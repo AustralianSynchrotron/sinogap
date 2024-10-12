@@ -782,6 +782,12 @@ def generateDiffImages(images, layout=None) :
         collage[..., DCfg.sinoSh[1]+cGap:2*DCfg.sinoSh[1]+cGap] = gen
         collage[..., 2*DCfg.sinoSh[1]+2*cGap:3*DCfg.sinoSh[1]+2*cGap] = dif
         collage[..., 3*DCfg.sinoSh[1]+3*cGap:4*DCfg.sinoSh[1]+4*cGap] = pre
+    elif layout == -4 :
+        collage = torch.zeros( (images.shape[0], 1, 4*DCfg.sinoSh[0] + 3*cGap, DCfg.sinoSh[1]))
+        collage[... , :DCfg.sinoSh[0] , : ] = images
+        collage[... , DCfg.sinoSh[0]+cGap:2*DCfg.sinoSh[0]+cGap , :] = gen
+        collage[... , 2*DCfg.sinoSh[0]+2*cGap:3*DCfg.sinoSh[0]+2*cGap , : ] = dif
+        collage[... , 3*DCfg.sinoSh[0]+3*cGap:4*DCfg.sinoSh[0]+4*cGap , : ] = pre
     else :
         collage = dif
     collage = squeezeOrg(collage,orgDim)
@@ -790,15 +796,15 @@ def generateDiffImages(images, layout=None) :
 
 
 def logStep(iter, write=True) :
-    colImgs, probs, dists = generateDiffImages(refImages, layout=4)
+    colImgs, probs, dists = generateDiffImages(refImages, layout=-4)
     probs = probs.mean(dim=0)
     dists = dists.mean(dim=0)
     colImgs = colImgs.squeeze()
     cSh = colImgs.shape
     gapH = DCfg.gapW
-    collage = np.zeros( ( cSh[0]*cSh[1] + (cSh[0]-1)*gapH , cSh[-1] ), dtype=np.float32  )
+    collage = np.zeros( ( cSh[-2], cSh[0]*cSh[-1] + (cSh[0]-1)*gapH ), dtype=np.float32  )
     for curI in range(cSh[0]) :
-        collage[ curI * (cSh[1]+gapH) : curI * (cSh[1]+gapH) + cSh[1] ,:] = colImgs[curI,...]
+        collage[ : , curI * (cSh[-1]+gapH) : curI * (cSh[-1]+gapH) + cSh[-1]] = colImgs[curI,...]
     writer.add_scalars("Probs of ref images",
                        {'Ref':probs[0]
                        ,'Gen':probs[2]
