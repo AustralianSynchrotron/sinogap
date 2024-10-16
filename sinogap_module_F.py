@@ -612,7 +612,25 @@ class GeneratorTemplate(nn.Module):
     def generateImages(self, images, noises=None) :
         clone = images.clone()
         return self.fillImages(clone, noises)
+
+    def preProc(self, images) :
+        images, orgDims = unsqeeze4dim(images)
+        if self.gapW == 2:
+            res = torch.zeros(images[self.gapRng].shape, device=images.device)
+            res[...,0] += 2*images[...,self.gapRngX.start-1] + images[...,self.gapRngX.stop]
+            res[...,1] += 2*images[...,self.gapRngX.stop] + images[...,self.gapRngX.start-1]
+            res /= 3
+        else :
+            preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
+            res = None
+            with torch.inference_mode() :
+                res = lowResGenerators[self.gapW//2].generatePatches(preImages)
+            res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
+        return squeezeOrg(res, orgDims)
+
+
 generator = initToNone('generator')
+lowResGenerators = {}
 
 
 class DiscriminatorTemplate(nn.Module):
@@ -724,7 +742,10 @@ def summarizeSet(dataloader):
         prepImages[DCfg.gapRng] = generator.preProc(images)
         MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], prepImages[DCfg.gapRng]))
         L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], prepImages[DCfg.gapRng]))
-        Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], prepImages[DCfg.gapRng]))
+        procImages, procData = imagesPreProc(images)
+        prepImages = procImages.clone()
+        prepImages[DCfg.gapRng] = generator.preProc(procImages)
+        Rec_diffs.append( nofIm * loss_Rec(procImages[DCfg.gapRng], prepImages[DCfg.gapRng]))
 
     MSE_diff = sum(MSE_diffs) / totalNofIm
     L1L_diff = sum(L1L_diffs) / totalNofIm
@@ -863,6 +884,9 @@ def calculateWeights(images) :
 
 
 def imagesPreProc(images) :
+    return images, None
+
+def imagesPostProc(images, procData=None) :
     return images
 
 
@@ -922,6 +946,7 @@ def train_step(images):
     ratReal = 0
     ratFake = 0
 
+    procImages, procData = imagesPreProc(images)
     generator.eval()
     discriminator.train()
     counter = 0
@@ -932,8 +957,8 @@ def train_step(images):
             optimizer_D.zero_grad()
 
             with torch.no_grad() :
-                fakeImages = generator.generateImages(images)
-            y_pred_real = discriminator(images)
+                fakeImages = generator.generateImages(procImages)
+            y_pred_real = discriminator(procImages)
             y_pred_fake = discriminator(fakeImages)
 
             y_pred_both = torch.cat((y_pred_real, y_pred_fake), dim=0)
@@ -967,7 +992,7 @@ def train_step(images):
         #trainGen = ratReal > ratFake
     else :
         with torch.inference_mode():
-            y_pred_real = discriminator(images)
+            y_pred_real = discriminator(procImages)
             D_loss = loss_Adv(labelsTrue, y_pred_real,
                               None if imWeights is None else torch.cat( (imWeights, imWeights) )  )
             ratReal = torch.count_nonzero(y_pred_real > 0.5)/nofIm
@@ -981,11 +1006,11 @@ def train_step(images):
         trainInfo.genPerformed += 1
         try :
             optimizer_G.zero_grad()
-            fakeImages = generator.generateImages(images)
+            fakeImages = generator.generateImages(procImages)
             with torch.no_grad() :
                 y_pred_fake = discriminator(fakeImages)
             GA_loss, GD_loss = loss_Gen(labelsTrue, y_pred_fake,
-                                        images[DCfg.gapRng], fakeImages[DCfg.gapRng],
+                                        procImages[DCfg.gapRng], fakeImages[DCfg.gapRng],
                                         imWeights)
             G_loss = GA_loss + lossDifCoef * GD_loss
             G_loss.backward()
@@ -1004,36 +1029,39 @@ def train_step(images):
     else :
         with torch.inference_mode() :
             GA_loss, GD_loss = loss_Gen(labelsTrue, y_pred_fake,
-                                        images[DCfg.gapRng], fakeImages[DCfg.gapRng],
+                                        procImages[DCfg.gapRng], fakeImages[DCfg.gapRng],
                                         imWeights)
             G_loss = GA_loss + lossDifCoef * GD_loss
             ratFake = torch.count_nonzero(y_pred_fake > 0.5)/nofIm
 
     #trainDis = trainGen = True
 
+    deprocFakeImages = imagesPostProc(fakeImages, procData)
 
     idx = y_pred_real.argmax()
+    trainInfo.bestRealImage = images[idx,...].clone().detach()
     trainInfo.bestRealProb = y_pred_real[idx].item()
     trainInfo.bestRealIndex = idx
 
     idx = y_pred_real.argmin()
+    trainInfo.worstRealImage = images[idx,...].clone().detach()
     trainInfo.worstRealProb =  y_pred_real[idx].item()
     trainInfo.worstRealIndex = idx
 
     idx = y_pred_fake.argmax()
-    trainInfo.bestFakeImage = fakeImages[idx,...].clone().detach()
+    trainInfo.bestFakeImage = deprocFakeImages[idx,...].clone().detach()
     trainInfo.bestFakeProb = y_pred_fake[idx].item()
     trainInfo.bestFakeIndex = idx
 
     idx = y_pred_fake.argmin()
-    trainInfo.worstFakeImage = fakeImages[idx,...].clone().detach()
+    trainInfo.worstFakeImage = deprocFakeImages[idx,...].clone().detach()
     trainInfo.worstFakeProb = y_pred_fake[idx].item()
     trainInfo.worstFakeIndex = idx
 
     trainInfo.highestDifIndex = eDinfo[0]
     trainInfo.highestDif = eDinfo[1]
     trainInfo.highestDifImageOrg = images[trainInfo.highestDifIndex,...].clone().detach()
-    trainInfo.highestDifImageGen = fakeImages[trainInfo.highestDifIndex,...].clone().detach()
+    trainInfo.highestDifImageGen = deprocFakeImages[trainInfo.highestDifIndex,...].clone().detach()
     trainInfo.lowestDifIndex = eDinfo[2]
     trainInfo.lowestDif = eDinfo[3]
 
@@ -1041,8 +1069,8 @@ def train_step(images):
     trainInfo.ratFake += ratFake * nofIm
     trainInfo.totalImages += nofIm
 
-    MSE_loss = loss_MSE(images[DCfg.gapRng], fakeImages[DCfg.gapRng])
-    L1L_loss = loss_L1L(images[DCfg.gapRng], fakeImages[DCfg.gapRng])
+    MSE_loss = loss_MSE(images[DCfg.gapRng], deprocFakeImages[DCfg.gapRng])
+    L1L_loss = loss_L1L(images[DCfg.gapRng], deprocFakeImages[DCfg.gapRng])
 
     return D_loss, GA_loss, GD_loss, MSE_loss, L1L_loss
 
@@ -1075,7 +1103,7 @@ def train(dataloader, savedCheckPoint):
         for it , data in tqdm.tqdm(enumerate(dataloader), total=int(len(dataloader))):
             iter += 1
 
-            images = imagesPreProc(data[0].clone().to(TCfg.device))
+            images = data[0].to(TCfg.device)
             nofIm = images.shape[0]
             totalIm += nofIm
             D_loss, GA_loss, GD_loss, MSE_loss, L1L_loss = train_step(images)
@@ -1104,8 +1132,8 @@ def train(dataloader, savedCheckPoint):
                     showMe[ row * ( DCfg.sinoSh[1]+DCfg.gapW) : (row+1) * DCfg.sinoSh[1] + row*DCfg.gapW ,
                             clmn * ( DCfg.sinoSh[0]+DCfg.gapW) : (clmn+1) * DCfg.sinoSh[0] + clmn*DCfg.gapW ] = \
                         imgToAdd.cpu().numpy()
-                addImage(0,0,images[trainInfo.bestRealIndex,...])
-                addImage(0,1,images[trainInfo.worstRealIndex,...])
+                addImage(0,0,trainInfo.bestRealImage)
+                addImage(0,1,trainInfo.worstRealImage)
                 addImage(1,0,trainInfo.bestFakeImage)
                 addImage(1,1,trainInfo.worstFakeImage)
                 addImage(2,0,trainInfo.highestDifImageGen)

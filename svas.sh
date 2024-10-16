@@ -15,9 +15,14 @@ if [ -z "${2}" ] ; then
 fi
 oDir="${2}"
 
-mkdir -p "$oDir/runs/"
-cp -r sinogap*.py *${iMask}* "$oDir"
-cp -r runs/*${iMask}* "$oDir/runs/"
+mkdir -p "$oDir"
+ls sinogap_module.py *${iMask}* | 
+while read flnm ; do
+  onm=$(sed "s:${iMask}::g" <<< "${flnm}" )
+  cp -vr "$flnm" "$oDir/$onm"
+done
+#echo cp -r sinogap_module.py *${iMask}* "$oDir"
+cp -r runs/*${iMask} "$oDir/logs"
  
 
 
