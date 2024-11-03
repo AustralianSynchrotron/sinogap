@@ -234,27 +234,20 @@ def set_seed(SEED_VALUE):
     np.random.seed(SEED_VALUE)
 
 
-def save_model(model, device, model_path):
-    if not device == 'cpu':
-        model.to('cpu')
+def save_model(model, model_path):
     torch.save(model.state_dict(), model_path)
-    if not device == 'cpu':
-        model.to(device)
     return
 
 
 def load_model(model, model_path):
-    model.load_state_dict(torch.load(model_path))
+    model.load_state_dict(torch.load(model_path, map_location=TCfg.device))
     return model
 
 
 def saveCheckPoint(path, epoch, iterations, minGEpoch, minGdLoss,
                    generator, discriminator,
                    optimizerGen=None, optimizerDis=None,
-                   schedulerGen=None, schedulerDis=None,
-                   device=None ) :
-    generator.to('cpu')
-    discriminator.to('cpu')
+                   schedulerGen=None, schedulerDis=None ) :
     checkPoint = {}
     checkPoint['epoch'] = epoch
     checkPoint['iterations'] = iterations
@@ -271,25 +264,18 @@ def saveCheckPoint(path, epoch, iterations, minGEpoch, minGdLoss,
     if not schedulerDis is None :
         checkPoint['schedulerDis'] = schedulerDis.state_dict()
     torch.save(checkPoint, path)
-    if not device is None:
-        generator.to(device)
-        discriminator.to(device)
 
 
 def loadCheckPoint(path, generator, discriminator,
                    optimizerGen=None, optimizerDis=None,
-                   schedulerGen=None, schedulerDis=None,
-                   device=None ) :
-    checkPoint = torch.load(path)
+                   schedulerGen=None, schedulerDis=None) :
+    checkPoint = torch.load(path, map_location=TCfg.device)
     epoch = checkPoint['epoch']
     iterations = checkPoint['iterations']
     minGEpoch = checkPoint['minGEpoch']
     minGdLoss = checkPoint['minGdLoss']
     generator.load_state_dict(checkPoint['generator'])
     discriminator.load_state_dict(checkPoint['discriminator'])
-    if not device is None :
-        generator.to(device)
-        discriminator.to(device)
     if not optimizerGen is None :
         optimizerGen.load_state_dict(checkPoint['optimizerGen'])
     if not schedulerGen is None :
@@ -515,7 +501,9 @@ examplesDb[4] = [(1298309, 1015)
                 ,(974214, 631)
                 ,(1429007,666)
                 ,(152196,251)
+                ,(1284589,62)
                 ,(102151, 418)
+                #,(2963058,233)
                 ]
 examplesDb[8] = [ (436179, 70), ]
 examplesDb[16] = [ (863470, 620), ]
@@ -612,7 +600,25 @@ class GeneratorTemplate(nn.Module):
     def generateImages(self, images, noises=None) :
         clone = images.clone()
         return self.fillImages(clone, noises)
+
+    def preProc(self, images) :
+        images, orgDims = unsqeeze4dim(images)
+        if self.gapW == 2:
+            res = torch.zeros(images[self.gapRng].shape, device=images.device)
+            res[...,0] += 2*images[...,self.gapRngX.start-1] + images[...,self.gapRngX.stop]
+            res[...,1] += 2*images[...,self.gapRngX.stop] + images[...,self.gapRngX.start-1]
+            res /= 3
+        else :
+            preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
+            res = None
+            with torch.inference_mode() :
+                res = lowResGenerators[self.gapW//2].generatePatches(preImages)
+            res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
+        return squeezeOrg(res, orgDims)
+
+
 generator = initToNone('generator')
+lowResGenerators = {}
 
 
 class DiscriminatorTemplate(nn.Module):
@@ -656,13 +662,12 @@ def restoreCheckpoint(path=None, logDir=None) :
         except : pass
         return 0, 0, 0, -1
     else :
-        return loadCheckPoint(path, generator, discriminator,
-                              optimizer_G, optimizer_D, device=TCfg.device)
+        return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D)
 
 
 def saveModels(path="") :
-    save_model(generator, TCfg.device, model_path=f"model_{TCfg.exec}_gen.pt")
-    save_model(discriminator, TCfg.device, model_path=f"model_{TCfg.exec}_dis.pt")
+    save_model(generator, model_path=f"model_{TCfg.exec}_gen.pt")
+    save_model(discriminator, model_path=f"model_{TCfg.exec}_dis.pt")
 
 
 def createCriteria() :
@@ -724,7 +729,10 @@ def summarizeSet(dataloader):
         prepImages[DCfg.gapRng] = generator.preProc(images)
         MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], prepImages[DCfg.gapRng]))
         L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], prepImages[DCfg.gapRng]))
-        Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], prepImages[DCfg.gapRng]))
+        procImages, procData = imagesPreProc(images)
+        prepImages = procImages.clone()
+        prepImages[DCfg.gapRng] = generator.preProc(procImages)
+        Rec_diffs.append( nofIm * loss_Rec(procImages[DCfg.gapRng], prepImages[DCfg.gapRng]))
 
     MSE_diff = sum(MSE_diffs) / totalNofIm
     L1L_diff = sum(L1L_diffs) / totalNofIm
@@ -863,6 +871,9 @@ def calculateWeights(images) :
 
 
 def imagesPreProc(images) :
+    return images, None
+
+def imagesPostProc(images, procData=None) :
     return images
 
 
@@ -893,9 +904,9 @@ class TrainInfoClass:
     disPerformed = 0
     genPerformed = 0
 trainInfo = TrainInfoClass()
-trainDis = True
-trainGen = True
 
+withEvalTrain = True
+withNoGrad = True
 def train_step(images):
     global trainDis, trainGen, eDinfo
     trainInfo.iterations += 1
@@ -909,131 +920,98 @@ def train_step(images):
     labelsFalse = torch.full((nofIm, 1),  TCfg.labelSmoothFac,
                         dtype=torch.float, device=TCfg.device)
 
-    fakeImages = None
-    y_pred_real = None
-    y_pred_fake = None
-    y_pred_both = None
-    labels = None
     D_loss = None
     G_loss = None
     GA_loss = None
     GD_loss = None
-    dif_losses = None
     ratReal = 0
     ratFake = 0
+    procImages, procData = imagesPreProc(images)
 
-    generator.eval()
-    discriminator.train()
-    counter = 0
-    if trainDis:
-        counter += 1
-        trainInfo.disPerformed += 1
-        try :
-            optimizer_D.zero_grad()
-
+    try :
+        if withEvalTrain:
+            generator.eval()
+            discriminator.train()
+        optimizer_D.zero_grad()
+        fakeImagesD=None
+        if withNoGrad :
             with torch.no_grad() :
-                fakeImages = generator.generateImages(images)
-            y_pred_real = discriminator(images)
-            y_pred_fake = discriminator(fakeImages)
+                fakeImagesD = generator.generateImages(procImages)
+        else :
+            fakeImagesD = generator.generateImages(procImages)
+        pred_realD = discriminator(procImages)
+        pred_fakeD = discriminator(fakeImagesD)
+        pred_both = torch.cat((pred_realD, pred_fakeD), dim=0)
+        labels = torch.cat( (labelsTrue, labelsFalse), dim=0).to(TCfg.device)
+        D_loss = loss_Adv(labels, pred_both,
+                          None if imWeights is None else torch.cat( (imWeights, imWeights) )  )
+        D_loss.backward()
+        optimizer_D.step()
+    except :
+        optimizer_D.zero_grad()
+        del fakeImagesD
+        del pred_realD
+        del pred_fakeD
+        del pred_both
+        del D_loss
+        raise
+    ratReal = torch.count_nonzero(pred_realD > 0.5)/nofIm
+    ratFake = torch.count_nonzero(pred_fakeD > 0.5)/nofIm
 
-            y_pred_both = torch.cat((y_pred_real, y_pred_fake), dim=0)
-            labels = torch.cat( (labelsTrue, labelsFalse), dim=0).to(TCfg.device)
-            D_loss = loss_Adv(labels, y_pred_both,
-                              None if imWeights is None else torch.cat( (imWeights, imWeights) )  )
-
-            #preImages = images.clone()
-            #preImages[...,*DCfg.gapRng] = generator.preProc(images)
-            #y_pred_pre = discriminator(preImages)
-            #y_pred_both = torch.cat((y_pred_real, y_pred_real,
-            #                         y_pred_fake, y_pred_pre), dim=0)
-            #labels = torch.cat( (labelsTrue, labelsTrue,
-            #                     labelsFalse, labelsFalse), dim=0).to(TCfg.device)
-            #D_loss = loss_Adv(labels, y_pred_both, torch.cat( (weights, weights,
-            #                                                   weights, weights) ) )
-
-            D_loss.backward()
-            optimizer_D.step()
-        except :
-            optimizer_D.zero_grad()
-            del fakeImages
-            del y_pred_real
-            del y_pred_fake
-            del y_pred_both
-            del labels
-            del D_loss
-            raise
-        ratReal = torch.count_nonzero(y_pred_real > 0.5)/nofIm
-        ratFake = torch.count_nonzero(y_pred_fake > 0.5)/nofIm
-        #trainGen = ratReal > ratFake
-    else :
-        with torch.inference_mode():
-            y_pred_real = discriminator(images)
-            D_loss = loss_Adv(labelsTrue, y_pred_real,
-                              None if imWeights is None else torch.cat( (imWeights, imWeights) )  )
-            ratReal = torch.count_nonzero(y_pred_real > 0.5)/nofIm
-
-
-    discriminator.eval()
-    generator.train()
-    counter = 0
-    if trainGen :
-        counter += 1
-        trainInfo.genPerformed += 1
-        try :
-            optimizer_G.zero_grad()
-            fakeImages = generator.generateImages(images)
+    try :
+        if withEvalTrain :
+            discriminator.eval()
+            generator.train()
+        optimizer_G.zero_grad()
+        fakeImagesG = generator.generateImages(procImages)
+        pred_fakeG=None
+        if withNoGrad :
             with torch.no_grad() :
-                y_pred_fake = discriminator(fakeImages)
-            GA_loss, GD_loss = loss_Gen(labelsTrue, y_pred_fake,
-                                        images[DCfg.gapRng], fakeImages[DCfg.gapRng],
-                                        imWeights)
-            G_loss = GA_loss + lossDifCoef * GD_loss
-            G_loss.backward()
-            optimizer_G.step()
-        except :
-            optimizer_G.zero_grad()
-            del fakeImages
-            del y_pred_fake
-            del G_loss
-            del GA_loss
-            del GD_loss
-            del dif_losses
-            raise
-        ratFake = torch.count_nonzero(y_pred_fake > 0.5)/nofIm
-        #trainDis = True # ratFake > 0.1 or ratReal <= ratFake
-    else :
-        with torch.inference_mode() :
-            GA_loss, GD_loss = loss_Gen(labelsTrue, y_pred_fake,
-                                        images[DCfg.gapRng], fakeImages[DCfg.gapRng],
-                                        imWeights)
-            G_loss = GA_loss + lossDifCoef * GD_loss
-            ratFake = torch.count_nonzero(y_pred_fake > 0.5)/nofIm
+                pred_fakeG = discriminator(fakeImagesG)
+        else :
+            pred_fakeG = discriminator(fakeImagesG)
+        GA_loss, GD_loss = loss_Gen(labelsTrue, pred_fakeG,
+                                    procImages[DCfg.gapRng], fakeImagesG[DCfg.gapRng],
+                                    imWeights)
+        G_loss = GA_loss + lossDifCoef * GD_loss
+        G_loss.backward()
+        optimizer_G.step()
+    except :
+        optimizer_G.zero_grad()
+        del fakeImagesG
+        del pred_fakeG
+        del G_loss
+        del GA_loss
+        del GD_loss
+        raise
+    ratFake = torch.count_nonzero(pred_fakeG > 0.5)/nofIm
 
-    #trainDis = trainGen = True
+    deprocFakeImages = imagesPostProc(fakeImagesG, procData)
 
-
-    idx = y_pred_real.argmax()
-    trainInfo.bestRealProb = y_pred_real[idx].item()
+    idx = pred_realD.argmax()
+    trainInfo.bestRealImage = images[idx,...].clone().detach()
+    trainInfo.bestRealProb = pred_realD[idx].item()
     trainInfo.bestRealIndex = idx
 
-    idx = y_pred_real.argmin()
-    trainInfo.worstRealProb =  y_pred_real[idx].item()
+    idx = pred_realD.argmin()
+    trainInfo.worstRealImage = images[idx,...].clone().detach()
+    trainInfo.worstRealProb =  pred_realD[idx].item()
     trainInfo.worstRealIndex = idx
 
-    idx = y_pred_fake.argmax()
-    trainInfo.bestFakeImage = fakeImages[idx,...].clone().detach()
-    trainInfo.bestFakeProb = y_pred_fake[idx].item()
+    idx = pred_fakeG.argmax()
+    trainInfo.bestFakeImage = deprocFakeImages[idx,...].clone().detach()
+    trainInfo.bestFakeProb = pred_fakeG[idx].item()
     trainInfo.bestFakeIndex = idx
 
-    idx = y_pred_fake.argmin()
-    trainInfo.worstFakeImage = fakeImages[idx,...].clone().detach()
-    trainInfo.worstFakeProb = y_pred_fake[idx].item()
+    idx = pred_fakeG.argmin()
+    trainInfo.worstFakeImage = deprocFakeImages[idx,...].clone().detach()
+    trainInfo.worstFakeProb = pred_fakeG[idx].item()
     trainInfo.worstFakeIndex = idx
 
     trainInfo.highestDifIndex = eDinfo[0]
     trainInfo.highestDif = eDinfo[1]
     trainInfo.highestDifImageOrg = images[trainInfo.highestDifIndex,...].clone().detach()
-    trainInfo.highestDifImageGen = fakeImages[trainInfo.highestDifIndex,...].clone().detach()
+    trainInfo.highestDifImageGen = deprocFakeImages[trainInfo.highestDifIndex,...].clone().detach()
     trainInfo.lowestDifIndex = eDinfo[2]
     trainInfo.lowestDif = eDinfo[3]
 
@@ -1041,8 +1019,8 @@ def train_step(images):
     trainInfo.ratFake += ratFake * nofIm
     trainInfo.totalImages += nofIm
 
-    MSE_loss = loss_MSE(images[DCfg.gapRng], fakeImages[DCfg.gapRng])
-    L1L_loss = loss_L1L(images[DCfg.gapRng], fakeImages[DCfg.gapRng])
+    MSE_loss = loss_MSE(images[DCfg.gapRng], deprocFakeImages[DCfg.gapRng])
+    L1L_loss = loss_L1L(images[DCfg.gapRng], deprocFakeImages[DCfg.gapRng])
 
     return D_loss, GA_loss, GD_loss, MSE_loss, L1L_loss
 
@@ -1052,6 +1030,10 @@ iter = initToNone('iter')
 minGEpoch = initToNone('minGEpoch')
 minGdLoss = initToNone('minGdLoss')
 prepGdLoss = initToNone('prepGdLoss')
+
+def onEachEpoch(epoch) :
+    return
+
 def train(dataloader, savedCheckPoint):
     global epoch, minGdLoss, minGEpoch, prepGdLoss, iter
     lastGdLoss = minGdLoss
@@ -1071,11 +1053,13 @@ def train(dataloader, savedCheckPoint):
         lossMSEacc = 0
         lossL1Lacc = 0
         totalIm = 0
+        onEachEpoch(epoch)
+
 
         for it , data in tqdm.tqdm(enumerate(dataloader), total=int(len(dataloader))):
             iter += 1
 
-            images = imagesPreProc(data[0].clone().to(TCfg.device))
+            images = data[0].to(TCfg.device)
             nofIm = images.shape[0]
             totalIm += nofIm
             D_loss, GA_loss, GD_loss, MSE_loss, L1L_loss = train_step(images)
@@ -1095,6 +1079,9 @@ def train(dataloader, savedCheckPoint):
                 collageR, probsR, _ = generateDiffImages(refImages[[0],...], layout=0)
                 showMe = np.zeros( (2*DCfg.sinoSh[1] + DCfg.gapW ,
                                     5*DCfg.sinoSh[0] + 4*DCfg.gapW), dtype=np.float32  )
+                for clmn in range (5) : # mark gaps
+                    showMe[ DCfg.sinoSh[0] : DCfg.sinoSh[0] + DCfg.gapW ,
+                            clmn*(DCfg.sinoSh[1]+DCfg.gapW) + 2*DCfg.gapW : clmn*(DCfg.sinoSh[1]+DCfg.gapW) + 3*DCfg.gapW ] = -1
                 def addImage(clmn, row, img, stretch=True) :
                     imgToAdd = img.clone().detach().squeeze()
                     if stretch :
@@ -1104,8 +1091,8 @@ def train(dataloader, savedCheckPoint):
                     showMe[ row * ( DCfg.sinoSh[1]+DCfg.gapW) : (row+1) * DCfg.sinoSh[1] + row*DCfg.gapW ,
                             clmn * ( DCfg.sinoSh[0]+DCfg.gapW) : (clmn+1) * DCfg.sinoSh[0] + clmn*DCfg.gapW ] = \
                         imgToAdd.cpu().numpy()
-                addImage(0,0,images[trainInfo.bestRealIndex,...])
-                addImage(0,1,images[trainInfo.worstRealIndex,...])
+                addImage(0,0,trainInfo.bestRealImage)
+                addImage(0,1,trainInfo.worstRealImage)
                 addImage(1,0,trainInfo.bestFakeImage)
                 addImage(1,1,trainInfo.worstFakeImage)
                 addImage(2,0,trainInfo.highestDifImageGen)
@@ -1172,8 +1159,7 @@ def train(dataloader, savedCheckPoint):
             saveCheckPoint(savedCheckPoint+"_BEST.pth",
                            epoch, iter, minGEpoch, minGdLoss,
                            generator, discriminator,
-                           optimizer_G, optimizer_D,
-                           device=TCfg.device)
+                           optimizer_G, optimizer_D)
             os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_BeforeBest.pth")
             os.system(f"cp {savedCheckPoint}_BEST.pth {savedCheckPoint}.pth")
             saveModels()
@@ -1181,8 +1167,7 @@ def train(dataloader, savedCheckPoint):
             saveCheckPoint(savedCheckPoint+".pth",
                            epoch, iter, minGEpoch, minGdLoss,
                            generator, discriminator,
-                           optimizer_G, optimizer_D,
-                           device=TCfg.device)
+                           optimizer_G, optimizer_D)
 
 
 def testMe(trainSet, nofIm=1) :
