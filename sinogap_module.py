@@ -491,19 +491,21 @@ examplesDb[2] = [(1271101, 570)
                 ,(5053275,1700)
                 ]
 examplesDb[4] = [(1298309, 1015)
-                ,(4612947, 2882)
+                #,(4612947, 2882)
                 ,(2215760, 500)
                 ,(2348099, 1684)
                 ,(1907990, 1545)
                 ,(291661, 724)
                 ,(2489646, 1240)
                 ,(1142687, 230)
-                ,(974214, 631)
+                #,(974214, 631)
                 ,(1429007,666)
                 ,(152196,251)
                 ,(1284589,62)
+                ,(2963058,233)
+                ,(200279,41)
+                ,(1707893,914)
                 ,(102151, 418)
-                #,(2963058,233)
                 ]
 examplesDb[8] = [ (436179, 70), ]
 examplesDb[16] = [ (863470, 620), ]
@@ -771,14 +773,16 @@ def generateDiffImages(images, layout=None) :
         dists[:,1] = loss_MSE(images[DCfg.gapRng], gen[DCfg.gapRng])
         dists[:,2] = loss_L1L(images[DCfg.gapRng], gen[DCfg.gapRng])
 
+    simages = None
     if not layout is None :
         def stretch(stretchme, mm, aa) :
             return ( stretchme - mm ) * 2 / aa - 1 if ampl > 0 else stretchme * 0
+        simages = images.clone()
         for curim in range(images.shape[0]) :
             rng = np.s_[curim,...]
             minv = min(images[rng].min(), pre[rng].min(), gen[rng].min()).item()
             ampl = max(images[rng].max(), pre[rng].max(), gen[rng].max()).item() - minv
-            images[rng] = stretch(images[rng], minv, ampl)
+            simages[rng] = stretch(simages[rng], minv, ampl)
             pre[rng] = stretch(pre[rng], minv, ampl)
             gen[rng] = stretch(gen[rng], minv, ampl)
 
@@ -786,7 +790,7 @@ def generateDiffImages(images, layout=None) :
     collage = None
     if layout == 0 :
         collage = torch.empty(images.shape[0], 4, *DCfg.sinoSh)
-        collage[:,0,...] = images[:,0,...]
+        collage[:,0,...] = simages[:,0,...]
         collage[:,1,...] = pre[:,0,...]
         collage[:,2,...] = gen[:,0,...]
         collage[:,3,...] = dif[:,0,...]
@@ -794,17 +798,17 @@ def generateDiffImages(images, layout=None) :
         collage = torch.zeros((images.shape[0], 1, DCfg.sinoSh[0]*2 + cGap, DCfg.sinoSh[1]*2 + cGap ))
         collage[..., :DCfg.sinoSh[0], :DCfg.sinoSh[1]] = gen
         collage[..., :DCfg.sinoSh[0], DCfg.sinoSh[1]+cGap:] = pre
-        collage[..., DCfg.sinoSh[0]+cGap:, :DCfg.sinoSh[1]] = images
+        collage[..., DCfg.sinoSh[0]+cGap:, :DCfg.sinoSh[1]] = simages
         collage[..., DCfg.sinoSh[0]+cGap:, DCfg.sinoSh[1]+cGap:] = dif
     elif layout == 4 :
         collage = torch.zeros((images.shape[0], 1, DCfg.sinoSh[0], 4*DCfg.sinoSh[1] + 3*cGap))
-        collage[..., :DCfg.sinoSh[1]] = images
+        collage[..., :DCfg.sinoSh[1]] = simages
         collage[..., DCfg.sinoSh[1]+cGap:2*DCfg.sinoSh[1]+cGap] = gen
         collage[..., 2*DCfg.sinoSh[1]+2*cGap:3*DCfg.sinoSh[1]+2*cGap] = dif
         collage[..., 3*DCfg.sinoSh[1]+3*cGap:4*DCfg.sinoSh[1]+4*cGap] = pre
     elif layout == -4 :
         collage = torch.zeros( (images.shape[0], 1, 4*DCfg.sinoSh[0] + 3*cGap, DCfg.sinoSh[1]))
-        collage[... , :DCfg.sinoSh[0] , : ] = images
+        collage[... , :DCfg.sinoSh[0] , : ] = simages
         collage[... , DCfg.sinoSh[0]+cGap:2*DCfg.sinoSh[0]+cGap , :] = gen
         collage[... , 2*DCfg.sinoSh[0]+2*cGap:3*DCfg.sinoSh[0]+2*cGap , : ] = dif
         collage[... , 3*DCfg.sinoSh[0]+3*cGap:4*DCfg.sinoSh[0]+4*cGap , : ] = pre
