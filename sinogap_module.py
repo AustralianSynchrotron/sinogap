@@ -968,12 +968,13 @@ def train_step(images):
             generator.train()
         optimizer_G.zero_grad()
         fakeImagesG = generator.generateImages(procImages)
-        pred_fakeG=None
-        if withNoGrad :
-            with torch.no_grad() :
-                pred_fakeG = discriminator(fakeImagesG)
-        else :
-            pred_fakeG = discriminator(fakeImagesG)
+        pred_fakeG = discriminator(fakeImagesG)
+        #pred_fakeG=None
+        #if withNoGrad :
+        #    with torch.no_grad() :
+        #        pred_fakeG = discriminator(fakeImagesG)
+        #else :
+        #    pred_fakeG = discriminator(fakeImagesG)
         GA_loss, GD_loss = loss_Gen(labelsTrue, pred_fakeG,
                                     procImages[DCfg.gapRng], fakeImagesG[DCfg.gapRng],
                                     imWeights)
@@ -1035,8 +1036,10 @@ minGEpoch = initToNone('minGEpoch')
 minGdLoss = initToNone('minGdLoss')
 prepGdLoss = initToNone('prepGdLoss')
 
+
 def onEachEpoch(epoch) :
     return
+
 
 def train(dataloader, savedCheckPoint):
     global epoch, minGdLoss, minGEpoch, prepGdLoss, iter
