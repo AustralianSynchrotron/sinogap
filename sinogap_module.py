@@ -4,6 +4,7 @@ import sys
 import os
 import random
 import time
+import gc
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -909,7 +910,6 @@ class TrainInfoClass:
     genPerformed = 0
 trainInfo = TrainInfoClass()
 
-withEvalTrain = True
 withNoGrad = True
 def train_step(images):
     global trainDis, trainGen, eDinfo
@@ -1182,5 +1182,8 @@ def testMe(trainSet, nofIm=1) :
         print(f"Distances. Rec: {dists[im,0]:.4e},  MSE: {dists[im,1]:.4e},  L1L: {dists[im,2]:.4e}.")
         plotImage(colImgs[im].squeeze().cpu())
 
-
+def freeGPUmem() :
+    gc.collect()
+    with torch.no_grad():
+        torch.cuda.empty_cache()
 
