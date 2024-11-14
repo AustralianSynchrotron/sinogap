@@ -933,15 +933,11 @@ def train_step(images):
     procImages, procData = imagesPreProc(images)
 
     try :
-        if withEvalTrain:
-            generator.eval()
-            discriminator.train()
+        generator.eval()
+        discriminator.train()
         optimizer_D.zero_grad()
         fakeImagesD=None
-        if withNoGrad :
-            with torch.no_grad() :
-                fakeImagesD = generator.generateImages(procImages)
-        else :
+        with torch.no_grad() :
             fakeImagesD = generator.generateImages(procImages)
         pred_realD = discriminator(procImages)
         pred_fakeD = discriminator(fakeImagesD)
@@ -963,18 +959,16 @@ def train_step(images):
     ratFake = torch.count_nonzero(pred_fakeD > 0.5)/nofIm
 
     try :
-        if withEvalTrain :
-            discriminator.eval()
-            generator.train()
+        discriminator.eval()
+        generator.train()
         optimizer_G.zero_grad()
         fakeImagesG = generator.generateImages(procImages)
-        pred_fakeG = discriminator(fakeImagesG)
-        #pred_fakeG=None
-        #if withNoGrad :
-        #    with torch.no_grad() :
-        #        pred_fakeG = discriminator(fakeImagesG)
-        #else :
-        #    pred_fakeG = discriminator(fakeImagesG)
+        pred_fakeG=None
+        if withNoGrad :
+            with torch.no_grad() :
+                pred_fakeG = discriminator(fakeImagesG)
+        else :
+            pred_fakeG = discriminator(fakeImagesG)
         GA_loss, GD_loss = loss_Gen(labelsTrue, pred_fakeG,
                                     procImages[DCfg.gapRng], fakeImagesG[DCfg.gapRng],
                                     imWeights)
