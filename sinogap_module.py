@@ -832,8 +832,8 @@ def logStep(iter, write=True) :
         collage[ : , curI * (cSh[-1]+gapH) : curI * (cSh[-1]+gapH) + cSh[-1]] = colImgs[curI,...]
     writer.add_scalars("Probs of ref images",
                        {'Ref':probs[0]
-                       ,'Gen':probs[2]
-                       ,'Pre':probs[1]
+                       ,'Gen':probs[2] - probs[0]
+                       ,'Pre':probs[1] - probs[0]
                        }, iter )
     writer.add_scalars("Dist of ref images",
                        { 'REC' : dists[0]
@@ -930,17 +930,27 @@ def train_step(images):
     GD_loss = None
     ratReal = 0
     ratFake = 0
-    procImages, procData = imagesPreProc(images)
+    procImages, procReverseData = imagesPreProc(images)
+
+    # calculate predictions of prefilled images - purely for metrics purposes
+    discriminator.eval()
+    generator.eval()
+    fakeImagesD = procImages.clone().detach()
+    fakeImagesD.requires_grad=False
+    with torch.no_grad() :
+        fakeImagesD[DCfg.gapRng] = generator.preProc(procImages)
+    pred_preD = discriminator(fakeImagesD)
 
     try :
         generator.eval()
         discriminator.train()
         optimizer_D.zero_grad()
-        fakeImagesD=None
         with torch.no_grad() :
-            fakeImagesD = generator.generateImages(procImages)
+            fakeImagesD[()] = generator.generateImages(procImages)
         pred_realD = discriminator(procImages)
         pred_fakeD = discriminator(fakeImagesD)
+        generator.preProc(images)
+
         pred_both = torch.cat((pred_realD, pred_fakeD), dim=0)
         labels = torch.cat( (labelsTrue, labelsFalse), dim=0).to(TCfg.device)
         D_loss = loss_Adv(labels, pred_both,
@@ -985,7 +995,7 @@ def train_step(images):
         raise
     ratFake = torch.count_nonzero(pred_fakeG > 0.5)/nofIm
 
-    deprocFakeImages = imagesPostProc(fakeImagesG, procData)
+    deprocFakeImages = imagesPostProc(fakeImagesG, procReverseData)
 
     idx = pred_realD.argmax()
     trainInfo.bestRealImage = images[idx,...].clone().detach()
@@ -1021,7 +1031,8 @@ def train_step(images):
     MSE_loss = loss_MSE(images[DCfg.gapRng], deprocFakeImages[DCfg.gapRng])
     L1L_loss = loss_L1L(images[DCfg.gapRng], deprocFakeImages[DCfg.gapRng])
 
-    return D_loss, GA_loss, GD_loss, MSE_loss, L1L_loss
+    return D_loss, GA_loss, GD_loss, MSE_loss, L1L_loss, \
+           pred_realD.mean(),  pred_preD.mean(),  pred_fakeD.mean()
 
 
 epoch=initToNone('epoch')
@@ -1053,6 +1064,9 @@ def train(dataloader, savedCheckPoint):
         lossGDacc = 0
         lossMSEacc = 0
         lossL1Lacc = 0
+        predRealAcc = 0
+        predPreAcc = 0
+        predFakeAcc = 0
         totalIm = 0
         onEachEpoch(epoch)
 
@@ -1063,12 +1077,17 @@ def train(dataloader, savedCheckPoint):
             images = data[0].to(TCfg.device)
             nofIm = images.shape[0]
             totalIm += nofIm
-            D_loss, GA_loss, GD_loss, MSE_loss, L1L_loss = train_step(images)
+            D_loss, GA_loss, GD_loss, MSE_loss, L1L_loss, \
+            predReal, predPre, predFake \
+                = train_step(images)
             lossDacc += D_loss.item() * nofIm
             lossGAacc += GA_loss.item() * nofIm
             lossGDacc += GD_loss.item() * nofIm
             lossMSEacc += MSE_loss.item() * nofIm
             lossL1Lacc += L1L_loss.item() * nofIm
+            predRealAcc += predReal.item() * nofIm
+            predPreAcc  += predPre.item() * nofIm
+            predFakeAcc += predFake.item() * nofIm
 
             #if True:
             #if False :
@@ -1112,6 +1131,12 @@ def train(dataloader, savedCheckPoint):
                                    ,'L1L': L1L_loss
                                    ,'REC': GD_loss
                                    }, iter )
+                writer.add_scalars("Probs per iter",
+                                   {'Ref':predReal
+                                   ,'Gen':predFake - predReal
+                                   ,'Pre':predPre - predReal
+                                   }, epoch )
+
 
                 IPython.display.clear_output(wait=True)
                 print(f"Epoch: {epoch} ({minGEpoch}). Losses: "
@@ -1143,6 +1168,10 @@ def train(dataloader, savedCheckPoint):
         lossGDacc /= totalIm
         lossMSEacc /= totalIm
         lossL1Lacc /= totalIm
+        predRealAcc /= totalIm
+        predPreAcc /= totalIm
+        predFakeAcc /= totalIm
+
         writer.add_scalars("Losses per epoch",
                            {'Dis': lossDacc
                            ,'Adv': lossGAacc
@@ -1152,6 +1181,11 @@ def train(dataloader, savedCheckPoint):
                            {'MSE': lossMSEacc
                            ,'L1L': lossL1Lacc
                            ,'REC': lossGDacc
+                           }, epoch )
+        writer.add_scalars("Probs per epoch",
+                           {'Ref':predRealAcc
+                           ,'Gen':predFakeAcc - predRealAcc
+                           ,'Pre':predPreAcc - predRealAcc
                            }, epoch )
         lastGdLoss = lossGDacc
         if minGdLoss < 0.0 or lossGDacc < minGdLoss  :
