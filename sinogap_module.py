@@ -1133,8 +1133,8 @@ def train(dataloader, savedCheckPoint):
                                    }, iter )
                 writer.add_scalars("Probs per iter",
                                    {'Ref':predReal
-                                   ,'Gen':predFake - predReal
-                                   ,'Pre':predPre - predReal
+                                   ,'Gen':predFake
+                                   ,'Pre':predPre
                                    }, epoch )
 
 
@@ -1183,9 +1183,9 @@ def train(dataloader, savedCheckPoint):
                            ,'REC': lossGDacc
                            }, epoch )
         writer.add_scalars("Probs per epoch",
-                           {'Ref':predRealAcc
-                           ,'Gen':predFakeAcc - predRealAcc
-                           ,'Pre':predPreAcc - predRealAcc
+                           {'Ref': predRealAcc
+                           ,'Gen': predFakeAcc
+                           ,'Pre': predPreAcc
                            }, epoch )
         lastGdLoss = lossGDacc
         if minGdLoss < 0.0 or lossGDacc < minGdLoss  :
