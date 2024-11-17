@@ -19,7 +19,7 @@ mkdir -p "$oDir"
 ls sinogap_module.py *${iMask}* | 
 while read flnm ; do
   onm=$(sed "s:${iMask}::g" <<< "${flnm}" )
-  cp -vr "$flnm" "$oDir/$onm"
+  cp -Lvr "$flnm" "$oDir/$onm"
 done
 #echo cp -r sinogap_module.py *${iMask}* "$oDir"
 cp -r runs/*${iMask} "$oDir/logs"
