@@ -1,5 +1,6 @@
 
 import IPython
+
 import sys
 import os
 import random
@@ -1058,7 +1059,7 @@ def train(dataloader, savedCheckPoint):
     generator.to(TCfg.device)
     lastUpdateTime = time.time()
 
-    while epoch is None or epoch <= TCfg.nofEpochs :
+    while TCfg.nofEpochs is None or epoch <= TCfg.nofEpochs :
         epoch += 1
         beforeEachEpoch(epoch)
         generator.train()
@@ -1072,13 +1073,17 @@ def train(dataloader, savedCheckPoint):
         predPreAcc = 0
         predFakeAcc = 0
         totalIm = 0
-
+        eqSize = 0
 
         for it , data in tqdm.tqdm(enumerate(dataloader), total=int(len(dataloader))):
             iter += 1
 
             images = data[0].to(TCfg.device)
             nofIm = images.shape[0]
+            if not it :
+                eqSize = nofIm
+            elif eqSize != nofIm :
+                break # last batch is smaller than others; don't want it.
             totalIm += nofIm
             D_loss, GA_loss, GD_loss, MSE_loss, L1L_loss, \
             predReal, predPre, predFake \
