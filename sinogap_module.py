@@ -1042,7 +1042,11 @@ minGdLoss = initToNone('minGdLoss')
 prepGdLoss = initToNone('prepGdLoss')
 
 
-def onEachEpoch(epoch) :
+def beforeEachEpoch(epoch) :
+    return
+
+
+def afterEachEpoch(epoch) :
     return
 
 
@@ -1054,9 +1058,9 @@ def train(dataloader, savedCheckPoint):
     generator.to(TCfg.device)
     lastUpdateTime = time.time()
 
-    while True:
+    while epoch is None or epoch <= TCfg.nofEpochs :
         epoch += 1
-
+        beforeEachEpoch(epoch)
         generator.train()
         discriminator.train()
         lossDacc = 0
@@ -1068,7 +1072,6 @@ def train(dataloader, savedCheckPoint):
         predPreAcc = 0
         predFakeAcc = 0
         totalIm = 0
-        onEachEpoch(epoch)
 
 
         for it , data in tqdm.tqdm(enumerate(dataloader), total=int(len(dataloader))):
@@ -1204,6 +1207,8 @@ def train(dataloader, savedCheckPoint):
                            generator, discriminator,
                            optimizer_G, optimizer_D)
 
+        afterEachEpoch(epoch)
+
 
 def testMe(trainSet, nofIm=1) :
     testSet = [ trainSet.__getitem__() for _ in range(nofIm) ]
@@ -1215,6 +1220,7 @@ def testMe(trainSet, nofIm=1) :
         print(f"Probabilities. Org: {probs[im,0]:.3e},  Gen: {probs[im,2]:.3e},  Pre: {probs[im,1]:.3e}.")
         print(f"Distances. Rec: {dists[im,0]:.4e},  MSE: {dists[im,1]:.4e},  L1L: {dists[im,2]:.4e}.")
         plotImage(colImgs[im].squeeze().cpu())
+
 
 def freeGPUmem() :
     gc.collect()
