@@ -1207,12 +1207,12 @@ def train(savedCheckPoint):
         if minGdLoss < 0.0 or lossGDacc < minGdLoss  :
             minGdLoss = lossGDacc
             minGEpoch = epoch
-            saveCheckPoint(savedCheckPoint+"_BEST.pth",
+            saveCheckPoint(savedCheckPoint+"_B.pth",
                            epoch, iter, minGEpoch, minGdLoss,
                            generator, discriminator,
                            optimizer_G, optimizer_D)
-            os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_BeforeBest.pth")
-            os.system(f"cp {savedCheckPoint}_BEST.pth {savedCheckPoint}.pth")
+            os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_BB.pth") # BB: before best
+            os.system(f"cp {savedCheckPoint}_B.pth {savedCheckPoint}.pth") # B: best
             saveModels()
         else :
             saveCheckPoint(savedCheckPoint+".pth",
