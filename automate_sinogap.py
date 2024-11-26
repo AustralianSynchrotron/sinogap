@@ -24,11 +24,6 @@ def my_train_step(images):
     images = images.squeeze(1).to(sg.TCfg.device)
     imWeights = sg.calculateWeights(images)
 
-    labelsTrue = torch.full((nofIm, 1),  1 - sg.TCfg.labelSmoothFac,
-                        dtype=torch.float, device=sg.TCfg.device)
-    labelsFalse = torch.full((nofIm, 1),  sg.TCfg.labelSmoothFac,
-                        dtype=torch.float, device=sg.TCfg.device)
-
     D_loss = None
     G_loss = None
     #GA_loss = None
@@ -150,15 +145,18 @@ def my_train_step(images):
 sg.train_step = my_train_step
 
 
-def my_train(dataloader, savedCheckPoint):
+def my_train(savedCheckPoint):
     #global sg.epoch, sg.minGdLoss, sg.minGEpoch, sg.prepGdLoss, sg.iter
+
 
     sg.discriminator.to(sg.TCfg.device)
     sg.generator.to(sg.TCfg.device)
     lastUpdateTime = time.time()
+    startTime = time.time()
 
     pbar = tqdm.tqdm(total=sg.TCfg.nofEpochs)
-    while sg.epoch is None or sg.epoch <= sg.TCfg.nofEpochs :
+    #while sg.epoch is None or sg.epoch <= sg.TCfg.nofEpochs :
+    while time.time() - startTime < 10000 :
         sg.epoch += 1
         sg.beforeEachEpoch(sg.epoch)
         sg.generator.train()
@@ -174,7 +172,7 @@ def my_train(dataloader, savedCheckPoint):
         totalIm = 0
 
 
-        for data in dataloader :
+        for data in sg.dataLoader :
             sg.iter += 1
 
             images = data[0].to(sg.TCfg.device)
@@ -325,13 +323,13 @@ sg.TCfg = sg.TCfgClass(
      exec = 1
     ,nofEpochs = 50
     ,latentDim = 64
-    ,batchSize=256
+    ,batchSize=128
     ,labelSmoothFac = 0.1 # For Fake labels (or set to 0.0 for no smoothing).
     ,learningRateD = 0.0002
     ,learningRateG = 0.0002
 )
 
-sg.DCfg = sg.DCfgClass(2)
+sg.DCfg = sg.DCfgClass(8)
 
 
 # %% [markdown]
@@ -346,7 +344,7 @@ sg.prepGdLoss=0
 
 # %%
 
-sg.refImages, sg.refNoises = sg.createReferences(trainSet, 7)
+sg.refImages, sg.refNoises = sg.createReferences(trainSet, 0)
 #sg.showMe(trainSet, 0)
 
 
@@ -362,10 +360,11 @@ sg.refImages, sg.refNoises = sg.createReferences(trainSet, 7)
 # %%
 
 
-class Generator(sg.GeneratorTemplate):
+
+class Generator2(sg.GeneratorTemplate):
 
     def __init__(self):
-        super(Generator, self).__init__(2)
+        super(Generator2, self).__init__(2)
 
         #latentChannels = 7
         #self.noise2latent = nn.Sequential(
@@ -454,12 +453,213 @@ class Generator(sg.GeneratorTemplate):
         patches = ( 2*res[self.gapRng] + modelIn[:,[0],:, self.gapRngX] + 1 ) * ampl / 2 + minv #destretch
         return sg.squeezeOrg(patches, orgDims)
 
+generator2 = Generator2()
+generator2 = sg.load_model(generator2, model_path="saves/gen2.pt" )
+generator2 = generator2.to(sg.TCfg.device)
+generator2 = generator2.requires_grad_(False)
+generator2 = generator2.eval()
+sg.lowResGenerators[2] = generator2
 
-sg.generator = Generator()
+
+
+
+class Generator4(sg.GeneratorTemplate):
+
+    def __init__(self):
+        super(Generator4, self).__init__(4)
+
+        #latentChannels = 7
+        #self.noise2latent = nn.Sequential(
+        #    nn.Linear(sg.TCfg.latentDim, self.sinoSize*latentChannels),
+        #    nn.ReLU(),
+        #    nn.Unflatten( 1, (latentChannels,) + self.sinoSh )
+        #)
+
+        baseChannels = 64
+
+        def encblock(chIn, chOut, kernel, stride=1, norm=True, dopadding=False) :
+            layers = []
+            layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias=True,
+                                     padding='same', padding_mode='reflect') \
+                           if stride == 1 and dopadding else \
+                           nn.Conv2d(chIn, chOut, kernel, stride=stride, bias=True)
+                           )
+            if norm :
+                layers.append(nn.BatchNorm2d(chOut))
+            layers.append(nn.LeakyReLU(0.2))
+            sg.fillWheights(layers)
+            return torch.nn.Sequential(*layers)
+        self.encoders =  nn.ModuleList([
+            encblock(  1,                  baseChannels, 3, norm=False),
+            encblock(  baseChannels,     2*baseChannels, 3, stride=2),
+            encblock(  2*baseChannels,   2*baseChannels, 3),
+            encblock(  2*baseChannels,   2*baseChannels, 3),
+            ])
+
+        smpl = torch.zeros((1,1,*self.sinoSh))
+        for encoder in self.encoders :
+            smpl = encoder(smpl)
+        encSh = smpl.shape
+        linChannels = math.prod(encSh)
+        self.fcLink = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(linChannels, linChannels),
+            nn.LeakyReLU(0.2),
+            nn.Linear(linChannels, linChannels),
+            nn.LeakyReLU(0.2),
+            nn.Unflatten(1, encSh[1:]),
+        )
+        sg.fillWheights(self.fcLink)
+
+        def decblock(chIn, chOut, kernel, stride=1, norm=True) :
+            layers = []
+            layers.append(nn.ConvTranspose2d(chIn, chOut, kernel, stride, bias=True))
+            if norm :
+                layers.append(nn.BatchNorm2d(chOut))
+            layers.append(nn.LeakyReLU(0.2))
+            sg.fillWheights(layers)
+            return torch.nn.Sequential(*layers)
+        self.decoders = nn.ModuleList([
+            decblock(4*baseChannels, 2*baseChannels, 3),
+            decblock(4*baseChannels, 2*baseChannels, 3),
+            decblock(4*baseChannels,   baseChannels, 4, stride=2),
+            decblock(2*baseChannels,   baseChannels, 3, norm=False),
+            ])
+
+        self.lastTouch = nn.Sequential(
+            nn.Conv2d(baseChannels+1, 1, 1),
+            nn.Tanh(),
+        )
+        sg.fillWheights(self.lastTouch)
+
+
+    def forward(self, input):
+
+        images, noises = input
+        images, orgDims = sg.unsqeeze4dim(images)
+        modelIn = images.clone()
+        modelIn[self.gapRng] = self.preProc(images)
+
+        #latent = self.noise2latent(noises)
+        #modelIn = torch.cat((modelIn,latent),dim=1).to(sg.TCfg.device)
+        dwTrain = [modelIn,]
+        for encoder in self.encoders :
+            dwTrain.append(encoder(dwTrain[-1]))
+        mid = self.fcLink(dwTrain[-1])
+        upTrain = [mid]
+        for level, decoder in enumerate(self.decoders) :
+            upTrain.append( decoder( torch.cat( (upTrain[-1], dwTrain[-1-level]), dim=1 ) ) )
+        res = self.lastTouch(torch.cat( (upTrain[-1], modelIn ), dim=1 ))
+
+        patches = modelIn[self.gapRng] + 2 * res[self.gapRng]
+        return sg.squeezeOrg(patches, orgDims)
+
+generator4 = Generator4()
+generator4 = sg.load_model(generator4, model_path="saves/gen4.pt" )
+generator4 = generator4.to(sg.TCfg.device)
+generator4 = generator4.requires_grad_(False)
+generator4 = generator4.eval()
+sg.lowResGenerators[4] = generator4
+
+
+
+
+
+class Generator8(sg.GeneratorTemplate):
+
+    def __init__(self):
+        super(Generator8, self).__init__(8)
+
+        #latentChannels = 7
+        #self.noise2latent = nn.Sequential(
+        #    nn.Linear(sg.TCfg.latentDim, self.sinoSize*latentChannels),
+        #    nn.ReLU(),
+        #    nn.Unflatten( 1, (latentChannels,) + self.sinoSh )
+        #)
+
+        baseChannels = 64
+
+        def encblock(chIn, chOut, kernel, stride=1, norm=True, dopadding=False) :
+            layers = []
+            layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias=True,
+                                     padding='same', padding_mode='reflect') \
+                           if stride == 1 and dopadding else \
+                           nn.Conv2d(chIn, chOut, kernel, stride=stride, bias=True)
+                           )
+            if norm :
+                layers.append(nn.BatchNorm2d(chOut))
+            layers.append(nn.LeakyReLU(0.2))
+            sg.fillWheights(layers)
+            return torch.nn.Sequential(*layers)
+        self.encoders =  nn.ModuleList([
+            encblock(  1,                  baseChannels, 3, norm=False),
+            encblock(  baseChannels,     2*baseChannels, 3, stride=2),
+            encblock(  2*baseChannels,   4*baseChannels, 3, stride=2),
+            encblock(  4*baseChannels,   4*baseChannels, 3),
+            encblock(  4*baseChannels,   4*baseChannels, 3),
+            ])
+
+        smpl = torch.zeros((1,1,*self.sinoSh))
+        for encoder in self.encoders :
+            smpl = encoder(smpl)
+        encSh = smpl.shape
+        linChannels = math.prod(encSh)
+        self.fcLink = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(linChannels, linChannels),
+            nn.LeakyReLU(0.2),
+            nn.Linear(linChannels, linChannels),
+            nn.LeakyReLU(0.2),
+            nn.Unflatten(1, encSh[1:]),
+        )
+        sg.fillWheights(self.fcLink)
+
+        def decblock(chIn, chOut, kernel, stride=1, norm=True) :
+            layers = []
+            layers.append(nn.ConvTranspose2d(chIn, chOut, kernel, stride, bias=True))
+            if norm :
+                layers.append(nn.BatchNorm2d(chOut))
+            layers.append(nn.LeakyReLU(0.2))
+            sg.fillWheights(layers)
+            return torch.nn.Sequential(*layers)
+        self.decoders = nn.ModuleList([
+            decblock(8*baseChannels, 4*baseChannels, 3),
+            decblock(8*baseChannels, 4*baseChannels, 3),
+            decblock(8*baseChannels, 2*baseChannels, 4, stride=2),
+            decblock(4*baseChannels,   baseChannels, 4, stride=2),
+            decblock(2*baseChannels,   baseChannels, 3, norm=False),
+            ])
+
+        self.lastTouch = nn.Sequential(
+            nn.Conv2d(baseChannels+1, 1, 1),
+            nn.Tanh(),
+        )
+        sg.fillWheights(self.lastTouch)
+
+
+    def forward(self, input):
+
+        images, noises = input
+        images, orgDims = sg.unsqeeze4dim(images)
+        modelIn = images.clone()
+        modelIn[self.gapRng] = self.preProc(images)
+
+        #latent = self.noise2latent(noises)
+        #modelIn = torch.cat((modelIn,latent),dim=1).to(sg.TCfg.device)
+        dwTrain = [modelIn,]
+        for encoder in self.encoders :
+            dwTrain.append(encoder(dwTrain[-1]))
+        mid = self.fcLink(dwTrain[-1])
+        upTrain = [mid]
+        for level, decoder in enumerate(self.decoders) :
+            upTrain.append( decoder( torch.cat( (upTrain[-1], dwTrain[-1-level]), dim=1 ) ) )
+        res = self.lastTouch(torch.cat( (upTrain[-1], modelIn ), dim=1 ))
+
+        patches = modelIn[self.gapRng] + 2 * res[self.gapRng]
+        return sg.squeezeOrg(patches, orgDims)
+
+sg.generator = Generator8()
 sg.generator.to(sg.TCfg.device)
-#model_summary = summary(sg.generator, input_data=[ [sg.refImages[[0],...], sg.refNoises[[0],...]] ] ).__str__()
-#print(model_summary)
-#sg.writer.add_graph(sg.generator, ((sg.refImages, sg.refNoises),) )
 
 
 
@@ -509,14 +709,14 @@ sg.writer = sg.createWriter(sg.TCfg.logDir, True)
 
 #for item in itertools.chain( sg.optimizer_D.param_groups, sg.optimizer_G.param_groups ):
 #    item['lr'] *= 0.1
-trainLoader = sg.createTrainLoader(trainSet)#, num_workers=0)
+sg.dataLoader = sg.createTrainLoader(trainSet)#, num_workers=0)
 
 
 #torch.autograd.set_detect_anomaly(True)
 #Summary. Rec: 6.114e-04, MSE: 6.114e-04, L1L: 9.813e-03.
 sg.prepGdLoss = 6.114e-04
 if sg.prepGdLoss == 0:
-    Rec_diff, MSE_diff, L1L_diff = sg.summarizeSet(trainLoader)
+    Rec_diff, MSE_diff, L1L_diff = sg.summarizeSet(sg.dataLoader)
     sg.prepGdLoss = Rec_diff
     sg.writer.add_scalars("Distances per epoch",
                           {'MSE0': MSE_diff
@@ -525,9 +725,9 @@ if sg.prepGdLoss == 0:
                           }, 0 )
 
 try :
-    sg.train(trainLoader, savedCheckPoint)
+    sg.train(savedCheckPoint)
 except :
-    del trainLoader
+    del sg.dataLoader
     sg.freeGPUmem()
     1/10 # to release Jupyuter memory in the next step
     raise

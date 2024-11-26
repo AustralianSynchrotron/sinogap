@@ -509,7 +509,13 @@ examplesDb[4] = [(1298309, 1015)
                 ,(1707893,914)
                 ,(102151, 418)
                 ]
-examplesDb[8] = [ (436179, 70), ]
+examplesDb[8] = [(2348095, 1684)
+                ,(1909160,333)
+                ,(2489646, 1240)
+                ,(1429010,666)
+                ,(152196,251)
+                ,(1707893,914)
+                ,(102151, 418)]
 examplesDb[16] = [ (863470, 620), ]
 examples = initToNone('examples')
 
@@ -883,6 +889,8 @@ def imagesPostProc(images, procData=None) :
     return images
 
 
+noAdv=False
+
 @dataclass
 class TrainInfoClass:
     bestRealIndex = 0
@@ -913,7 +921,7 @@ trainInfo = TrainInfoClass()
 
 withNoGrad = True
 def train_step(images):
-    global trainDis, trainGen, eDinfo
+    global trainDis, trainGen, eDinfo, noAdv
     trainInfo.iterations += 1
 
     nofIm = images.shape[0]
@@ -925,24 +933,30 @@ def train_step(images):
     labelsFalse = torch.full((nofIm, 1),  TCfg.labelSmoothFac,
                         dtype=torch.float, device=TCfg.device)
 
-    D_loss = None
-    G_loss = None
-    GA_loss = None
-    GD_loss = None
+    D_loss = torch.zeros(1)
+    G_loss = torch.zeros(1)
+    GA_loss = torch.zeros(1)
+    GD_loss = torch.zeros(1)
+    pred_preD = torch.zeros(1)
+    pred_realD = torch.zeros(1)
+    pred_fakeD = torch.zeros(1)
+    pred_fakeG = torch.zeros(1)
     ratReal = 0
     ratFake = 0
     procImages, procReverseData = imagesPreProc(images)
 
-    # calculate predictions of prefilled images - purely for metrics purposes
-    discriminator.eval()
-    generator.eval()
-    fakeImagesD = procImages.clone().detach()
-    fakeImagesD.requires_grad=False
-    with torch.no_grad() :
-        fakeImagesD[DCfg.gapRng] = generator.preProc(procImages)
-    pred_preD = discriminator(fakeImagesD)
+    if not noAdv :
 
-    try :
+        # calculate predictions of prefilled images - purely for metrics purposes
+        discriminator.eval()
+        generator.eval()
+        fakeImagesD = procImages.clone().detach()
+        fakeImagesD.requires_grad=False
+        with torch.no_grad() :
+            fakeImagesD[DCfg.gapRng] = generator.preProc(procImages)
+        pred_preD = discriminator(fakeImagesD)
+
+        # train discriminator
         generator.eval()
         discriminator.train()
         optimizer_D.zero_grad()
@@ -951,29 +965,25 @@ def train_step(images):
         pred_realD = discriminator(procImages)
         pred_fakeD = discriminator(fakeImagesD)
         generator.preProc(images)
-
         pred_both = torch.cat((pred_realD, pred_fakeD), dim=0)
         labels = torch.cat( (labelsTrue, labelsFalse), dim=0).to(TCfg.device)
         D_loss = loss_Adv(labels, pred_both,
-                          None if imWeights is None else torch.cat( (imWeights, imWeights) )  )
+                            None if imWeights is None else torch.cat( (imWeights, imWeights) )  )
         D_loss.backward()
         optimizer_D.step()
-    except :
-        optimizer_D.zero_grad()
-        del fakeImagesD
-        del pred_realD
-        del pred_fakeD
-        del pred_both
-        del D_loss
-        raise
-    ratReal = torch.count_nonzero(pred_realD > 0.5)/nofIm
-    ratFake = torch.count_nonzero(pred_fakeD > 0.5)/nofIm
+        ratReal = torch.count_nonzero(pred_realD > 0.5)/nofIm
+        ratFake = torch.count_nonzero(pred_fakeD > 0.5)/nofIm
 
-    try :
-        discriminator.eval()
-        generator.train()
-        optimizer_G.zero_grad()
-        fakeImagesG = generator.generateImages(procImages)
+    # train generator
+    discriminator.eval()
+    generator.train()
+    optimizer_G.zero_grad()
+    fakeImagesG = generator.generateImages(procImages)
+    if noAdv :
+        G_loss = loss_Rec(procImages[DCfg.gapRng], fakeImagesG[DCfg.gapRng],
+                 imWeights)
+        GD_loss = GA_loss = G_loss
+    else :
         pred_fakeG=None
         if withNoGrad :
             with torch.no_grad() :
@@ -984,56 +994,52 @@ def train_step(images):
                                     procImages[DCfg.gapRng], fakeImagesG[DCfg.gapRng],
                                     imWeights)
         G_loss = GA_loss + lossDifCoef * GD_loss
-        G_loss.backward()
-        optimizer_G.step()
-    except :
-        optimizer_G.zero_grad()
-        del fakeImagesG
-        del pred_fakeG
-        del G_loss
-        del GA_loss
-        del GD_loss
-        raise
-    ratFake = torch.count_nonzero(pred_fakeG > 0.5)/nofIm
+        ratFake = torch.count_nonzero(pred_fakeG > 0.5)/nofIm
+    G_loss.backward()
+    optimizer_G.step()
 
-    deprocFakeImages = imagesPostProc(fakeImagesG, procReverseData)
+    MSE_loss = L1L_loss = None
+    with torch.no_grad() :
 
-    idx = pred_realD.argmax()
-    trainInfo.bestRealImage = images[idx,...].clone().detach()
-    trainInfo.bestRealProb = pred_realD[idx].item()
-    trainInfo.bestRealIndex = idx
+        deprocFakeImages = imagesPostProc(fakeImagesG, procReverseData)
+        MSE_loss = loss_MSE(images[DCfg.gapRng], deprocFakeImages[DCfg.gapRng])
+        L1L_loss = loss_L1L(images[DCfg.gapRng], deprocFakeImages[DCfg.gapRng])
 
-    idx = pred_realD.argmin()
-    trainInfo.worstRealImage = images[idx,...].clone().detach()
-    trainInfo.worstRealProb =  pred_realD[idx].item()
-    trainInfo.worstRealIndex = idx
+        idx = random.randint(0, nofIm-1) if noAdv else pred_realD.argmax()
+        trainInfo.bestRealImage = deprocFakeImages[idx,...].clone().detach() if noAdv \
+                                  else images[idx,...].clone().detach()
+        trainInfo.bestRealProb = 0 if noAdv else pred_realD[idx].item()
+        trainInfo.bestRealIndex = idx
 
-    idx = pred_fakeG.argmax()
-    trainInfo.bestFakeImage = deprocFakeImages[idx,...].clone().detach()
-    trainInfo.bestFakeProb = pred_fakeG[idx].item()
-    trainInfo.bestFakeIndex = idx
+        idx = random.randint(0, nofIm-1) if noAdv else pred_realD.argmin()
+        trainInfo.worstRealImage = deprocFakeImages[idx,...].clone().detach() if noAdv \
+                                   else images[idx,...].clone().detach()
+        trainInfo.worstRealProb = 0 if noAdv else pred_realD[idx].item()
+        trainInfo.worstRealIndex = idx
 
-    idx = pred_fakeG.argmin()
-    trainInfo.worstFakeImage = deprocFakeImages[idx,...].clone().detach()
-    trainInfo.worstFakeProb = pred_fakeG[idx].item()
-    trainInfo.worstFakeIndex = idx
+        idx = random.randint(0, nofIm-1) if noAdv else pred_fakeG.argmax()
+        trainInfo.bestFakeImage = deprocFakeImages[idx,...].clone().detach()
+        trainInfo.bestFakeProb = 0 if noAdv else pred_fakeG[idx].item()
+        trainInfo.bestFakeIndex = idx
 
-    trainInfo.highestDifIndex = eDinfo[0]
-    trainInfo.highestDif = eDinfo[1]
-    trainInfo.highestDifImageOrg = images[trainInfo.highestDifIndex,...].clone().detach()
-    trainInfo.highestDifImageGen = deprocFakeImages[trainInfo.highestDifIndex,...].clone().detach()
-    trainInfo.lowestDifIndex = eDinfo[2]
-    trainInfo.lowestDif = eDinfo[3]
+        idx = random.randint(0, nofIm-1) if noAdv else pred_fakeG.argmin()
+        trainInfo.worstFakeImage = deprocFakeImages[idx,...].clone().detach()
+        trainInfo.worstFakeProb = 0 if noAdv else pred_fakeG[idx].item()
+        trainInfo.worstFakeIndex = idx
 
-    trainInfo.ratReal += ratReal * nofIm
-    trainInfo.ratFake += ratFake * nofIm
-    trainInfo.totalImages += nofIm
+        trainInfo.highestDifIndex = eDinfo[0]
+        trainInfo.highestDif = eDinfo[1]
+        trainInfo.highestDifImageOrg = images[trainInfo.highestDifIndex,...].clone().detach()
+        trainInfo.highestDifImageGen = deprocFakeImages[trainInfo.highestDifIndex,...].clone().detach()
+        trainInfo.lowestDifIndex = eDinfo[2]
+        trainInfo.lowestDif = eDinfo[3]
 
-    MSE_loss = loss_MSE(images[DCfg.gapRng], deprocFakeImages[DCfg.gapRng])
-    L1L_loss = loss_L1L(images[DCfg.gapRng], deprocFakeImages[DCfg.gapRng])
+        trainInfo.ratReal += ratReal * nofIm
+        trainInfo.ratFake += ratFake * nofIm
+        trainInfo.totalImages += nofIm
 
     return D_loss, GA_loss, GD_loss, MSE_loss, L1L_loss, \
-           pred_realD.mean(),  pred_preD.mean(),  pred_fakeD.mean()
+           pred_realD.mean(), pred_preD.mean(), pred_fakeD.mean()
 
 
 epoch=initToNone('epoch')
@@ -1051,7 +1057,9 @@ def afterEachEpoch(epoch) :
     return
 
 
-def train(dataloader, savedCheckPoint):
+dataLoader=None
+
+def train(savedCheckPoint):
     global epoch, minGdLoss, minGEpoch, prepGdLoss, iter
     lastGdLoss = minGdLoss
 
@@ -1075,7 +1083,7 @@ def train(dataloader, savedCheckPoint):
         totalIm = 0
         eqSize = 0
 
-        for it , data in tqdm.tqdm(enumerate(dataloader), total=int(len(dataloader))):
+        for it , data in tqdm.tqdm(enumerate(dataLoader), total=int(len(dataLoader))):
             iter += 1
 
             images = data[0].to(TCfg.device)
@@ -1147,11 +1155,11 @@ def train(dataloader, savedCheckPoint):
 
 
                 IPython.display.clear_output(wait=True)
-                print(f"Epoch: {epoch} ({minGEpoch}). Losses: "
-                      f" Dis: {D_loss:.3f} "
-                      f"({trainInfo.ratReal/trainInfo.totalImages:.3f}),"
-                      f" Gen: {GA_loss:.3f} "
-                      f"({trainInfo.ratFake/trainInfo.totalImages:.3f}),"
+                print(f"Epoch: {epoch} ({minGEpoch}). Losses: " +
+                      ( f" L1L: {L1L_loss.item():.3e} " if noAdv \
+                          else f" Dis: {D_loss.item():.3f} ({trainInfo.ratReal/trainInfo.totalImages:.3f})," ) +
+                      ( f" MSE: {MSE_loss.item():.3e} " if noAdv \
+                          else f" Gen: {GA_loss.item():.3f} ({trainInfo.ratFake/trainInfo.totalImages:.3f})," ) +
                       f" Rec: {lastGdLoss:.3e} ({minGdLoss:.3e} / {prepGdLoss:.3e})."
                       )
                 trainInfo.iterations = 0
