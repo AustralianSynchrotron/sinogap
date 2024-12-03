@@ -495,7 +495,7 @@ examplesDb[2] = [(1271101, 570)
 examplesDb[4] = [(1298309, 1015)
                 #,(4612947, 2882)
                 ,(2215760, 500)
-                ,(2348099, 1684)
+                ,(2348095, 1684)
                 ,(1907990, 1545)
                 ,(291661, 724)
                 ,(2489646, 1240)
@@ -594,6 +594,30 @@ class GeneratorTemplate(nn.Module):
         self.gapSize = math.prod(self.gapSh)
         self.gapRngX = np.s_[ self.sinoSh[1]//2 - self.gapW//2 : self.sinoSh[1]//2 + self.gapW//2 ]
         self.gapRng = np.s_[...,self.gapRngX]
+
+
+    def encblock(self, chIn, chOut, kernel, stride=1, norm=True, dopadding=False) :
+        layers = []
+        layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias=True,
+                                padding='same', padding_mode='reflect') \
+                                if stride == 1 and dopadding else \
+                                nn.Conv2d(chIn, chOut, kernel, stride=stride, bias=True)
+                     )
+        if norm :
+            layers.append(nn.BatchNorm2d(chOut))
+        layers.append(nn.LeakyReLU(0.2))
+        fillWheights(layers)
+        return torch.nn.Sequential(*layers)
+
+
+    def decblock(self, chIn, chOut, kernel, stride=1, norm=True) :
+        layers = []
+        layers.append(nn.ConvTranspose2d(chIn, chOut, kernel, stride, bias=True))
+        if norm :
+            layers.append(nn.BatchNorm2d(chOut))
+        layers.append(nn.LeakyReLU(0.2))
+        fillWheights(layers)
+        return torch.nn.Sequential(*layers)
 
 
     def generatePatches(self, images, noises=None) :
