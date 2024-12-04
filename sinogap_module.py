@@ -610,9 +610,13 @@ class GeneratorTemplate(nn.Module):
         return torch.nn.Sequential(*layers)
 
 
-    def decblock(self, chIn, chOut, kernel, stride=1, norm=True) :
+    def decblock(self, chIn, chOut, kernel, stride=1, norm=True, dopadding=False) :
         layers = []
-        layers.append(nn.ConvTranspose2d(chIn, chOut, kernel, stride, bias=True))
+        layers.append( nn.ConvTranspose2d(chIn, chOut, kernel, stride, bias=True,
+                                          padding=1) \
+                       if stride == 1 and dopadding else \
+                       nn.ConvTranspose2d(chIn, chOut, kernel, stride, bias=True)
+                      )
         if norm :
             layers.append(nn.BatchNorm2d(chOut))
         layers.append(nn.LeakyReLU(0.2))
