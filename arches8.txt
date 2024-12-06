@@ -1,0 +1,46 @@
+#arch 1
+            encblock(  1,                  baseChannels, 3, norm=False),
+            encblock(  baseChannels,     2*baseChannels, 3, stride=2),
+            encblock(  2*baseChannels,   4*baseChannels, 3, stride=2),
+            encblock(  4*baseChannels,   4*baseChannels, 3),
+            encblock(  4*baseChannels,   4*baseChannels, 3),
+
+# arch 2
+
+# arch 3
+            encblock(  1,                baseChannels, 3, norm=False),
+            encblock(  baseChannels,   2*baseChannels, 3, stride=2),
+            encblock(  2*baseChannels, 2*baseChannels, 3, dopadding=True),
+            encblock(  2*baseChannels, 4*baseChannels, 3, stride=2),
+            encblock(  4*baseChannels, 4*baseChannels, 3),
+            encblock(  4*baseChannels, 4*baseChannels, 3),
+
+# arch 4
+            encblock(  1,                  baseChannels, 5, norm=False),
+            encblock(  baseChannels,       baseChannels, 3),
+            encblock(  baseChannels,     2*baseChannels, 3, stride=2),
+            encblock(  2*baseChannels,   2*baseChannels, 3),
+            encblock(  2*baseChannels,   4*baseChannels, 3, stride=2),
+            encblock(  4*baseChannels,   4*baseChannels, 3),
+
+# arch 5 
+            encblock(  1,                  baseChannels, 7, norm=False),
+            encblock(  baseChannels,     2*baseChannels, 3, stride=2),
+            encblock(  2*baseChannels,   2*baseChannels, 3),
+            encblock(  2*baseChannels,   4*baseChannels, 3, stride=2),
+            encblock(  4*baseChannels,   4*baseChannels, 3),
+
+# arch 6
+        baseChannels = 64*2
+            encblock(  1,                baseChannels, 7, norm=False),
+            encblock(    baseChannels,   baseChannels, 5, ),
+            encblock(    baseChannels,   baseChannels, 5, ),
+            encblock(    baseChannels, 2*baseChannels, 3, stride=2),
+            encblock(  2*baseChannels, 2*baseChannels, 3),
+            encblock(  2*baseChannels, 2*baseChannels, 3),
+            encblock(  2*baseChannels, 2*baseChannels, 3),
+            encblock(  2*baseChannels, 2*baseChannels, 3),
+
+
+
+
