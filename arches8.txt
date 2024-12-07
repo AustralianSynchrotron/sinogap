@@ -5,9 +5,9 @@
             4*baseChannels,   4*baseChannels, 3
             4*baseChannels,   4*baseChannels, 3
 
-# arch 2
+# arch 2 - same as arch 1
 
-# arch 3
+# arch 3 - better than arch 1
             1,                baseChannels, 3, norm=False
             baseChannels,   2*baseChannels, 3, stride=2
             2*baseChannels, 2*baseChannels, 3, dopadding=True
@@ -15,7 +15,7 @@
             4*baseChannels, 4*baseChannels, 3
             4*baseChannels, 4*baseChannels, 3
 
-# arch 4
+# arch 4 - same as arch 3
             1,                  baseChannels, 5, norm=False
             baseChannels,       baseChannels, 3
             baseChannels,     2*baseChannels, 3, stride=2
@@ -23,14 +23,14 @@
             2*baseChannels,   4*baseChannels, 3, stride=2
             4*baseChannels,   4*baseChannels, 3
 
-# arch 5
+# arch 5 - same as arch 3
             1,                  baseChannels, 7, norm=False
             baseChannels,     2*baseChannels, 3, stride=2
             2*baseChannels,   2*baseChannels, 3
             2*baseChannels,   4*baseChannels, 3, stride=2
             4*baseChannels,   4*baseChannels, 3
 
-# arch 6
+# arch 6 - slower and bigger than arch 3 with same results
         baseChannels = 64*2
             1,                baseChannels, 7, norm=False
               baseChannels,   baseChannels, 5,
@@ -41,7 +41,7 @@
             2*baseChannels, 2*baseChannels, 3
             2*baseChannels, 2*baseChannels, 3
 
-# arch 7
+# arch 7 - same as arch 3
               1,                  baseChannels, 3, norm=False
               baseChannels,     2*baseChannels, 3, stride=2
             2*baseChannels,     2*baseChannels, 3
@@ -49,7 +49,7 @@
             2*baseChannels,     4*baseChannels, 3, stride=2
             4*baseChannels,     4*baseChannels, 3
 
-# arch 8
+# arch 8 - worse than arch 3
             1,                baseChannels, 7, norm=False
               baseChannels,   baseChannels, 7
               baseChannels, 2*baseChannels, 5, stride=2
