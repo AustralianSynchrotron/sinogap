@@ -898,11 +898,12 @@ def initialTest() :
               f"REC: {ref_loss_Rec:.3e}, "
               f"MSE: {ref_loss_MSE:.3e}, "
               f"L1L: {ref_loss_L1L:.3e}.")
-        writer.add_scalars("Dist of ref images",
-                              { 'REC0' : ref_loss_Rec
-                              , 'MSE0' : ref_loss_MSE
-                              , 'L1L0' : ref_loss_L1L
-                              }, 0 )
+        if not epoch :
+            writer.add_scalars("Dist of ref images",
+                                  { 'REC' : ref_loss_Rec
+                                  , 'MSE' : ref_loss_MSE
+                                  , 'L1L' : ref_loss_L1L
+                                  }, 0 )
         plotImage(collage)
 
 

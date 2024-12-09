@@ -41,7 +41,7 @@
             2*baseChannels, 2*baseChannels, 3
             2*baseChannels, 2*baseChannels, 3
 
-# arch 7 - same as arch 3
+# arch 7 - worse
               1,                  baseChannels, 3, norm=False
               baseChannels,     2*baseChannels, 3, stride=2
             2*baseChannels,     2*baseChannels, 3
@@ -57,7 +57,7 @@
             2*baseChannels, 4*baseChannels, 3
             4*baseChannels, 4*baseChannels, 3
 
-# arch 9, batch size 1/4 of others
+# arch 9, batch size 1/4 of others - worse
             1,              baseChannels, 3, norm=False
             baseChannels,   baseChannels, 3
             baseChannels,   baseChannels, 3
@@ -75,3 +75,28 @@
             baseChannels,   baseChannels, 3
             baseChannels,   baseChannels, 3
 
+# arch 10
+            16*baseChannels, 4*baseChannels, 4, stride=2
+             8*baseChannels, 2*baseChannels, 4, stride=2
+             4*baseChannels,   baseChannels, 4, stride=2
+             2*baseChannels,   baseChannels, 3, norm=False
+
+# arch 11
+            1,                  baseChannels, 3, norm=False
+            baseChannels,     2*baseChannels, 3, stride=2
+            2*baseChannels,   2*baseChannels, 3, dopadding=True
+            2*baseChannels,   4*baseChannels, 3, stride=2
+            4*baseChannels,   4*baseChannels, 3, dopadding=True
+            4*baseChannels,   8*baseChannels, 3, stride=2
+            8*baseChannels,   8*baseChannels, 3, dopadding=True
+
+# arch 12
+
+            1,                  baseChannels, 3, norm=False
+            baseChannels,       baseChannels, 3, dopadding=True
+            baseChannels,     2*baseChannels, 3, stride=2
+            2*baseChannels,   2*baseChannels, 3, dopadding=True
+            2*baseChannels,   4*baseChannels, 3, stride=2
+            4*baseChannels,   4*baseChannels, 3, dopadding=True
+            4*baseChannels,   8*baseChannels, 3, stride=2
+            8*baseChannels,   8*baseChannels, 3, dopadding=True
