@@ -1,4 +1,4 @@
-#arch 1
+#arch 1 - superseeded by arch 3
             1,                  baseChannels, 3, norm=False
             baseChannels,     2*baseChannels, 3, stride=2
             2*baseChannels,   4*baseChannels, 3, stride=2
@@ -7,7 +7,7 @@
 
 # arch 2 - same as arch 1
 
-# arch 3 - better than arch 1
+# arch 3 - better than arch 1, superseeded by arch 12
             1,                baseChannels, 3, norm=False
             baseChannels,   2*baseChannels, 3, stride=2
             2*baseChannels, 2*baseChannels, 3, dopadding=True
@@ -41,7 +41,7 @@
             2*baseChannels, 2*baseChannels, 3
             2*baseChannels, 2*baseChannels, 3
 
-# arch 7 - worse
+# arch 7 - worse than arch 3
               1,                  baseChannels, 3, norm=False
               baseChannels,     2*baseChannels, 3, stride=2
             2*baseChannels,     2*baseChannels, 3
@@ -75,13 +75,13 @@
             baseChannels,   baseChannels, 3
             baseChannels,   baseChannels, 3
 
-# arch 10
+# arch 10 - worse than arch 3
             16*baseChannels, 4*baseChannels, 4, stride=2
              8*baseChannels, 2*baseChannels, 4, stride=2
              4*baseChannels,   baseChannels, 4, stride=2
              2*baseChannels,   baseChannels, 3, norm=False
 
-# arch 11
+# arch 11 - worse than arch 12
             1,                  baseChannels, 3, norm=False
             baseChannels,     2*baseChannels, 3, stride=2
             2*baseChannels,   2*baseChannels, 3, dopadding=True
@@ -90,8 +90,7 @@
             4*baseChannels,   8*baseChannels, 3, stride=2
             8*baseChannels,   8*baseChannels, 3, dopadding=True
 
-# arch 12
-
+# arch 12 - better than all above
             1,                  baseChannels, 3, norm=False
             baseChannels,       baseChannels, 3, dopadding=True
             baseChannels,     2*baseChannels, 3, stride=2
@@ -100,3 +99,20 @@
             4*baseChannels,   4*baseChannels, 3, dopadding=True
             4*baseChannels,   8*baseChannels, 3, stride=2
             8*baseChannels,   8*baseChannels, 3, dopadding=True
+
+# arch 13 (baseChannels = 1/4)
+            1,                  baseChannels, 3, norm=False
+            baseChannels,       baseChannels, 3, dopadding=True
+            baseChannels,     2*baseChannels, 3, stride=2
+            2*baseChannels,   2*baseChannels, 3, dopadding=True
+            2*baseChannels,   4*baseChannels, 3, stride=2
+            4*baseChannels,   4*baseChannels, 3, dopadding=True
+
+# arch 14 (baseChannels = 1/2)
+            1,                  baseChannels, 3, norm=False
+            baseChannels,       baseChannels, 3, dopadding=True
+            baseChannels,     2*baseChannels, 3, stride=2
+            2*baseChannels,   2*baseChannels, 3, dopadding=True
+            2*baseChannels,   4*baseChannels, 3, stride=2
+            4*baseChannels,   4*baseChannels, 3
+
