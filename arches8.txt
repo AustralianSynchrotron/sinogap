@@ -100,7 +100,7 @@
             4*baseChannels,   8*baseChannels, 3, stride=2
             8*baseChannels,   8*baseChannels, 3, dopadding=True
 
-# arch 13 (baseChannels = 1/4)
+# arch 13 (baseChannels = 1/4) - worse than arch 12
             1,                  baseChannels, 3, norm=False
             baseChannels,       baseChannels, 3, dopadding=True
             baseChannels,     2*baseChannels, 3, stride=2
@@ -108,7 +108,7 @@
             2*baseChannels,   4*baseChannels, 3, stride=2
             4*baseChannels,   4*baseChannels, 3, dopadding=True
 
-# arch 14 (baseChannels = 1/2)
+# arch 14 (baseChannels = 1/2) - worse than arch 12
             1,                  baseChannels, 3, norm=False
             baseChannels,       baseChannels, 3, dopadding=True
             baseChannels,     2*baseChannels, 3, stride=2
@@ -116,3 +116,32 @@
             2*baseChannels,   4*baseChannels, 3, stride=2
             4*baseChannels,   4*baseChannels, 3
 
+# arch 15 (batchSize = 1/2)
+            1,                  baseChannels, 3, norm=False
+            baseChannels,       baseChannels, 3, dopadding=True
+            baseChannels,     2*baseChannels, 3, stride=2
+            2*baseChannels,   2*baseChannels, 3, dopadding=True
+            2*baseChannels,   4*baseChannels, 3, stride=2
+            4*baseChannels,   4*baseChannels, 3, dopadding=True
+            4*baseChannels,   4*baseChannels, 3
+            4*baseChannels,   4*baseChannels, 3
+
+# arch 16 (batchSize = 1/2)
+            1,                  baseChannels, 3, norm=False
+            baseChannels,       baseChannels, 3, dopadding=True
+            baseChannels,     2*baseChannels, 3, stride=2
+            2*baseChannels,   2*baseChannels, 3, dopadding=True
+            2*baseChannels,   4*baseChannels, 3, stride=2
+            4*baseChannels,   4*baseChannels, 3, dopadding=True
+            4*baseChannels,   8*baseChannels, 3
+            8*baseChannels,   8*baseChannels, 3
+            8*baseChannels,  16*baseChannels, 3
+
+# arch 17 (batchSize = 1/2)
+            1,                  baseChannels, 3, norm=False
+            baseChannels,       baseChannels, 3, dopadding=True
+            baseChannels,     2*baseChannels, 3, stride=2
+            2*baseChannels,   2*baseChannels, 3
+            2*baseChannels,   4*baseChannels, 3, stride=2
+            4*baseChannels,   4*baseChannels, 3
+            4*baseChannels,   8*baseChannels, 3
