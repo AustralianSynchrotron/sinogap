@@ -137,7 +137,7 @@
             8*baseChannels,   8*baseChannels, 3
             8*baseChannels,  16*baseChannels, 3
 
-# arch 17 (batchSize = 1/2)
+# arch 17 (batchSize = 1/2) - worse than arch 15, 16
             1,                  baseChannels, 3, norm=False
             baseChannels,       baseChannels, 3, dopadding=True
             baseChannels,     2*baseChannels, 3, stride=2
