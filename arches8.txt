@@ -116,7 +116,7 @@
             2*baseChannels,   4*baseChannels, 3, stride=2
             4*baseChannels,   4*baseChannels, 3
 
-# arch 15 (batchSize = 1/2)
+# arch 15 (batchSize = 1/2) - only a little worse than arch 16, but faster!
             1,                  baseChannels, 3, norm=False
             baseChannels,       baseChannels, 3, dopadding=True
             baseChannels,     2*baseChannels, 3, stride=2

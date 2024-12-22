@@ -518,7 +518,7 @@ examplesDb[8] = [(2348095, 1684)
                 ,(1707893,914)
                 ,(102151, 418)]
 examplesDb[16] = [ (2348095, 1684)
-                 , (863470, 620)
+                 , (1958164,1391)
                  ,(1429010,666)
                  , (102151, 418)]
 examples = initToNone('examples')
@@ -1195,17 +1195,12 @@ def train(savedCheckPoint):
         predPreAcc = 0
         predFakeAcc = 0
         totalIm = 0
-        eqSize = 0
 
         for it , data in tqdm.tqdm(enumerate(dataLoader), total=int(len(dataLoader))):
             iter += 1
 
             images = data[0].to(TCfg.device)
             nofIm = images.shape[0]
-            if not it :
-                eqSize = nofIm
-            elif eqSize != nofIm :
-                break # last batch is smaller than others; don't want it.
             totalIm += nofIm
             D_loss, GA_loss, GD_loss, MSE_loss, L1L_loss, \
             predReal, predPre, predFake \
