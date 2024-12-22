@@ -39,17 +39,18 @@ def initToNone(var) :
 @dataclass
 class TCfgClass:
     exec : int
-    device: torch.device = field(repr = True, init = False)
-    nofEpochs: int
     latentDim: int
     batchSize: int
     labelSmoothFac: float
     learningRateD: float
     learningRateG: float
+    device: torch.device = torch.device('cpu')
+    nofEpochs: int = 0
     historyHDF : str = field(repr = True, init = False)
     logDir : str = field(repr = True, init = False)
     def __post_init__(self):
-        self.device = f"cuda:{self.exec}"
+        if self.device == torch.device('cpu')  :
+            self.device = torch.device(f"cuda:{self.exec}")
         self.historyHDF = f"train_{self.exec}.hdf"
         self.logDir = f"runs/experiment_{self.exec}"
 TCfg = initToNone('TCfg')
@@ -276,8 +277,8 @@ def loadCheckPoint(path, generator, discriminator,
     iterations = checkPoint['iterations']
     minGEpoch = checkPoint['minGEpoch']
     minGdLoss = checkPoint['minGdLoss']
-    generator.load_state_dict(checkPoint['generator'])
-    discriminator.load_state_dict(checkPoint['discriminator'])
+    realModel(generator).load_state_dict(checkPoint['generator'])
+    realModel(discriminator).load_state_dict(checkPoint['discriminator'])
     if not optimizerGen is None :
         optimizerGen.load_state_dict(checkPoint['optimizerGen'])
     if not schedulerGen is None :
@@ -522,7 +523,6 @@ examplesDb[16] = [ (2348095, 1684)
                  , (102151, 418)]
 examples = initToNone('examples')
 
-
 def createTrainSet() :
     listOfData = [ "4176862R_Eig_Threshold-4keV"
                  , "18515.Lamb1_Eiger_7m_45keV_360Scan"
@@ -544,8 +544,73 @@ def createTrainLoader(trainSet, num_workers=os.cpu_count()) :
         dataset=trainSet,
         batch_size=TCfg.batchSize,
         shuffle=False,
-        num_workers=num_workers
+        num_workers=num_workers,
+        drop_last=True
     )
+
+
+class PrepackedHDF :
+
+    def __init__(self, sampleName):
+        sampleHDF = sampleName.split(':')
+        if len(sampleHDF) != 2 :
+            raise Exception(f"String \"{sampleName}\" does not represent an HDF5 format.")
+        with h5py.File(sampleHDF[0],'r') as trgH5F:
+            if  sampleHDF[1] not in trgH5F.keys():
+                raise Exception(f"No dataset '{sampleHDF[1]}' in input file {sampleHDF[0]}.")
+            self.data = trgH5F[sampleHDF[1]]
+            if not self.data.size :
+                raise Exception(f"Container \"{sampleName}\" is zero size.")
+            self.sh = self.data.shape
+            if len(self.sh) != 3 :
+                raise Exception(f"Dimensions of the container \"{sampleName}\" is not 3 {self.sh}.")
+            self.fsh = self.sh[1:3]
+            if self.fsh != (80,80) :
+                raise Exception(f"Dimensions of the container \"{sampleName}\" is not 80,80 {self.fsh}.")
+            self.volume = None
+            self.volume = np.empty(self.sh, dtype=np.float32)
+            self.data.read_direct(self.volume)
+            trgH5F.close()
+
+    def get_dataset(self, transform=None) :
+
+        class Sinos(torch.utils.data.Dataset) :
+
+            def __init__(self, root, transform=None):
+                self.container = root
+                self.transform = transforms.Compose([transforms.ToTensor(), transform]) \
+                    if transform else transforms.ToTensor()
+
+            def __len__(self):
+                return self.container.sh[0]
+
+            def __getitem__(self, index):
+                data=self.container.volume[[index],...]
+                data = self.transform(data)
+                return data
+
+        return Sinos(self, transform)
+
+def createTestSet() :
+    sinoRoot = PrepackedHDF("storage/test/testSetSmall.hdf:/data")
+    mytransforms = transforms.Compose([
+            transforms.Resize(DCfg.sinoSh),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.Normalize(mean=(0.5), std=(1))
+    ])
+    return sinoRoot.get_dataset(mytransforms)
+
+
+def createTestLoader(testSet, num_workers=os.cpu_count()) :
+    return torch.utils.data.DataLoader(
+        dataset=testSet,
+        batch_size = TCfg.batchSize, # test requires no grad
+        shuffle=False,
+        num_workers=num_workers,
+        drop_last=True
+    )
+
 
 
 def createReferences(trainSet, toShow = 0) :
@@ -583,6 +648,10 @@ def showMe(trainSet, item=None) :
     tensorStat(image)
     plotImage(image.cpu())
     image = image.to(TCfg.device)
+
+
+def realModel(mod) :
+    return mod.module if isinstance(mod, nn.DataParallel) else mod
 
 
 class GeneratorTemplate(nn.Module):
@@ -652,14 +721,15 @@ class GeneratorTemplate(nn.Module):
         else :
             preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
             res = None
-            with torch.inference_mode() :
-                res = lowResGenerators[self.gapW//2].generatePatches(preImages)
+            with torch.no_grad() :
+                res = realModel(lowResGenerators[self.gapW//2]).generatePatches(preImages)
             res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
         return squeezeOrg(res, orgDims)
 
 
 generator = initToNone('generator')
 lowResGenerators = {}
+
 
 
 class DiscriminatorTemplate(nn.Module):
@@ -758,22 +828,28 @@ def loss_Gen(y_true, y_pred, p_true, p_pred, weights=None):
     return lossAdv, lossDif
 
 
-def summarizeSet(dataloader):
+def summarizeSet(dataloader, onPrep=True):
+
 
     MSE_diffs, L1L_diffs, Rec_diffs = [], [], []
     totalNofIm = 0
-    for it , data in tqdm.tqdm(enumerate(dataloader), total=int(len(dataloader))):
-        images = data[0].squeeze(1).to(TCfg.device)
-        nofIm = images.shape[0]
-        totalNofIm += nofIm
-        prepImages = images.clone()
-        prepImages[DCfg.gapRng] = generator.preProc(images)
-        MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], prepImages[DCfg.gapRng]))
-        L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], prepImages[DCfg.gapRng]))
-        procImages, procData = imagesPreProc(images)
-        prepImages = procImages.clone()
-        prepImages[DCfg.gapRng] = generator.preProc(procImages)
-        Rec_diffs.append( nofIm * loss_Rec(procImages[DCfg.gapRng], prepImages[DCfg.gapRng]))
+    generator.to(TCfg.device)
+    realModel(generator).eval()
+    with torch.no_grad() :
+        for it , data in tqdm.tqdm(enumerate(dataloader), total=int(len(dataloader))):
+            images = data[0].squeeze(1).to(TCfg.device)
+            nofIm = images.shape[0]
+            totalNofIm += nofIm
+            procImages, procData = imagesPreProc(images)
+            prepImages = procImages.clone()
+            if onPrep :
+                prepImages[DCfg.gapRng] = realModel(generator).preProc(prepImages)
+            else :
+                prepImages[DCfg.gapRng] = realModel(generator).generatePatches(prepImages)
+            procImages = imagesPostProc(prepImages, procData)
+            MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages[DCfg.gapRng]))
+            L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], procImages[DCfg.gapRng]))
+            Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], procImages[DCfg.gapRng]))
 
     MSE_diff = sum(MSE_diffs) / totalNofIm
     L1L_diff = sum(L1L_diffs) / totalNofIm
@@ -792,8 +868,8 @@ def generateDiffImages(images, layout=None) :
     dists = None
     with torch.inference_mode() :
         generator.eval()
-        pre[DCfg.gapRng] = generator.preProc(images)
-        gen[DCfg.gapRng] = generator.generatePatches(images)
+        pre[DCfg.gapRng] = realModel(generator).preProc(images)
+        gen[DCfg.gapRng] = realModel(generator).generatePatches(images)
         dif[DCfg.gapRng] = (gen - pre)[DCfg.gapRng]
         dif[...,hGap:hGap+DCfg.gapW] = (images - pre)[DCfg.gapRng]
         dif[...,-DCfg.gapW-hGap:-hGap] = (images - gen)[DCfg.gapRng]
@@ -893,7 +969,7 @@ def initialTest() :
               f'Gen: {probs[2]:.3e}, '
               f'Pre: {probs[1]:.3e}.')
         generator.eval()
-        pre = generator.preProc(refImages)
+        pre = realModel(generator).preProc(refImages)
         ref_loss_Rec = loss_Rec(refImages[DCfg.gapRng], pre, calculateWeights(refImages))
         ref_loss_MSE = loss_MSE(refImages[DCfg.gapRng], pre)
         ref_loss_L1L = loss_L1L(refImages[DCfg.gapRng], pre)
@@ -1010,7 +1086,12 @@ def train_step(images):
     discriminator.eval()
     generator.train()
     optimizer_G.zero_grad()
-    fakeImagesG = generator.generateImages(procImages)
+    fakeImagesG = None
+    if isinstance(generator, nn.DataParallel) :
+        fakeImagesG = procImages.clone()
+        fakeImagesG[DCfg.gapRng] = generator((procImages, None))
+    else :
+        fakeImagesG = generator.generateImages(procImages)
     if noAdv :
         G_loss = loss_Rec(procImages[DCfg.gapRng], fakeImagesG[DCfg.gapRng],
                  imWeights)
@@ -1090,6 +1171,7 @@ def afterEachEpoch(epoch) :
 
 
 dataLoader=None
+testLoader=None
 
 def train(savedCheckPoint):
     global epoch, minGdLoss, minGEpoch, prepGdLoss, iter
@@ -1210,6 +1292,13 @@ def train(savedCheckPoint):
                        f"LD: {trainInfo.lowestDif:.3e} ({data[1][trainInfo.lowestDifIndex]},{data[2][trainInfo.lowestDifIndex]}),  "
                        f"R : {probsR[0,0].item():.5f}." )
                 plotImage(showMe)
+
+        Rec_test, MSE_test, L1L_test = summarizeSet(testLoader, False)
+        writer.add_scalars("Test per epoch",
+                           {'MSE': MSE_test
+                           ,'L1L': L1L_test
+                           ,'REC': Rec_test
+                           }, epoch )
 
         lossDacc /= totalIm
         lossGAacc /= totalIm
