@@ -595,8 +595,8 @@ def createTestSet() :
     sinoRoot = PrepackedHDF("storage/test/testSetSmall.hdf:/data")
     mytransforms = transforms.Compose([
             transforms.Resize(DCfg.sinoSh),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
+#            transforms.RandomHorizontalFlip(),
+#            transforms.RandomVerticalFlip(),
             transforms.Normalize(mean=(0.5), std=(1))
     ])
     return sinoRoot.get_dataset(mytransforms)
