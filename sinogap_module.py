@@ -738,6 +738,19 @@ class DiscriminatorTemplate(nn.Module):
     def __init__(self):
         super(DiscriminatorTemplate, self).__init__()
 
+    def encblock(self, chIn, chOut, kernel, stride=1, norm=True, dopadding=False) :
+        layers = []
+        layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias=True,
+                                padding='same', padding_mode='reflect') \
+                                if stride == 1 and dopadding else \
+                                nn.Conv2d(chIn, chOut, kernel, stride=stride, bias=True)
+                     )
+        if norm :
+            layers.append(nn.BatchNorm2d(chOut))
+        layers.append(nn.LeakyReLU(0.2))
+        fillWheights(layers)
+        return torch.nn.Sequential(*layers)
+
     def forward(self, images):
         if images.dim() == 3:
             images = images.unsqueeze(1)
@@ -789,6 +802,7 @@ def createCriteria() :
     return BCE, MSE, L1L
 BCE, MSE, L1L = createCriteria()
 lossDifCoef = 0
+lossAdvCoef = 1.0
 
 def applyWeights(inp, weights):
     inp = inp.squeeze()
@@ -1107,7 +1121,7 @@ def train_step(images):
         GA_loss, GD_loss = loss_Gen(labelsTrue, pred_fakeG,
                                     procImages[DCfg.gapRng], fakeImagesG[DCfg.gapRng],
                                     imWeights)
-        G_loss = GA_loss + lossDifCoef * GD_loss
+        G_loss = lossAdvCoef * GA_loss + lossDifCoef * GD_loss
         ratFake = torch.count_nonzero(pred_fakeG > 0.5)/nofIm
     G_loss.backward()
     optimizer_G.step()
@@ -1250,7 +1264,7 @@ def train(savedCheckPoint):
                 writer.add_scalars("Losses per iter",
                                    {'Dis': D_loss
                                    ,'Adv': GA_loss
-                                   ,'Gen': GA_loss + lossDifCoef * GD_loss
+                                   ,'Gen': lossAdvCoef * GA_loss + lossDifCoef * GD_loss
                                    }, iter )
                 writer.add_scalars("Distances per iter",
                                    {'MSE': MSE_loss
@@ -1308,7 +1322,7 @@ def train(savedCheckPoint):
         writer.add_scalars("Losses per epoch",
                            {'Dis': lossDacc
                            ,'Adv': lossGAacc
-                           ,'Gen': lossGAacc + lossDifCoef * lossGDacc
+                           ,'Gen': lossAdvCoef * lossGAacc + lossDifCoef * lossGDacc
                            }, epoch )
         writer.add_scalars("Distances per epoch",
                            {'MSE': lossMSEacc
