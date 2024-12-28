@@ -528,6 +528,7 @@ def createTrainSet() :
                  , "18515.Lamb1_Eiger_7m_45keV_360Scan"
                  , "23574.8965435L.Eiger.32kev_org"
                  , "23574.8965435L.Eiger.32kev_sft"
+                 #, "18692b_input_PhantomM"
                  ]
     sinoRoot = StripesFromHDFs(listOfData)
     mytransforms = transforms.Compose([
@@ -841,15 +842,14 @@ def summarizeSet(dataloader, onPrep=True):
             nofIm = images.shape[0]
             totalNofIm += nofIm
             procImages, procData = imagesPreProc(images)
-            prepImages = procImages.clone()
-            if onPrep :
-                prepImages[DCfg.gapRng] = realModel(generator).preProc(prepImages)
-            else :
-                prepImages[DCfg.gapRng] = realModel(generator).generatePatches(prepImages)
-            procImages = imagesPostProc(prepImages, procData)
-            MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages[DCfg.gapRng]))
-            L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], procImages[DCfg.gapRng]))
-            Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], procImages[DCfg.gapRng]))
+            #prepImages = procImages.clone()
+            patchImages = realModel(generator).preProc(procImages) \
+                          if onPrep else \
+                          realModel(generator).generatePatches(procImages)
+            procImages = imagesPostProc(patchImages, procData)
+            MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages))
+            L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], procImages))
+            Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], procImages))
 
     MSE_diff = sum(MSE_diffs) / totalNofIm
     L1L_diff = sum(L1L_diffs) / totalNofIm
