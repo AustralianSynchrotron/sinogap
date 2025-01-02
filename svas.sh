@@ -22,7 +22,8 @@ while read flnm ; do
   cp -Lvr "$flnm" "$oDir/$onm"
 done
 #echo cp -r sinogap_module.py *${iMask}* "$oDir"
-cp -r runs/*${iMask} "$oDir/logs"
+#cp -rf runs/*${iMask}/* "$oDir/logs"
+rsync -av runs/*${iMask}/ "$oDir/logs"
  
 
 
