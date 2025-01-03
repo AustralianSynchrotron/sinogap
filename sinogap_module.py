@@ -754,6 +754,9 @@ class DiscriminatorTemplate(nn.Module):
     def forward(self, images):
         if images.dim() == 3:
             images = images.unsqueeze(1)
+        images = images.clone() # I want to exclude two blocks on the edges :
+        images[ ..., :DCfg.gapW, DCfg.gapRngX ] = 0
+        images[ ..., -DCfg.gapW:, DCfg.gapRngX ] = 0
         convRes = self.body(images)
         res = self.head(convRes)
         return res
@@ -967,8 +970,8 @@ def logStep(iter, write=True) :
         collage[ : , curI * (cSh[-1]+gapH) : curI * (cSh[-1]+gapH) + cSh[-1]] = colImgs[curI,...]
     writer.add_scalars("Probs of ref images",
                        {'Ref':probs[0]
-                       ,'Gen':probs[0] - probs[2]
-                       ,'Pre':probs[0] - probs[1]
+                       ,'Gen':probs[2]
+                       ,'Pre':probs[1]
                        }, iter )
     writer.add_scalars("Dist of ref images",
                        { 'REC' : dists[0]
@@ -1112,7 +1115,7 @@ def train_step(images):
             optimizer_D.step()
             ratReal = torch.count_nonzero(pred_realD > 0.5)/nofIm
             ratFake = torch.count_nonzero(pred_fakeD > 0.5)/nofIm
-            skipGen = pred_fakeD.mean() > 2 * pred_realD.mean()
+            skipGen = pred_fakeD.mean() >= pred_realD.mean()
 
         else:
 
@@ -1149,8 +1152,7 @@ def train_step(images):
                                         imWeights)
             G_loss = lossAdvCoef * GA_loss + lossDifCoef * GD_loss
             ratFake = torch.count_nonzero(pred_fakeG > 0.5)/nofIm
-            meanPred = pred_fakeG.mean()
-            skipDis = ratFake == 0 and 0.5 - meanPred > meanPred - 0.1
+            skipDis = ratFake < 0.01 and ratReal > 0.99
         G_loss.backward()
         optimizer_G.step()
 
@@ -1223,6 +1225,7 @@ def train(savedCheckPoint):
     discriminator.to(TCfg.device)
     generator.to(TCfg.device)
     lastUpdateTime = time.time()
+    lastSaveTime = time.time()
 
     while TCfg.nofEpochs is None or epoch <= TCfg.nofEpochs :
         epoch += 1
@@ -1261,8 +1264,8 @@ def train(savedCheckPoint):
             #if False :
             #if not it or it > len(dataloader)-2 or time.time() - lastUpdateTime > 60 :
             if time.time() - lastUpdateTime > 60 :
-
                 lastUpdateTime = time.time()
+
                 _,_,_ =  logStep(iter)
                 collageR, probsR, _ = generateDiffImages(refImages[[0],...], layout=0)
                 showMe = np.zeros( (2*DCfg.sinoSh[1] + DCfg.gapW ,
@@ -1301,13 +1304,13 @@ def train(savedCheckPoint):
                                    }, iter )
                 writer.add_scalars("Probs per iter",
                                    {'Ref':predReal
-                                   ,'Gen':predReal-predFake
-                                   ,'Pre':predReal-predPre
+                                   ,'Gen':predFake
+                                   ,'Pre':predPre
                                    }, iter )
 
 
                 IPython.display.clear_output(wait=True)
-                print(f"Epoch: {epoch} ({minGEpoch}). Losses: " +
+                print(f"Epoch: {epoch} ({minGEpoch}). " +
                       ( f" L1L: {L1L_loss.item():.3e} " if noAdv \
                           else \
                         f" Dis[{trainInfo.disPerformed/trainInfo.totPerformed:.3f}]: {D_loss.item():.3f} ({trainInfo.ratReal/trainInfo.totalImages:.3f})," ) +
@@ -1324,15 +1327,23 @@ def train(savedCheckPoint):
                 trainInfo.disPerformed = 0
                 trainInfo.totPerformed = 0
 
-                print (f"TT: {trainInfo.bestRealProb:.4e} ({data[1][trainInfo.bestRealIndex]},{data[2][trainInfo.bestRealIndex]}),  "
-                       f"FT: {trainInfo.bestFakeProb:.4e} ({data[1][trainInfo.bestFakeIndex]},{data[2][trainInfo.bestFakeIndex]}),  "
+                print (f"TT: {trainInfo.bestRealProb:.2f} ({data[1][trainInfo.bestRealIndex]},{data[2][trainInfo.bestRealIndex]}),  "
+                       f"FT: {trainInfo.bestFakeProb:.2f} ({data[1][trainInfo.bestFakeIndex]},{data[2][trainInfo.bestFakeIndex]}),  "
                        f"HD: {trainInfo.highestDif:.3e} ({data[1][trainInfo.highestDifIndex]},{data[2][trainInfo.highestDifIndex]}),  "
-                       f"GP: {probsR[0,2].item():.5f}, {probsR[0,1].item():.5f} " )
-                print (f"TF: {trainInfo.worstRealProb:.4e} ({data[1][trainInfo.worstRealIndex]},{data[2][trainInfo.worstRealIndex]}),  "
-                       f"FF: {trainInfo.worstFakeProb:.4e} ({data[1][trainInfo.worstFakeIndex]},{data[2][trainInfo.worstFakeIndex]}),  "
+                       f"GP: {probsR[0,2].item():.3f}, {probsR[0,1].item():.3f} " )
+                print (f"TF: {trainInfo.worstRealProb:.2f} ({data[1][trainInfo.worstRealIndex]},{data[2][trainInfo.worstRealIndex]}),  "
+                       f"FF: {trainInfo.worstFakeProb:.2f} ({data[1][trainInfo.worstFakeIndex]},{data[2][trainInfo.worstFakeIndex]}),  "
                        f"LD: {trainInfo.lowestDif:.3e} ({data[1][trainInfo.lowestDifIndex]},{data[2][trainInfo.lowestDifIndex]}),  "
-                       f"R : {probsR[0,0].item():.5f}." )
+                       f"R : {probsR[0,0].item():.3f}." )
                 plotImage(showMe)
+
+            if time.time() - lastSaveTime > 3600 :
+                lastSaveTime = time.time()
+                saveCheckPoint(savedCheckPoint+"_hourly.pth",
+                               epoch, iter, minGEpoch, minGdLoss,
+                               generator, discriminator,
+                               optimizer_G, optimizer_D)
+
 
         Rec_test, MSE_test, L1L_test = summarizeSet(testLoader, False)
         writer.add_scalars("Test per epoch",
@@ -1362,8 +1373,8 @@ def train(savedCheckPoint):
                            }, epoch )
         writer.add_scalars("Probs per epoch",
                            {'Ref': predRealAcc
-                           ,'Gen': predRealAcc - predFakeAcc
-                           ,'Pre': predRealAcc - predPreAcc
+                           ,'Gen': predFakeAcc
+                           ,'Pre': predPreAcc
                            }, epoch )
         lastGdLoss = lossGDacc
         if minGdLoss < 0.0 or lossGDacc < minGdLoss  :
