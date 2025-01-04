@@ -1059,9 +1059,10 @@ def train_step(images):
     imWeights = calculateWeights(images)
 
     labelsTrue = torch.full((nofIm, 1),  1 - TCfg.labelSmoothFac,
-                        dtype=torch.float, device=TCfg.device)
+                        dtype=torch.float, device=TCfg.device, requires_grad=False)
     labelsFalse = torch.full((nofIm, 1),  TCfg.labelSmoothFac,
-                        dtype=torch.float, device=TCfg.device)
+                        dtype=torch.float, device=TCfg.device, requires_grad=False)
+    labelsDis = torch.cat( (labelsTrue, labelsFalse), dim=0).to(TCfg.device).requires_grad_(False)
 
     D_loss = torch.zeros(1)
     G_loss = torch.zeros(1)
@@ -1087,26 +1088,31 @@ def train_step(images):
         fakeImagesD.requires_grad=False
         with torch.no_grad() :
             fakeImagesD[DCfg.gapRng] = generator.preProc(procImages)
-        pred_preD = discriminator(fakeImagesD)
+            pred_preD = discriminator(fakeImagesD)
+
+        def calc_D_loss() :
+            wghts= None if imWeights is None else torch.cat( (imWeights, imWeights) )
+            return loss_Adv(labelsDis, pred_both, wghts)
 
         if not skipDis :
 
-            trainInfo.disPerformed += 1
-
             # train discriminator
             generator.eval()
-            optimizer_D.zero_grad()
             with torch.no_grad() :
                 fakeImagesD[()] = generator.generateImages(procImages)
             pred_realD = discriminator(procImages)
             pred_fakeD = discriminator(fakeImagesD)
-            generator.preProc(images)
             pred_both = torch.cat((pred_realD, pred_fakeD), dim=0)
-            labels = torch.cat( (labelsTrue, labelsFalse), dim=0).to(TCfg.device)
-            D_loss = loss_Adv(labels, pred_both,
-                                None if imWeights is None else torch.cat( (imWeights, imWeights) )  )
-            D_loss.backward()
-            optimizer_D.step()
+            # train discriminator only if it is not too good :
+            if pred_fakeD.mean() > 0.2 and pred_realD.mean() < 0.8 :
+                trainInfo.disPerformed += 1
+                optimizer_D.zero_grad()
+                D_loss = calc_D_loss()
+                D_loss.backward()
+                optimizer_D.step()
+            else :
+                with torch.no_grad() :
+                    D_loss = calc_D_loss()
             ratReal = torch.count_nonzero(pred_realD > 0.5)/nofIm
             ratFake = torch.count_nonzero(pred_fakeD > 0.5)/nofIm
             skipGen = pred_fakeD.mean() >= pred_realD.mean()
@@ -1115,7 +1121,9 @@ def train_step(images):
 
             with torch.no_grad() :
                 pred_realD = discriminator(procImages)
-                D_loss = loss_Adv(labelsTrue, pred_realD, imWeights)
+                pred_fakeD = discriminator(fakeImagesD)
+                pred_both = torch.cat((pred_realD, pred_fakeD), dim=0)
+                D_loss = calc_D_loss()
                 ratReal = torch.count_nonzero(pred_realD > 0.5)/nofIm
 
 
@@ -1126,11 +1134,7 @@ def train_step(images):
         ##discriminator.eval()
         generator.train()
         optimizer_G.zero_grad()
-        if isinstance(generator, nn.DataParallel) :
-            fakeImagesG = procImages.clone()
-            fakeImagesG[DCfg.gapRng] = generator((procImages, None))
-        else :
-            fakeImagesG = generator.generateImages(procImages)
+        fakeImagesG = generator.generateImages(procImages)
         if noAdv :
             G_loss = loss_Rec(procImages[DCfg.gapRng], fakeImagesG[DCfg.gapRng],
                      imWeights)
@@ -1146,7 +1150,8 @@ def train_step(images):
                                         imWeights)
             G_loss = lossAdvCoef * GA_loss + lossDifCoef * GD_loss
             ratFake = torch.count_nonzero(pred_fakeG > 0.5)/nofIm
-            skipDis = ratFake < 0.01 and ratReal > 0.99
+            #skipDis = ratFake < 0.01 and ratReal > 0.99
+            skipDis = False # pred_fakeG.mean() < 0.2 and pred_realD.mean() > 0.8
         G_loss.backward()
         optimizer_G.step()
 
@@ -1193,8 +1198,9 @@ def train_step(images):
         trainInfo.ratFake += ratFake * nofIm
         trainInfo.totalImages += nofIm
 
-    return D_loss, GA_loss, GD_loss, MSE_loss, L1L_loss, \
-           pred_realD.mean(), pred_preD.mean(), pred_fake.mean()
+
+    pReal, pPre, pFake = pred_realD.mean().item(), pred_preD.mean().item(), pred_fake.mean().item()
+    return D_loss.item(), GA_loss.item(), GD_loss.item(), MSE_loss.item(), L1L_loss.item(), pReal, pPre, pFake
 
 
 epoch=initToNone('epoch')
@@ -1248,14 +1254,14 @@ def train(savedCheckPoint):
             D_loss, GA_loss, GD_loss, MSE_loss, L1L_loss, \
             predReal, predPre, predFake \
                 = train_step(images)
-            lossDacc += D_loss.item() * nofIm
-            lossGAacc += GA_loss.item() * nofIm
-            lossGDacc += GD_loss.item() * nofIm
-            lossMSEacc += MSE_loss.item() * nofIm
-            lossL1Lacc += L1L_loss.item() * nofIm
-            predRealAcc += predReal.item() * nofIm
-            predPreAcc  += predPre.item() * nofIm
-            predFakeAcc += predFake.item() * nofIm
+            lossDacc += D_loss * nofIm
+            lossGAacc += GA_loss * nofIm
+            lossGDacc += GD_loss * nofIm
+            lossMSEacc += MSE_loss * nofIm
+            lossL1Lacc += L1L_loss * nofIm
+            predRealAcc += predReal * nofIm
+            predPreAcc  += predPre * nofIm
+            predFakeAcc += predFake * nofIm
 
             #if True:
             #if False :
@@ -1308,12 +1314,12 @@ def train(savedCheckPoint):
 
                 IPython.display.clear_output(wait=True)
                 print(f"Epoch: {epoch} ({minGEpoch}). " +
-                      ( f" L1L: {L1L_loss.item():.3e} " if noAdv \
+                      ( f" L1L: {L1L_loss:.3e} " if noAdv \
                           else \
-                        f" Dis[{trainInfo.disPerformed/trainInfo.totPerformed:.3f}]: {D_loss.item():.3f} ({trainInfo.ratReal/trainInfo.totalImages:.3f})," ) +
-                      ( f" MSE: {MSE_loss.item():.3e} " if noAdv \
+                        f" Dis[{trainInfo.disPerformed/trainInfo.totPerformed:.2f}]: {D_loss:.3f} ({trainInfo.ratReal/trainInfo.totalImages:.3f})," ) +
+                      ( f" MSE: {MSE_loss:.3e} " if noAdv \
                           else \
-                        f" Gen[{trainInfo.genPerformed/trainInfo.totPerformed:.3f}]: {GA_loss.item():.3f} ({trainInfo.ratFake/trainInfo.totalImages:.3f})," ) +
+                        f" Gen[{trainInfo.genPerformed/trainInfo.totPerformed:.2f}]: {GA_loss:.3f} ({trainInfo.ratFake/trainInfo.totalImages:.3f})," ) +
                       f" Rec: {lastGdLoss:.3e} ({minGdLoss:.3e} / {prepGdLoss:.3e})."
                       )
                 trainInfo.iterations = 0
@@ -1337,7 +1343,7 @@ def train(savedCheckPoint):
             if time.time() - lastSaveTime > 3600 :
                 lastSaveTime = time.time()
                 saveCheckPoint(savedCheckPoint+"_hourly.pth",
-                               epoch, iter, minGEpoch, minGdLoss,
+                               epoch-1, iter, minGEpoch, minGdLoss,
                                generator, discriminator,
                                optimizer_G, optimizer_D)
 
