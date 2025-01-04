@@ -277,8 +277,8 @@ def loadCheckPoint(path, generator, discriminator,
     iterations = checkPoint['iterations']
     minGEpoch = checkPoint['minGEpoch']
     minGdLoss = checkPoint['minGdLoss']
-    realModel(generator).load_state_dict(checkPoint['generator'])
-    realModel(discriminator).load_state_dict(checkPoint['discriminator'])
+    generator.load_state_dict(checkPoint['generator'])
+    discriminator.load_state_dict(checkPoint['discriminator'])
     if not optimizerGen is None :
         optimizerGen.load_state_dict(checkPoint['optimizerGen'])
     if not schedulerGen is None :
@@ -712,6 +712,7 @@ class GeneratorTemplate(nn.Module):
         clone = images.clone()
         return self.fillImages(clone, noises)
 
+
     def preProc(self, images) :
         images, orgDims = unsqeeze4dim(images)
         if self.gapW == 2:
@@ -722,15 +723,17 @@ class GeneratorTemplate(nn.Module):
         else :
             preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
             res = None
-            with torch.no_grad() :
-                res = realModel(lowResGenerators[self.gapW//2]).generatePatches(preImages)
+            if hasattr(self, 'lowResGen') : # lowRes generator to be trained
+                res = self.lowResGen.generatePatches(preImages)
+            elif self.gapW//2 in lowResGenerators :
+                with torch.no_grad() :
+                    res = lowResGenerators[self.gapW//2].generatePatches(preImages)
+            else :
+                raise Exception(f"No low resolution generator for gap width {self.gapW}.")
             res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
         return squeezeOrg(res, orgDims)
-
-
 generator = initToNone('generator')
 lowResGenerators = {}
-
 
 
 class DiscriminatorTemplate(nn.Module):
@@ -761,6 +764,8 @@ class DiscriminatorTemplate(nn.Module):
         res = self.head(convRes)
         return res
 discriminator = initToNone('discriminator')
+noAdv=False
+
 
 def createOptimizer(model, lr) :
     return optim.Adam(
@@ -768,20 +773,6 @@ def createOptimizer(model, lr) :
         lr=lr,
         betas=(0.5, 0.999)
     )
-
-
-#def createOptimizers() :
-#    optimizer_G = optim.Adam(
-#        generator.parameters(),
-#        lr=TCfg.learningRateG,
-#        betas=(0.5, 0.999)
-#    )
-#    optimizer_D = optim.Adam(
-#        discriminator.parameters(),
-#        lr=TCfg.learningRateD,
-#        betas=(0.5, 0.999)
-#    )
-#    return optimizer_G, optimizer_D
 optimizer_G = initToNone('optimizer_G')
 optimizer_D = initToNone('optimizer_D')
 
@@ -855,21 +846,25 @@ def loss_Gen(y_true, y_pred, p_true, p_pred, weights=None):
 
 def summarizeSet(dataloader, onPrep=True):
 
-
-    MSE_diffs, L1L_diffs, Rec_diffs = [], [], []
+    MSE_diffs, L1L_diffs, Rec_diffs, Real_probs, Fake_probs = [], [], [], [], []
     totalNofIm = 0
     generator.to(TCfg.device)
-    realModel(generator).eval()
+    generator.eval()
+    #discriminator.eval()
     with torch.no_grad() :
         for it , data in tqdm.tqdm(enumerate(dataloader), total=int(len(dataloader))):
             images = data[0].squeeze(1).to(TCfg.device)
             nofIm = images.shape[0]
             totalNofIm += nofIm
             procImages, procData = imagesPreProc(images)
-            #prepImages = procImages.clone()
-            patchImages = realModel(generator).preProc(procImages) \
+            genImages = procImages.clone()
+            patchImages = generator.preProc(procImages) \
                           if onPrep else \
-                          realModel(generator).generatePatches(procImages)
+                          generator.generatePatches(procImages)
+            genImages[DCfg.gapRng] = patchImages
+            if not noAdv :
+                Real_probs.append(discriminator(procImages).sum().item())
+                Fake_probs.append(discriminator(genImages).sum().item())
             procImages = imagesPostProc(patchImages, procData)
             MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages))
             L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], procImages))
@@ -878,8 +873,10 @@ def summarizeSet(dataloader, onPrep=True):
     MSE_diff = sum(MSE_diffs) / totalNofIm
     L1L_diff = sum(L1L_diffs) / totalNofIm
     Rec_diff = sum(Rec_diffs) / totalNofIm
-    print (f"Summary. Rec: {Rec_diff:.3e}, MSE: {MSE_diff:.3e}, L1L: {L1L_diff:.3e}.")
-    return Rec_diff, MSE_diff, L1L_diff
+    Real_prob = sum(Real_probs) / totalNofIm if not noAdv else 0
+    Fake_prob = sum(Fake_probs) / totalNofIm if not noAdv else 0
+    print (f"Summary. Rec: {Rec_diff:.3e}, MSE: {MSE_diff:.3e}, L1L: {L1L_diff:.3e}, Dis: {Real_prob:.3e}, Gen: {Fake_prob:.3e}.")
+    return Rec_diff, MSE_diff, L1L_diff, Real_prob, Fake_prob
 
 
 def generateDiffImages(images, layout=None) :
@@ -892,8 +889,8 @@ def generateDiffImages(images, layout=None) :
     dists = None
     with torch.inference_mode() :
         generator.eval()
-        pre[DCfg.gapRng] = realModel(generator).preProc(images)
-        gen[DCfg.gapRng] = realModel(generator).generatePatches(images)
+        pre[DCfg.gapRng] = generator.preProc(images)
+        gen[DCfg.gapRng] = generator.generatePatches(images)
         dif[DCfg.gapRng] = (gen - pre)[DCfg.gapRng]
         dif[...,hGap:hGap+DCfg.gapW] = (images - pre)[DCfg.gapRng]
         dif[...,-DCfg.gapW-hGap:-hGap] = (images - gen)[DCfg.gapRng]
@@ -968,16 +965,16 @@ def logStep(iter, write=True) :
     collage = np.zeros( ( cSh[-2], cSh[0]*cSh[-1] + (cSh[0]-1)*gapH ), dtype=np.float32  )
     for curI in range(cSh[0]) :
         collage[ : , curI * (cSh[-1]+gapH) : curI * (cSh[-1]+gapH) + cSh[-1]] = colImgs[curI,...]
-    writer.add_scalars("Probs of ref images",
-                       {'Ref':probs[0]
-                       ,'Gen':probs[2]
-                       ,'Pre':probs[1]
-                       }, iter )
-    writer.add_scalars("Dist of ref images",
-                       { 'REC' : dists[0]
-                       , 'MSE' : dists[1]
-                       , 'L1L' : dists[2]
-                       }, iter )
+    #writer.add_scalars("Probs of ref images",
+    #                   {'Ref':probs[0]
+    #                   ,'Gen':probs[2]
+    #                   ,'Pre':probs[1]
+    #                   }, iter )
+    #writer.add_scalars("Dist of ref images",
+    #                   { 'REC' : dists[0]
+    #                   , 'MSE' : dists[1]
+    #                   , 'L1L' : dists[2]
+    #                   }, iter )
     try :
         addToHDF(TCfg.historyHDF, "data", collage)
     except :
@@ -993,7 +990,7 @@ def initialTest() :
               f'Gen: {probs[2]:.3e}, '
               f'Pre: {probs[1]:.3e}.')
         generator.eval()
-        pre = realModel(generator).preProc(refImages)
+        pre = generator.preProc(refImages)
         ref_loss_Rec = loss_Rec(refImages[DCfg.gapRng], pre, calculateWeights(refImages))
         ref_loss_MSE = loss_MSE(refImages[DCfg.gapRng], pre)
         ref_loss_L1L = loss_L1L(refImages[DCfg.gapRng], pre)
@@ -1001,12 +998,12 @@ def initialTest() :
               f"REC: {ref_loss_Rec:.3e}, "
               f"MSE: {ref_loss_MSE:.3e}, "
               f"L1L: {ref_loss_L1L:.3e}.")
-        if not epoch :
-            writer.add_scalars("Dist of ref images",
-                                  { 'REC' : ref_loss_Rec
-                                  , 'MSE' : ref_loss_MSE
-                                  , 'L1L' : ref_loss_L1L
-                                  }, 0 )
+        #if not epoch :
+        #    writer.add_scalars("Dist of ref images",
+        #                          { 'REC' : ref_loss_Rec
+        #                          , 'MSE' : ref_loss_MSE
+        #                          , 'L1L' : ref_loss_L1L
+        #                          }, 0 )
         plotImage(collage)
 
 
@@ -1019,9 +1016,6 @@ def imagesPreProc(images) :
 
 def imagesPostProc(images, procData=None) :
     return images
-
-
-noAdv=False
 
 
 @dataclass
@@ -1159,7 +1153,10 @@ def train_step(images):
     MSE_loss = L1L_loss = None
     with torch.no_grad() :
 
-        deprocFakeImages = imagesPostProc(fakeImagesD if fakeImagesG is None else fakeImagesG, procReverseData)
+        fakeImages = fakeImagesD if fakeImagesG is None else fakeImagesG
+        pred_fake = pred_fakeD if fakeImagesG is None else pred_fakeG
+
+        deprocFakeImages = imagesPostProc(fakeImages, procReverseData)
         MSE_loss = loss_MSE(images[DCfg.gapRng], deprocFakeImages[DCfg.gapRng])
         L1L_loss = loss_L1L(images[DCfg.gapRng], deprocFakeImages[DCfg.gapRng])
 
@@ -1175,14 +1172,14 @@ def train_step(images):
         trainInfo.worstRealProb = 0 if noAdv else pred_realD[idx].item()
         trainInfo.worstRealIndex = idx
 
-        idx = random.randint(0, nofIm-1) if noAdv else pred_fakeG.argmax()
+        idx = random.randint(0, nofIm-1) if noAdv else pred_fake.argmax()
         trainInfo.bestFakeImage = deprocFakeImages[idx,...].clone().detach()
-        trainInfo.bestFakeProb = 0 if noAdv else pred_fakeG[idx].item()
+        trainInfo.bestFakeProb = 0 if noAdv else pred_fake[idx].item()
         trainInfo.bestFakeIndex = idx
 
-        idx = random.randint(0, nofIm-1) if noAdv else pred_fakeG.argmin()
+        idx = random.randint(0, nofIm-1) if noAdv else pred_fake.argmin()
         trainInfo.worstFakeImage = deprocFakeImages[idx,...].clone().detach()
-        trainInfo.worstFakeProb = 0 if noAdv else pred_fakeG[idx].item()
+        trainInfo.worstFakeProb = 0 if noAdv else pred_fake[idx].item()
         trainInfo.worstFakeIndex = idx
 
         trainInfo.highestDifIndex = eDinfo[0]
@@ -1197,7 +1194,7 @@ def train_step(images):
         trainInfo.totalImages += nofIm
 
     return D_loss, GA_loss, GD_loss, MSE_loss, L1L_loss, \
-           pred_realD.mean(), pred_preD.mean(), pred_fakeG.mean()
+           pred_realD.mean(), pred_preD.mean(), pred_fake.mean()
 
 
 epoch=initToNone('epoch')
@@ -1345,11 +1342,13 @@ def train(savedCheckPoint):
                                optimizer_G, optimizer_D)
 
 
-        Rec_test, MSE_test, L1L_test = summarizeSet(testLoader, False)
+        Rec_test, MSE_test, L1L_test, Gen_test, Dis_test = summarizeSet(testLoader, False)
         writer.add_scalars("Test per epoch",
                            {'MSE': MSE_test
                            ,'L1L': L1L_test
                            ,'REC': Rec_test
+                           ,'Dis': Dis_test
+                           ,'Gen': Gen_test
                            }, epoch )
 
         lossDacc /= totalIm
