@@ -519,7 +519,8 @@ examplesDb[8] = [(2348095, 1684)
                 ,(102151, 418)]
 examplesDb[16] = [ (2348095, 1684)
                  , (1958164,1391)
-                 ,(1429010,666)
+                 , (1429010,666)
+                 #, (1831107,164)
                  , (102151, 418)]
 examples = initToNone('examples')
 
@@ -722,15 +723,10 @@ class GeneratorTemplate(nn.Module):
             res /= 3
         else :
             preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
-            res = None
-            if hasattr(self, 'lowResGen') : # lowRes generator to be trained
+            # lowRes generator to be trained if part of the generator and not if it is a separate generator
+            with torch.set_grad_enabled(hasattr(self, 'lowResGen')) :
                 res = self.lowResGen.generatePatches(preImages)
-            elif self.gapW//2 in lowResGenerators :
-                with torch.no_grad() :
-                    res = lowResGenerators[self.gapW//2].generatePatches(preImages)
-            else :
-                raise Exception(f"No low resolution generator for gap width {self.gapW}.")
-            res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
+                res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
         return squeezeOrg(res, orgDims)
 generator = initToNone('generator')
 lowResGenerators = {}
@@ -885,8 +881,6 @@ def generateDiffImages(images, layout=None) :
     hGap = DCfg.gapW // 2
     pre = images.clone()
     gen = images.clone()
-    probs = None
-    dists = None
     with torch.inference_mode() :
         generator.eval()
         pre[DCfg.gapRng] = generator.preProc(images)
@@ -923,7 +917,6 @@ def generateDiffImages(images, layout=None) :
             gen[rng] = stretch(gen[rng], minv, ampl)
 
     cGap = DCfg.gapW
-    collage = None
     if layout == 0 :
         collage = torch.empty(images.shape[0], 4, *DCfg.sinoSh)
         collage[:,0,...] = simages[:,0,...]
@@ -1140,10 +1133,7 @@ def train_step(images):
                      imWeights)
             GD_loss = GA_loss = G_loss
         else :
-            if withNoGrad :
-                with torch.no_grad() :
-                    pred_fakeG = discriminator(fakeImagesG)
-            else :
+            with torch.set_grad_enabled(not withNoGrad) :
                 pred_fakeG = discriminator(fakeImagesG)
             GA_loss, GD_loss = loss_Gen(labelsTrue, pred_fakeG,
                                         procImages[DCfg.gapRng], fakeImagesG[DCfg.gapRng],
