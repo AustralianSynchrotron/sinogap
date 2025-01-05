@@ -723,9 +723,9 @@ class GeneratorTemplate(nn.Module):
             res /= 3
         else :
             preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
-            # lowRes generator to be trained if part of the generator and not if it is a separate generator
+            # lowRes generator to be trained if they are parts of the generator
             with torch.set_grad_enabled(hasattr(self, 'lowResGen')) :
-                res = self.lowResGen.generatePatches(preImages)
+                res = lowResGenerators[self.gapW//2].generatePatches(preImages)
                 res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
         return squeezeOrg(res, orgDims)
 generator = initToNone('generator')
