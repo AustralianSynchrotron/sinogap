@@ -6,6 +6,7 @@ import os
 import random
 import time
 import gc
+import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -698,6 +699,23 @@ class GeneratorTemplate(nn.Module):
         return torch.nn.Sequential(*layers)
 
 
+    def createFClink(self) :
+        smpl = torch.zeros((1,1,*self.sinoSh))
+        for encoder in self.encoders :
+            smpl = encoder(smpl)
+        encSh = smpl.shape
+        linChannels = math.prod(encSh)
+        return nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(linChannels, linChannels),
+            nn.LeakyReLU(0.2),
+            nn.Linear(linChannels, linChannels),
+            nn.LeakyReLU(0.2),
+            nn.Unflatten(1, encSh[1:]),
+        )
+
+
+
     def generatePatches(self, images, noises=None) :
         if noises is None :
             noises = torch.randn( 1 if images.dim() < 3 else images.shape[0], TCfg.latentDim).to(TCfg.device)
@@ -1038,11 +1056,37 @@ class TrainInfoClass:
     disPerformed = 0
     genPerformed = 0
     totPerformed = 0
-trainInfo = TrainInfoClass()
 
+@dataclass
+class TrainResClass:
+    lossD : any = 0
+    lossGA : any = 0
+    lossGD : any = 0
+    lossMSE : any = 0
+    lossL1L : any = 0
+    predReal : any = 0
+    predPre : any = 0
+    predFake : any = 0
+    def __add__(self, other):
+        toRet = TrainResClass()
+        for field in dataclasses.fields(TrainResClass):
+            fn = field.name
+            setattr(toRet, fn, getattr(self, fn) + getattr(other, fn) )
+        return toRet
+    def __mul__(self, other):
+        toRet = TrainResClass()
+        for field in dataclasses.fields(TrainResClass):
+            fn = field.name
+            setattr(toRet, fn, getattr(self, fn) * other )
+        return toRet
+    __rmul__ = __mul__
+
+
+trainInfo = TrainInfoClass()
 withNoGrad = True
 skipGen=False
 skipDis=False
+
 def train_step(images):
     global trainDis, trainGen, eDinfo, noAdv, withNoGrad, skipGen, skipDis
     trainInfo.iterations += 1
@@ -1145,7 +1189,6 @@ def train_step(images):
         G_loss.backward()
         optimizer_G.step()
 
-    MSE_loss = L1L_loss = None
     with torch.no_grad() :
 
         fakeImages = fakeImagesD if fakeImagesG is None else fakeImagesG
@@ -1188,9 +1231,16 @@ def train_step(images):
         trainInfo.ratFake += ratFake * nofIm
         trainInfo.totalImages += nofIm
 
-
-    pReal, pPre, pFake = pred_realD.mean().item(), pred_preD.mean().item(), pred_fake.mean().item()
-    return D_loss.item(), GA_loss.item(), GD_loss.item(), MSE_loss.item(), L1L_loss.item(), pReal, pPre, pFake
+    return TrainResClass(*(mem.item() for mem in ( D_loss
+                                                 , GA_loss
+                                                 , GD_loss
+                                                 , MSE_loss
+                                                 , L1L_loss
+                                                 , pred_realD.mean()
+                                                 , pred_preD.mean()
+                                                 , pred_fake.mean())))
+    toRet = TrainResClass(*toRet)
+    return toRet
 
 
 epoch=initToNone('epoch')
@@ -1225,14 +1275,7 @@ def train(savedCheckPoint):
         beforeEachEpoch(epoch)
         generator.train()
         discriminator.train()
-        lossDacc = 0
-        lossGAacc = 0
-        lossGDacc = 0
-        lossMSEacc = 0
-        lossL1Lacc = 0
-        predRealAcc = 0
-        predPreAcc = 0
-        predFakeAcc = 0
+        resAcc = TrainResClass()
         totalIm = 0
 
         for it , data in tqdm.tqdm(enumerate(dataLoader), total=int(len(dataLoader))):
@@ -1241,17 +1284,8 @@ def train(savedCheckPoint):
             images = data[0].to(TCfg.device)
             nofIm = images.shape[0]
             totalIm += nofIm
-            D_loss, GA_loss, GD_loss, MSE_loss, L1L_loss, \
-            predReal, predPre, predFake \
-                = train_step(images)
-            lossDacc += D_loss * nofIm
-            lossGAacc += GA_loss * nofIm
-            lossGDacc += GD_loss * nofIm
-            lossMSEacc += MSE_loss * nofIm
-            lossL1Lacc += L1L_loss * nofIm
-            predRealAcc += predReal * nofIm
-            predPreAcc  += predPre * nofIm
-            predFakeAcc += predFake * nofIm
+            trainRes = train_step(images)
+            resAcc += trainRes * nofIm
 
             #if True:
             #if False :
@@ -1286,30 +1320,30 @@ def train(savedCheckPoint):
                 addImage(4,0,collageR[0,1])
                 addImage(4,1,collageR[0,3], stretch=False)
                 writer.add_scalars("Losses per iter",
-                                   {'Dis': D_loss
-                                   ,'Adv': GA_loss
-                                   ,'Gen': lossAdvCoef * GA_loss + lossDifCoef * GD_loss
+                                   {'Dis': trainRes.lossD
+                                   ,'Adv': trainRes.lossGA
+                                   ,'Gen': lossAdvCoef * trainRes.lossGA + lossDifCoef * trainRes.lossGD
                                    }, iter )
                 writer.add_scalars("Distances per iter",
-                                   {'MSE': MSE_loss
-                                   ,'L1L': L1L_loss
-                                   ,'REC': GD_loss
+                                   {'MSE': trainRes.lossMSE
+                                   ,'L1L': trainRes.lossL1L
+                                   ,'REC': trainRes.lossGD
                                    }, iter )
                 writer.add_scalars("Probs per iter",
-                                   {'Ref':predReal
-                                   ,'Gen':predFake
-                                   ,'Pre':predPre
+                                   {'Ref':trainRes.predReal
+                                   ,'Gen':trainRes.predFake
+                                   ,'Pre':trainRes.predPre
                                    }, iter )
 
 
                 IPython.display.clear_output(wait=True)
                 print(f"Epoch: {epoch} ({minGEpoch}). " +
-                      ( f" L1L: {L1L_loss:.3e} " if noAdv \
+                      ( f" L1L: {trainRes.lossL1L:.3e} " if noAdv \
                           else \
-                        f" Dis[{trainInfo.disPerformed/trainInfo.totPerformed:.2f}]: {D_loss:.3f} ({trainInfo.ratReal/trainInfo.totalImages:.3f})," ) +
-                      ( f" MSE: {MSE_loss:.3e} " if noAdv \
+                        f" Dis[{trainInfo.disPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossD:.3f} ({trainInfo.ratReal/trainInfo.totalImages:.3f})," ) +
+                      ( f" MSE: {trainRes.lossMSE:.3e} " if noAdv \
                           else \
-                        f" Gen[{trainInfo.genPerformed/trainInfo.totPerformed:.2f}]: {GA_loss:.3f} ({trainInfo.ratFake/trainInfo.totalImages:.3f})," ) +
+                        f" Gen[{trainInfo.genPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossGA:.3f} ({trainInfo.ratFake/trainInfo.totalImages:.3f})," ) +
                       f" Rec: {lastGdLoss:.3e} ({minGdLoss:.3e} / {prepGdLoss:.3e})."
                       )
                 trainInfo.iterations = 0
@@ -1338,42 +1372,25 @@ def train(savedCheckPoint):
                                optimizer_G, optimizer_D)
 
 
-        Rec_test, MSE_test, L1L_test, Gen_test, Dis_test = summarizeSet(testLoader, False)
-        writer.add_scalars("Test per epoch",
-                           {'MSE': MSE_test
-                           ,'L1L': L1L_test
-                           ,'REC': Rec_test
-                           ,'Dis': Dis_test
-                           ,'Gen': Gen_test
-                           }, epoch )
-
-        lossDacc /= totalIm
-        lossGAacc /= totalIm
-        lossGDacc /= totalIm
-        lossMSEacc /= totalIm
-        lossL1Lacc /= totalIm
-        predRealAcc /= totalIm
-        predPreAcc /= totalIm
-        predFakeAcc /= totalIm
-
+        resAcc *= 1.0/totalIm
         writer.add_scalars("Losses per epoch",
-                           {'Dis': lossDacc
-                           ,'Adv': lossGAacc
-                           ,'Gen': lossAdvCoef * lossGAacc + lossDifCoef * lossGDacc
+                           {'Dis': resAcc.lossD
+                           ,'Adv': resAcc.lossGA
+                           ,'Gen': lossAdvCoef * resAcc.lossGA + lossDifCoef * resAcc.lossGD
                            }, epoch )
         writer.add_scalars("Distances per epoch",
-                           {'MSE': lossMSEacc
-                           ,'L1L': lossL1Lacc
-                           ,'REC': lossGDacc
+                           {'MSE': resAcc.lossMSE
+                           ,'L1L': resAcc.lossL1L
+                           ,'REC': resAcc.lossGD
                            }, epoch )
         writer.add_scalars("Probs per epoch",
-                           {'Ref': predRealAcc
-                           ,'Gen': predFakeAcc
-                           ,'Pre': predPreAcc
+                           {'Ref': trainRes.predRealAcc
+                           ,'Gen': trainRes.predFakeAcc
+                           ,'Pre': trainRes.predPreAcc
                            }, epoch )
-        lastGdLoss = lossGDacc
-        if minGdLoss < 0.0 or lossGDacc < minGdLoss  :
-            minGdLoss = lossGDacc
+        lastGdLoss = resAcc.lossGD
+        if minGdLoss < 0.0 or resAcc.lossGD < minGdLoss  :
+            minGdLoss = resAcc.lossGD
             minGEpoch = epoch
             saveCheckPoint(savedCheckPoint+"_B.pth",
                            epoch, iter, minGEpoch, minGdLoss,
@@ -1387,6 +1404,15 @@ def train(savedCheckPoint):
                            epoch, iter, minGEpoch, minGdLoss,
                            generator, discriminator,
                            optimizer_G, optimizer_D)
+
+        Rec_test, MSE_test, L1L_test, Gen_test, Dis_test = summarizeSet(testLoader, False)
+        writer.add_scalars("Test per epoch",
+                           {'MSE': MSE_test
+                           ,'L1L': L1L_test
+                           ,'REC': Rec_test
+                           ,'Dis': Dis_test
+                           ,'Gen': Gen_test
+                           }, epoch )
 
         afterEachEpoch(epoch)
 
