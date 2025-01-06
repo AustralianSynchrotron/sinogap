@@ -739,12 +739,14 @@ class GeneratorTemplate(nn.Module):
             res[...,0] += 2*images[...,self.gapRngX.start-1] + images[...,self.gapRngX.stop]
             res[...,1] += 2*images[...,self.gapRngX.stop] + images[...,self.gapRngX.start-1]
             res /= 3
-        else :
+        elif self.gapW//2 in lowResGenerators :
             preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
             # lowRes generator to be trained if they are parts of the generator
             with torch.set_grad_enabled(hasattr(self, 'lowResGen')) :
                 res = lowResGenerators[self.gapW//2].generatePatches(preImages)
                 res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
+        else :
+            res = torch.zeros(images[self.gapRng].shape, device=images.device, requires_grad=False)
         return squeezeOrg(res, orgDims)
 generator = initToNone('generator')
 lowResGenerators = {}
@@ -1384,9 +1386,9 @@ def train(savedCheckPoint):
                            ,'REC': resAcc.lossGD
                            }, epoch )
         writer.add_scalars("Probs per epoch",
-                           {'Ref': trainRes.predRealAcc
-                           ,'Gen': trainRes.predFakeAcc
-                           ,'Pre': trainRes.predPreAcc
+                           {'Ref': resAcc.predReal
+                           ,'Gen': resAcc.predFake
+                           ,'Pre': resAcc.predPre
                            }, epoch )
         lastGdLoss = resAcc.lossGD
         if minGdLoss < 0.0 or resAcc.lossGD < minGdLoss  :
