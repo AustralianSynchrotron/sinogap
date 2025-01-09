@@ -52,7 +52,7 @@ yes             | last          | low           | - b1
 no              | all           | all           | - b2
 yes             | only          | -             | - b3
 
-yes             | all           | none          |
+yes             | all           | low           |
 
 
 
