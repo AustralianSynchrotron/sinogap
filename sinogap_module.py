@@ -659,7 +659,7 @@ def realModel(mod) :
 
 class GeneratorTemplate(nn.Module):
 
-    def __init__(self, gapW):
+    def __init__(self, gapW, latentChannels=0):
         super(GeneratorTemplate, self).__init__()
 
         self.gapW = gapW
@@ -669,6 +669,20 @@ class GeneratorTemplate(nn.Module):
         self.gapSize = math.prod(self.gapSh)
         self.gapRngX = np.s_[ self.sinoSh[1]//2 - self.gapW//2 : self.sinoSh[1]//2 + self.gapW//2 ]
         self.gapRng = np.s_[...,self.gapRngX]
+        self.latentChannels = latentChannels
+        self.baseChannels = 64
+
+
+    def createLatent(self) :
+        if self.latentChannels == 0 :
+            return None
+        toRet =  nn.Sequential(
+            nn.Linear(TCfg.latentDim, self.sinoSize*self.latentChannels),
+            nn.ReLU(),
+            nn.Unflatten( 1, (self.latentChannels,) + self.sinoSh )
+        )
+        fillWheights(toRet)
+        return toRet
 
 
     def encblock(self, chIn, chOut, kernel, stride=1, norm=True, dopadding=False) :
@@ -700,12 +714,12 @@ class GeneratorTemplate(nn.Module):
 
 
     def createFClink(self) :
-        smpl = torch.zeros((1,1,*self.sinoSh))
+        smpl = torch.zeros((1, 1+self.latentChannels, *self.sinoSh))
         for encoder in self.encoders :
             smpl = encoder(smpl)
         encSh = smpl.shape
         linChannels = math.prod(encSh)
-        return nn.Sequential(
+        toRet = nn.Sequential(
             nn.Flatten(),
             nn.Linear(linChannels, linChannels),
             nn.LeakyReLU(0.2),
@@ -713,7 +727,17 @@ class GeneratorTemplate(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Unflatten(1, encSh[1:]),
         )
+        fillWheights(toRet)
+        return toRet
 
+
+    def createLastTouch(self) :
+        toRet = nn.Sequential(
+            nn.Conv2d(self.baseChannels+1, 1, 1),
+            nn.Tanh(),
+        )
+        fillWheights(toRet)
+        return toRet
 
 
     def generatePatches(self, images, noises=None) :
@@ -773,9 +797,9 @@ class DiscriminatorTemplate(nn.Module):
     def forward(self, images):
         if images.dim() == 3:
             images = images.unsqueeze(1)
-        images = images.clone() # I want to exclude two blocks on the edges :
-        images[ ..., :DCfg.gapW, DCfg.gapRngX ] = 0
-        images[ ..., -DCfg.gapW:, DCfg.gapRngX ] = 0
+        #images = images.clone() # I want to exclude two blocks on the edges :
+        #images[ ..., :DCfg.gapW, DCfg.gapRngX ] = 0
+        #images[ ..., -DCfg.gapW:, DCfg.gapRngX ] = 0
         convRes = self.body(images)
         res = self.head(convRes)
         return res
@@ -1241,8 +1265,6 @@ def train_step(images):
                                                  , pred_realD.mean()
                                                  , pred_preD.mean()
                                                  , pred_fake.mean())))
-    toRet = TrainResClass(*toRet)
-    return toRet
 
 
 epoch=initToNone('epoch')
@@ -1255,16 +1277,20 @@ prepGdLoss = initToNone('prepGdLoss')
 def beforeEachEpoch(epoch) :
     return
 
-
 def afterEachEpoch(epoch) :
     return
 
+def beforeReport() :
+    return
+
+def afterReport() :
+    return
 
 dataLoader=None
 testLoader=None
 
 def train(savedCheckPoint):
-    global epoch, minGdLoss, minGEpoch, prepGdLoss, iter
+    global epoch, minGdLoss, minGEpoch, prepGdLoss, iter, trainInfo
     lastGdLoss = minGdLoss
 
     discriminator.to(TCfg.device)
@@ -1337,8 +1363,8 @@ def train(savedCheckPoint):
                                    ,'Pre':trainRes.predPre
                                    }, iter )
 
-
                 IPython.display.clear_output(wait=True)
+                beforeReport()
                 print(f"Epoch: {epoch} ({minGEpoch}). " +
                       ( f" L1L: {trainRes.lossL1L:.3e} " if noAdv \
                           else \
@@ -1348,14 +1374,6 @@ def train(savedCheckPoint):
                         f" Gen[{trainInfo.genPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossGA:.3f} ({trainInfo.ratFake/trainInfo.totalImages:.3f})," ) +
                       f" Rec: {lastGdLoss:.3e} ({minGdLoss:.3e} / {prepGdLoss:.3e})."
                       )
-                trainInfo.iterations = 0
-                trainInfo.totalImages = 0
-                trainInfo.ratReal = 0
-                trainInfo.ratFake = 0
-                trainInfo.genPerformed = 0
-                trainInfo.disPerformed = 0
-                trainInfo.totPerformed = 0
-
                 print (f"TT: {trainInfo.bestRealProb:.2f} ({data[1][trainInfo.bestRealIndex]},{data[2][trainInfo.bestRealIndex]}),  "
                        f"FT: {trainInfo.bestFakeProb:.2f} ({data[1][trainInfo.bestFakeIndex]},{data[2][trainInfo.bestFakeIndex]}),  "
                        f"HD: {trainInfo.highestDif:.3e} ({data[1][trainInfo.highestDifIndex]},{data[2][trainInfo.highestDifIndex]}),  "
@@ -1365,6 +1383,8 @@ def train(savedCheckPoint):
                        f"LD: {trainInfo.lowestDif:.3e} ({data[1][trainInfo.lowestDifIndex]},{data[2][trainInfo.lowestDifIndex]}),  "
                        f"R : {probsR[0,0].item():.3f}." )
                 plotImage(showMe)
+                afterReport()
+                trainInfo = TrainInfoClass() # reset for the next iteration
 
             if time.time() - lastSaveTime > 3600 :
                 lastSaveTime = time.time()
