@@ -1,0 +1,58 @@
+# arch1 - worse than arch 2
+            1,                  baseChannels, 3, norm=False
+            baseChannels,     2*baseChannels, 3, stride=2
+            2*baseChannels,   2*baseChannels, 3
+            2*baseChannels,   2*baseChannels, 3
+            2*baseChannels,   4*baseChannels, 3, stride=2
+            4*baseChannels,   4*baseChannels, 3
+            4*baseChannels,   8*baseChannels, 3, stride=2
+            8*baseChannels,   8*baseChannels, 3
+
+# arch2
+             1,                  baseChannels, 3, norm=False
+             baseChannels,       baseChannels, 3, dopadding=True
+             baseChannels,     2*baseChannels, 3, stride=2
+             2*baseChannels,   2*baseChannels, 3, dopadding=True
+             2*baseChannels,   4*baseChannels, 3, stride=2
+             4*baseChannels,   4*baseChannels, 3, dopadding=True
+             4*baseChannels,   8*baseChannels, 3, stride=2
+             8*baseChannels,   8*baseChannels, 3, dopadding=True
+             8*baseChannels,  16*baseChannels, 3, stride=2
+            16*baseChannels,  16*baseChannels, 3, dopadding=True
+
+# arch3 - worse than arch 2
+            1,                  baseChannels, 3, norm=False
+            baseChannels,     2*baseChannels, 3, stride=2
+            2*baseChannels,   4*baseChannels, 3, stride=2
+            4*baseChannels,   8*baseChannels, 3, stride=2
+            8*baseChannels,  16*baseChannels, 3, stride=2
+
+# arch4
+        encPattern(inChan) :
+                inChan,       inChan, 3, dopadding=True
+                inChan,     2*inChan, 3, stride=2
+                2*inChan,   2*inChan, 3, dopadding=True
+        encblock( 1,                  baseChannels, 3, norm=False
+        *encPattern(  baseChannels)
+        *encPattern(2*baseChannels)
+        *encPattern(4*baseChannels)
+        *encPattern(8*baseChannels)
+
+
+### Arch 2 used for all further experiments
+
+Adv             | Train         | PreTrain      | Progress
+----------------------------------------------------------------
+no              | last          | low           | pureRec_trainLast
+no              | all           | low           | pureRec_trainAll
+no              | only          | -             | pureRec_noPreProc
+
+no              | all           | none          | - b0
+yes             | last          | low           | - b1
+no              | all           | all           | - b2
+yes             | only          | -             | - b3
+
+yes             | all           | none          |
+
+
+
