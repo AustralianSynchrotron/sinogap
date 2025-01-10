@@ -53,6 +53,8 @@ no              | all           | all           | - b2
 yes             | only          | -             | - b3
 
 yes             | all           | low           |
+yes             | all           | all           |
+no              | all           | all++         |
 
 
 
