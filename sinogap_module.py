@@ -29,13 +29,12 @@ import tifffile
 import tqdm
 
 
-def initToNone(var) :
+def initIfNew(var, val=None) :
     if var in locals() :
-        return locals(var)
+        return locals()[var]
     if var in globals() :
-        return globals(var)
-    return None
-
+        return globals()[var]
+    return val
 
 @dataclass
 class TCfgClass:
@@ -46,6 +45,7 @@ class TCfgClass:
     learningRateD: float
     learningRateG: float
     device: torch.device = torch.device('cpu')
+    batchSplit : int = 1
     nofEpochs: int = 0
     historyHDF : str = field(repr = True, init = False)
     logDir : str = field(repr = True, init = False)
@@ -54,7 +54,10 @@ class TCfgClass:
             self.device = torch.device(f"cuda:{self.exec}")
         self.historyHDF = f"train_{self.exec}.hdf"
         self.logDir = f"runs/experiment_{self.exec}"
-TCfg = initToNone('TCfg')
+        if self.batchSize % self.batchSplit :
+            raise Exception(f"Batch size {self.batchSize} is not divisible by batch split {self.batchSplit}.")
+global TCfg
+TCfg = initIfNew('TCfg')
 
 
 @dataclass
@@ -77,7 +80,7 @@ class DCfgClass:
         self.gapRngX = np.s_[ self.sinoSh[1]//2 - self.gapW//2 : self.sinoSh[1]//2 + self.gapW//2 ]
         self.gapRng = np.s_[...,self.gapRngX]
         self.disRng = np.s_[ self.gapW:-self.gapW , self.gapRngX ]
-DCfg = initToNone('DCfg')
+DCfg = initIfNew('DCfg')
 
 
 def eprint(*args, **kwargs):
@@ -251,12 +254,14 @@ def load_model(model, model_path):
 def saveCheckPoint(path, epoch, iterations, minGEpoch, minGdLoss,
                    generator, discriminator,
                    optimizerGen=None, optimizerDis=None,
-                   schedulerGen=None, schedulerDis=None ) :
+                   schedulerGen=None, schedulerDis=None,
+                   startFrom=0) :
     checkPoint = {}
     checkPoint['epoch'] = epoch
     checkPoint['iterations'] = iterations
     checkPoint['minGEpoch'] = minGEpoch
     checkPoint['minGdLoss'] = minGdLoss
+    checkPoint['startFrom'] = startFrom
     checkPoint['generator'] = generator.state_dict()
     checkPoint['discriminator'] = discriminator.state_dict()
     if not optimizerGen is None :
@@ -278,6 +283,7 @@ def loadCheckPoint(path, generator, discriminator,
     iterations = checkPoint['iterations']
     minGEpoch = checkPoint['minGEpoch']
     minGdLoss = checkPoint['minGdLoss']
+    startFrom = checkPoint['startFrom'] if 'startFrom' in checkPoint else 0
     generator.load_state_dict(checkPoint['generator'])
     discriminator.load_state_dict(checkPoint['discriminator'])
     if not optimizerGen is None :
@@ -288,7 +294,7 @@ def loadCheckPoint(path, generator, discriminator,
         optimizerDis.load_state_dict(checkPoint['optimizerDis'])
     if not schedulerDis is None :
         schedulerDis.load_state_dict(checkPoint['schedulerDis'])
-    return epoch, iterations, minGEpoch, minGdLoss
+    return epoch, iterations, minGEpoch, minGdLoss, startFrom
 
 
 def addToHDF(filename, containername, data) :
@@ -329,7 +335,7 @@ def createWriter(logDir, addToExisting=False) :
         raise Exception(f"Log directory \"{logDir}\" for the experiment already exists."
                         " Remove it or implicitry overwrite with setting addToExisting to True.")
     return SummaryWriter(logDir)
-writer = initToNone('writer')
+writer = initIfNew('writer')
 
 
 class StripesFromHDF :
@@ -513,7 +519,8 @@ examplesDb[4] = [(1298309, 1015)
                 ]
 examplesDb[8] = [(2348095, 1684)
                 ,(1909160,333)
-                ,(2489646, 1240)
+                #,(2489646, 1240)
+                ,(5592152, 2722)
                 ,(1429010,666)
                 ,(152196,251)
                 ,(1707893,914)
@@ -523,14 +530,14 @@ examplesDb[16] = [ (2348095, 1684)
                  , (1429010,666)
                  #, (1831107,164)
                  , (102151, 418)]
-examples = initToNone('examples')
+examples = initIfNew('examples')
 
 def createTrainSet() :
     listOfData = [ "4176862R_Eig_Threshold-4keV"
                  , "18515.Lamb1_Eiger_7m_45keV_360Scan"
                  , "23574.8965435L.Eiger.32kev_org"
                  , "23574.8965435L.Eiger.32kev_sft"
-                 #, "18692b_input_PhantomM"
+                 , "18692b_input_PhantomM"
                  ]
     sinoRoot = StripesFromHDFs(listOfData)
     mytransforms = transforms.Compose([
@@ -630,8 +637,8 @@ def createReferences(trainSet, toShow = 0) :
                                for ex in examples ] ).to(TCfg.device)
     refNoises = torch.randn((refImages.shape[0],TCfg.latentDim)).to(TCfg.device)
     return refImages, refNoises
-refImages = initToNone('refImages')
-refNoises = initToNone('refNoises')
+refImages = initIfNew('refImages')
+refNoises = initIfNew('refNoises')
 
 
 def showMe(trainSet, item=None) :
@@ -652,9 +659,6 @@ def showMe(trainSet, item=None) :
     plotImage(image.cpu())
     image = image.to(TCfg.device)
 
-
-def realModel(mod) :
-    return mod.module if isinstance(mod, nn.DataParallel) else mod
 
 
 class GeneratorTemplate(nn.Module):
@@ -686,6 +690,8 @@ class GeneratorTemplate(nn.Module):
 
 
     def encblock(self, chIn, chOut, kernel, stride=1, norm=True, dopadding=False) :
+        chIn = int(chIn*self.baseChannels)
+        chOut = int(chOut*self.baseChannels)
         layers = []
         layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias=True,
                                 padding='same', padding_mode='reflect') \
@@ -700,6 +706,8 @@ class GeneratorTemplate(nn.Module):
 
 
     def decblock(self, chIn, chOut, kernel, stride=1, norm=True, dopadding=False) :
+        chIn = int(chIn*self.baseChannels)
+        chOut = int(chOut*self.baseChannels)
         layers = []
         layers.append( nn.ConvTranspose2d(chIn, chOut, kernel, stride, bias=True,
                                           padding=1) \
@@ -772,16 +780,47 @@ class GeneratorTemplate(nn.Module):
         else :
             res = torch.zeros(images[self.gapRng].shape, device=images.device, requires_grad=False)
         return squeezeOrg(res, orgDims)
-generator = initToNone('generator')
-lowResGenerators = {}
+
+
+    def forward(self, input):
+
+        images, noises = input
+        images, orgDims = unsqeeze4dim(images)
+        modelIn = images.clone()
+        modelIn[self.gapRng] = self.preProc(images)
+
+        if self.latentChannels :
+            latent = self.noise2latent(noises)
+            dwTrain = [torch.cat((modelIn, latent), dim=1),]
+        else :
+            dwTrain = [modelIn,]
+        for encoder in self.encoders :
+            dwTrain.append(encoder(dwTrain[-1]))
+        mid = self.fcLink(dwTrain[-1])
+        upTrain = [mid]
+        for level, decoder in enumerate(self.decoders) :
+            upTrain.append( decoder( torch.cat( (upTrain[-1], dwTrain[-1-level]), dim=1 ) ) )
+        res = self.lastTouch(torch.cat( (upTrain[-1], modelIn ), dim=1 ))
+
+        patches = modelIn[self.gapRng] + 2 * res[self.gapRng]
+        return squeezeOrg(patches, orgDims)
+
+
+generator = initIfNew('generator')
+lowResGenerators = initIfNew('lowResGenerators', {})
 
 
 class DiscriminatorTemplate(nn.Module):
 
-    def __init__(self):
+    def __init__(self, omitEdges=0):
         super(DiscriminatorTemplate, self).__init__()
+        self.baseChannels = 64
+        self.omitEdges = omitEdges
+
 
     def encblock(self, chIn, chOut, kernel, stride=1, norm=True, dopadding=False) :
+        chIn = int(chIn*self.baseChannels)
+        chOut = int(chOut*self.baseChannels)
         layers = []
         layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias=True,
                                 padding='same', padding_mode='reflect') \
@@ -794,16 +833,34 @@ class DiscriminatorTemplate(nn.Module):
         fillWheights(layers)
         return torch.nn.Sequential(*layers)
 
+    def createHead(self) :
+        encSh = self.body(torch.zeros((1,1,*DCfg.sinoSh))).shape
+        linChannels = math.prod(encSh)
+        toRet = nn.Sequential(
+            nn.Flatten(),
+            #nn.Dropout(0.4),
+            nn.Linear(linChannels, self.baseChannels*4),
+            #nn.Linear(linChannels, 1),
+            nn.LeakyReLU(0.2),
+            #nn.Dropout(0.4),
+            nn.Linear(self.baseChannels*4, 1),
+            nn.Sigmoid(),
+        )
+        fillWheights(toRet)
+        return toRet
+
     def forward(self, images):
         if images.dim() == 3:
             images = images.unsqueeze(1)
-        #images = images.clone() # I want to exclude two blocks on the edges :
-        #images[ ..., :DCfg.gapW, DCfg.gapRngX ] = 0
-        #images[ ..., -DCfg.gapW:, DCfg.gapRngX ] = 0
+        if self.omitEdges :
+            images = images.clone() # I want to exclude two blocks on the edges :
+            images[ ..., :self.omitEdges, DCfg.gapRngX ] = 0
+            images[ ..., -self.omitEdges:, DCfg.gapRngX ] = 0
         convRes = self.body(images)
         res = self.head(convRes)
         return res
-discriminator = initToNone('discriminator')
+
+discriminator = initIfNew('discriminator')
 noAdv=False
 
 
@@ -813,8 +870,8 @@ def createOptimizer(model, lr) :
         lr=lr,
         betas=(0.5, 0.999)
     )
-optimizer_G = initToNone('optimizer_G')
-optimizer_D = initToNone('optimizer_D')
+optimizer_G = initIfNew('optimizer_G')
+optimizer_D = initIfNew('optimizer_D')
 
 
 def restoreCheckpoint(path=None, logDir=None) :
@@ -826,7 +883,7 @@ def restoreCheckpoint(path=None, logDir=None) :
                             " Remove it .")
         try : os.remove(TCfg.historyHDF)
         except : pass
-        return 0, 0, 0, -1
+        return 0, 0, 0, -1, 0
     else :
         return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D)
 
@@ -1110,169 +1167,152 @@ class TrainResClass:
 
 trainInfo = TrainInfoClass()
 withNoGrad = True
-skipGen=False
-skipDis=False
 
 def train_step(images):
     global trainDis, trainGen, eDinfo, noAdv, withNoGrad, skipGen, skipDis
     trainInfo.iterations += 1
+    trainInfo.totPerformed += 1
+    trainRes = TrainResClass()
 
     nofIm = images.shape[0]
     images = images.squeeze(1).to(TCfg.device)
+    procImages, procReverseData = imagesPreProc(images)
+    fakeImages = procImages.clone().detach().requires_grad_(False)
+    subBatchSize = nofIm // TCfg.batchSplit
     imWeights = calculateWeights(images)
 
-    labelsTrue = torch.full((nofIm, 1),  1 - TCfg.labelSmoothFac,
+    labelsTrue = torch.full((subBatchSize, 1),  1 - TCfg.labelSmoothFac,
                         dtype=torch.float, device=TCfg.device, requires_grad=False)
-    labelsFalse = torch.full((nofIm, 1),  TCfg.labelSmoothFac,
+    labelsFalse = torch.full((subBatchSize, 1),  TCfg.labelSmoothFac,
                         dtype=torch.float, device=TCfg.device, requires_grad=False)
     labelsDis = torch.cat( (labelsTrue, labelsFalse), dim=0).to(TCfg.device).requires_grad_(False)
 
-    D_loss = torch.zeros(1)
-    G_loss = torch.zeros(1)
-    GA_loss = torch.zeros(1)
-    GD_loss = torch.zeros(1)
-    pred_preD = torch.zeros(1)
-    pred_realD = torch.zeros(1)
-    pred_fakeD = torch.zeros(1)
-    pred_fakeG = torch.zeros(1)
-    ratReal = 0
-    ratFake = 0
-    procImages, procReverseData = imagesPreProc(images)
-
-    discriminator.train()
-    generator.train()
-    trainInfo.totPerformed += 1
-
+    # train discriminator
     if not noAdv :
         # calculate predictions of prefilled images - purely for metrics purposes
-        ##discriminator.eval()
+        #discriminator.eval()
         generator.eval()
-        fakeImagesD = procImages.clone().detach()
-        fakeImagesD.requires_grad=False
         with torch.no_grad() :
-            fakeImagesD[DCfg.gapRng] = generator.preProc(procImages)
-            pred_preD = discriminator(fakeImagesD)
+            fakeImages[DCfg.gapRng] = generator.preProc(procImages)
+            trainRes.predPre = discriminator(fakeImages).mean().item()
 
-        def calc_D_loss() :
-            wghts= None if imWeights is None else torch.cat( (imWeights, imWeights) )
-            return loss_Adv(labelsDis, pred_both, wghts)
-
-        if not skipDis :
-
-            # train discriminator
-            generator.eval()
+        pred_real = torch.empty((nofIm,1), requires_grad=False)
+        pred_fake = torch.empty((nofIm,1), requires_grad=False)
+        #discriminator.train()
+        for param in discriminator.parameters() :
+            param.requires_grad = True
+        optimizer_D.zero_grad()
+        for i in range(TCfg.batchSplit) :
+            subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize] if TCfg.batchSplit > 1 else np.s_[...]
+            subFakeImages = fakeImages[subRange,...]
             with torch.no_grad() :
-                fakeImagesD[()] = generator.generateImages(procImages)
-            pred_realD = discriminator(procImages)
-            pred_fakeD = discriminator(fakeImagesD)
-            pred_both = torch.cat((pred_realD, pred_fakeD), dim=0)
+                subFakeImages[DCfg.gapRng] = generator.generatePatches(procImages[subRange,...])
+            subPred_fakeD = discriminator(subFakeImages)
+            subPred_realD = discriminator(procImages[subRange,...])
+            pred_both = torch.cat((subPred_realD, subPred_fakeD), dim=0)
+            wghts = None if imWeights is None else \
+                torch.cat( (imWeights[subRange], imWeights[subRange]) )
+            subD_loss = loss_Adv(labelsDis, pred_both, wghts)
             # train discriminator only if it is not too good :
-            if pred_fakeD.mean() > 0.2 and pred_realD.mean() < 0.8 :
-                trainInfo.disPerformed += 1
-                optimizer_D.zero_grad()
-                D_loss = calc_D_loss()
-                D_loss.backward()
-                optimizer_D.step()
-            else :
-                with torch.no_grad() :
-                    D_loss = calc_D_loss()
-            ratReal = torch.count_nonzero(pred_realD > 0.5)/nofIm
-            ratFake = torch.count_nonzero(pred_fakeD > 0.5)/nofIm
-            skipGen = pred_fakeD.mean() >= pred_realD.mean()
+            if subPred_fakeD.mean() > 0.2 or subPred_realD.mean() < 0.8 :
+            #if True :
+                trainInfo.disPerformed += 1/TCfg.batchSplit
+                subD_loss.backward()
+            trainRes.lossD += subD_loss.item()
+            pred_real[subRange] = subPred_realD.clone().detach()
+            pred_fake[subRange] = subPred_fakeD.clone().detach()
+        optimizer_D.step()
+        optimizer_D.zero_grad(set_to_none=True)
+        trainRes.lossD /= TCfg.batchSplit
+        trainRes.predReal = pred_real.mean().item()
+        trainRes.predFake = pred_fake.mean().item()
 
-        else:
-
-            with torch.no_grad() :
-                pred_realD = discriminator(procImages)
-                pred_fakeD = discriminator(fakeImagesD)
-                pred_both = torch.cat((pred_realD, pred_fakeD), dim=0)
-                D_loss = calc_D_loss()
-                ratReal = torch.count_nonzero(pred_realD > 0.5)/nofIm
-
+    else :
+        pred_real = torch.zeros((1,), requires_grad=False)
+        pred_fake = torch.zeros((1,), requires_grad=False)
 
     # train generator
-    fakeImagesG = None
-    if not skipGen :
-        trainInfo.genPerformed += 1
-        ##discriminator.eval()
-        generator.train()
-        optimizer_G.zero_grad()
-        fakeImagesG = generator.generateImages(procImages)
+    #discriminator.eval()
+    for param in discriminator.parameters() :
+        param.requires_grad = False
+    generator.train()
+    optimizer_G.zero_grad()
+    for i in range(TCfg.batchSplit) :
+        subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize] if TCfg.batchSplit > 1 else np.s_[:]
+        wghts = None if imWeights is None else \
+                torch.cat( (imWeights[subRange], imWeights[subRange]) )
+        subFakeImages = generator.generateImages(procImages[subRange,...])
         if noAdv :
-            G_loss = loss_Rec(procImages[DCfg.gapRng], fakeImagesG[DCfg.gapRng],
-                     imWeights)
-            GD_loss = GA_loss = G_loss
+            subG_loss = loss_Rec(procImages[subRange,:,DCfg.gapRngX], subFakeImages[DCfg.gapRng], wghts)
+            subGD_loss = subGA_loss = subG_loss
         else :
-            with torch.set_grad_enabled(not withNoGrad) :
-                pred_fakeG = discriminator(fakeImagesG)
-            GA_loss, GD_loss = loss_Gen(labelsTrue, pred_fakeG,
-                                        procImages[DCfg.gapRng], fakeImagesG[DCfg.gapRng],
-                                        imWeights)
-            G_loss = lossAdvCoef * GA_loss + lossDifCoef * GD_loss
-            ratFake = torch.count_nonzero(pred_fakeG > 0.5)/nofIm
-            #skipDis = ratFake < 0.01 and ratReal > 0.99
-            skipDis = False # pred_fakeG.mean() < 0.2 and pred_realD.mean() > 0.8
-        G_loss.backward()
-        optimizer_G.step()
+            subPred_fakeG = discriminator(subFakeImages)
+            subGA_loss, subGD_loss = loss_Gen(labelsTrue, subPred_fakeG,
+                                              procImages[subRange,:,DCfg.gapRngX],
+                                              subFakeImages[DCfg.gapRng])
+            subG_loss = lossAdvCoef * subGA_loss + lossDifCoef * subGD_loss
+            pred_fake[subRange] = subPred_fakeG.clone().detach()
+        # train generator only if it is not too good :
+        if noAdv  or  subPred_fakeD.mean() < pred_real[subRange].mean() :
+            trainInfo.genPerformed += 1/TCfg.batchSplit
+            subG_loss.backward()
+        trainRes.lossGA += subGA_loss.item()
+        trainRes.lossGD += subGD_loss.item()
+        fakeImages[subRange,...,DCfg.gapRngX] = subFakeImages[DCfg.gapRng].detach()
+    optimizer_G.step()
+    optimizer_G.zero_grad(set_to_none=True)
+    trainRes.lossGA /= TCfg.batchSplit
+    trainRes.lossGD /= TCfg.batchSplit
+    trainRes.predFake = pred_fake.mean().item()
 
+    # prepare report
     with torch.no_grad() :
 
-        fakeImages = fakeImagesD if fakeImagesG is None else fakeImagesG
-        pred_fake = pred_fakeD if fakeImagesG is None else pred_fakeG
+        trainRes.lossMSE = loss_MSE(images[DCfg.gapRng], fakeImages[DCfg.gapRng]).item()
+        trainRes.lossL1L = loss_L1L(images[DCfg.gapRng], fakeImages[DCfg.gapRng]).item()
 
-        deprocFakeImages = imagesPostProc(fakeImages, procReverseData)
-        MSE_loss = loss_MSE(images[DCfg.gapRng], deprocFakeImages[DCfg.gapRng])
-        L1L_loss = loss_L1L(images[DCfg.gapRng], deprocFakeImages[DCfg.gapRng])
-
-        idx = random.randint(0, nofIm-1) if noAdv else pred_realD.argmax()
-        trainInfo.bestRealImage = deprocFakeImages[idx,...].clone().detach() if noAdv \
+        idx = random.randint(0, nofIm-1) if noAdv else pred_real.argmax()
+        trainInfo.bestRealImage = fakeImages[idx,...].clone().detach() if noAdv \
                                   else images[idx,...].clone().detach()
-        trainInfo.bestRealProb = 0 if noAdv else pred_realD[idx].item()
+        trainInfo.bestRealProb = 0 if noAdv else pred_real[idx].item()
         trainInfo.bestRealIndex = idx
 
-        idx = random.randint(0, nofIm-1) if noAdv else pred_realD.argmin()
-        trainInfo.worstRealImage = deprocFakeImages[idx,...].clone().detach() if noAdv \
+        idx = random.randint(0, nofIm-1) if noAdv else pred_real.argmin()
+        trainInfo.worstRealImage = fakeImages[idx,...].clone().detach() if noAdv \
                                    else images[idx,...].clone().detach()
-        trainInfo.worstRealProb = 0 if noAdv else pred_realD[idx].item()
+        trainInfo.worstRealProb = 0 if noAdv else pred_real[idx].item()
         trainInfo.worstRealIndex = idx
 
         idx = random.randint(0, nofIm-1) if noAdv else pred_fake.argmax()
-        trainInfo.bestFakeImage = deprocFakeImages[idx,...].clone().detach()
+        trainInfo.bestFakeImage = fakeImages[idx,...].clone().detach()
         trainInfo.bestFakeProb = 0 if noAdv else pred_fake[idx].item()
         trainInfo.bestFakeIndex = idx
 
         idx = random.randint(0, nofIm-1) if noAdv else pred_fake.argmin()
-        trainInfo.worstFakeImage = deprocFakeImages[idx,...].clone().detach()
+        trainInfo.worstFakeImage = fakeImages[idx,...].clone().detach()
         trainInfo.worstFakeProb = 0 if noAdv else pred_fake[idx].item()
         trainInfo.worstFakeIndex = idx
 
         trainInfo.highestDifIndex = eDinfo[0]
         trainInfo.highestDif = eDinfo[1]
         trainInfo.highestDifImageOrg = images[trainInfo.highestDifIndex,...].clone().detach()
-        trainInfo.highestDifImageGen = deprocFakeImages[trainInfo.highestDifIndex,...].clone().detach()
+        trainInfo.highestDifImageGen = fakeImages[trainInfo.highestDifIndex,...].clone().detach()
         trainInfo.lowestDifIndex = eDinfo[2]
         trainInfo.lowestDif = eDinfo[3]
 
-        trainInfo.ratReal += ratReal * nofIm
-        trainInfo.ratFake += ratFake * nofIm
+        trainInfo.ratReal += nofIm * torch.count_nonzero(pred_real > 0.5)/nofIm
+        trainInfo.ratFake += nofIm * torch.count_nonzero(pred_fake > 0.5)/nofIm
         trainInfo.totalImages += nofIm
 
-    return TrainResClass(*(mem.item() for mem in ( D_loss
-                                                 , GA_loss
-                                                 , GD_loss
-                                                 , MSE_loss
-                                                 , L1L_loss
-                                                 , pred_realD.mean()
-                                                 , pred_preD.mean()
-                                                 , pred_fake.mean())))
+    return trainRes
 
 
-epoch=initToNone('epoch')
-iter = initToNone('iter')
-minGEpoch = initToNone('minGEpoch')
-minGdLoss = initToNone('minGdLoss')
-prepGdLoss = initToNone('prepGdLoss')
-
+epoch=initIfNew('epoch', 0)
+iter = initIfNew('iter', 0)
+minGEpoch = initIfNew('minGEpoch')
+minGdLoss = initIfNew('minGdLoss')
+prepGdLoss = initIfNew('prepGdLoss')
+startFrom = initIfNew('startFrom', 0)
 
 def beforeEachEpoch(epoch) :
     return
@@ -1290,7 +1330,7 @@ dataLoader=None
 testLoader=None
 
 def train(savedCheckPoint):
-    global epoch, minGdLoss, minGEpoch, prepGdLoss, iter, trainInfo
+    global epoch, minGdLoss, minGEpoch, prepGdLoss, iter, trainInfo, startFrom
     lastGdLoss = minGdLoss
 
     discriminator.to(TCfg.device)
@@ -1308,6 +1348,9 @@ def train(savedCheckPoint):
 
         for it , data in tqdm.tqdm(enumerate(dataLoader), total=int(len(dataLoader))):
             iter += 1
+            if startFrom :
+                startFrom -= 1
+                continue
 
             images = data[0].to(TCfg.device)
             nofIm = images.shape[0]
@@ -1391,7 +1434,7 @@ def train(savedCheckPoint):
                 saveCheckPoint(savedCheckPoint+"_hourly.pth",
                                epoch-1, iter, minGEpoch, minGdLoss,
                                generator, discriminator,
-                               optimizer_G, optimizer_D)
+                               optimizer_G, optimizer_D, startFrom=it)
 
 
         resAcc *= 1.0/totalIm
