@@ -488,36 +488,19 @@ examplesDb[2] = [(2348095, 1684)
                 ,(1958164,1391)
                 ,(1429010,666)
                 ,(1271101, 570)
-                ,(3007773,2063)
-                #,(1271426,1140)
-                ,(176088,893)
-                #,(173107,273)
-                #,(141881,817)
-                #,(4076914,1642)
+                ,(1271426,1140)
+                ,(4076914,1642)
                 ,(2880692,530)
-                #,(1333420,160)
-                ,(2997700,2321)
-                #,(1385331,653)
-                #,(132424,868)
-                #,(1440290,204)
-                #,(132352,757)
+                ,(1333420,160)
                 ,(102151, 418)
                 ]
-examplesDb[4] = [(1298309, 1015)
-                #,(4612947, 2882)
-                ,(2215760, 500)
-                ,(2348095, 1684)
+examplesDb[4] = [(2348095, 1684)
+                ,(1958164,1391)
+                ,(1429010,666)
+                ,(1298309, 1015)
                 ,(1907990, 1545)
-                ,(291661, 724)
-                ,(2489646, 1240)
-                ,(1142687, 230)
-                #,(974214, 631)
-                ,(1429007,666)
-                ,(152196,251)
-                ,(1284589,62)
                 ,(2963058,233)
                 ,(200279,41)
-                ,(1707893,914)
                 ,(102151, 418)
                 ]
 examplesDb[8] = [(2348095, 1684)
@@ -535,14 +518,18 @@ examplesDb[16] = [ (2348095, 1684)
                  , (102151, 418)]
 examples = initIfNew('examples')
 
+
+listOfTrainData = [ "18515.Lamb1_Eiger_7m_45keV_360Scan"
+                  , "18692a.ExpChicken6mGyShift"
+                  , "18692b_input_PhantomM"
+                  , "18692b.MinceO"
+                  , "19022g.11-EggLard"
+                  , "19736b.09_Feb.4176862R_Eig_Threshold-4keV"
+                  , "20982b.04_774784R"
+                  , "23574.8965435L.Eiger.32kev_org"
+                  ]
 def createTrainSet() :
-    listOfData = [ "4176862R_Eig_Threshold-4keV"
-                 , "18515.Lamb1_Eiger_7m_45keV_360Scan"
-                 , "23574.8965435L.Eiger.32kev_org"
-                 , "23574.8965435L.Eiger.32kev_sft"
-                 , "18692b_input_PhantomM"
-                 ]
-    sinoRoot = StripesFromHDFs(listOfData)
+    sinoRoot = StripesFromHDFs(listOfTrainData)
     mytransforms = transforms.Compose([
             transforms.Resize(DCfg.sinoSh),
             transforms.RandomHorizontalFlip(),
@@ -678,6 +665,7 @@ class GeneratorTemplate(nn.Module):
         self.gapRng = np.s_[...,self.gapRngX]
         self.latentChannels = latentChannels
         self.baseChannels = 64
+        self.amplitude = nn.Parameter(torch.full((1,), -2.9)) # coef ~0.1
 
 
     def createLatent(self) :
@@ -805,7 +793,8 @@ class GeneratorTemplate(nn.Module):
             upTrain.append( decoder( torch.cat( (upTrain[-1], dwTrain[-1-level]), dim=1 ) ) )
         res = self.lastTouch(torch.cat( (upTrain[-1], modelIn ), dim=1 ))
 
-        patches = modelIn[self.gapRng] + 2 * res[self.gapRng]
+        resWeight = 2 * torch.sigmoid(self.amplitude)
+        patches = modelIn[self.gapRng] + resWeight * res[self.gapRng]
         return squeezeOrg(patches, orgDims)
 
 
@@ -886,7 +875,7 @@ def restoreCheckpoint(path=None, logDir=None) :
                             " Remove it .")
         try : os.remove(TCfg.historyHDF)
         except : pass
-        return 0, 0, 0, -1, 0
+        return 0, 0, 0, 1, 0
     else :
         return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D)
 
@@ -949,26 +938,35 @@ def summarizeSet(dataloader, onPrep=True):
     MSE_diffs, L1L_diffs, Rec_diffs, Real_probs, Fake_probs = [], [], [], [], []
     totalNofIm = 0
     generator.to(TCfg.device)
+    #generator.train()
     generator.eval()
     #discriminator.eval()
     with torch.no_grad() :
         for it , data in tqdm.tqdm(enumerate(dataloader), total=int(len(dataloader))):
             images = data[0].squeeze(1).to(TCfg.device)
             nofIm = images.shape[0]
+            subBatchSize = nofIm // TCfg.batchSplit
             totalNofIm += nofIm
             procImages, procData = imagesPreProc(images)
             genImages = procImages.clone()
-            patchImages = generator.preProc(procImages) \
-                          if onPrep else \
-                          generator.generatePatches(procImages)
-            genImages[DCfg.gapRng] = patchImages
-            if not noAdv :
-                Real_probs.append(discriminator(procImages).sum().item())
-                Fake_probs.append(discriminator(genImages).sum().item())
-            procImages = imagesPostProc(patchImages, procData)
-            MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages))
-            L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], procImages))
-            Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], procImages))
+
+            rprob = fprob = 0
+            for i in range(TCfg.batchSplit) :
+                subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize] if TCfg.batchSplit > 1 else np.s_[...]
+                subProcImages = procImages[subRange,...]
+                patchImages = generator.preProc(subProcImages) \
+                              if onPrep else \
+                              generator.generatePatches(subProcImages)
+                genImages[subRange,:,DCfg.gapRngX] = patchImages
+                if not noAdv :
+                    rprob += discriminator(subProcImages).sum().item()
+                    fprob += discriminator(genImages[subRange,...]).sum().item()
+            procImages = imagesPostProc(genImages, procData)
+            MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages[DCfg.gapRng]))
+            L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], procImages[DCfg.gapRng]))
+            Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], procImages[DCfg.gapRng]))
+            Real_probs.append(rprob)
+            Fake_probs.append(fprob)
 
     MSE_diff = sum(MSE_diffs) / totalNofIm
     L1L_diff = sum(L1L_diffs) / totalNofIm
@@ -1169,6 +1167,9 @@ class TrainResClass:
 
 
 trainInfo = TrainInfoClass()
+normMSE=1
+normL1L=1
+normRec=1
 skipDis = False
 
 def train_step(images):
@@ -1200,7 +1201,7 @@ def train_step(images):
         with torch.no_grad() :
             for i in range(TCfg.batchSplit) :
                 subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize] if TCfg.batchSplit > 1 else np.s_[...]
-                fakeImages[subRange,:,DCfg.gapRngX] = generator.preProc(procImages[subRange,...])
+                fakeImages[subRange,...,DCfg.gapRngX] = generator.preProc(procImages[subRange,...])
                 trainRes.predPre += discriminator(fakeImages[subRange,...]).mean().item()
             trainRes.predPre /= TCfg.batchSplit
 
@@ -1267,7 +1268,7 @@ def train_step(images):
             subG_loss.backward()
         trainRes.lossGA += subGA_loss.item()
         trainRes.lossGD += subGD_loss.item()
-        fakeImages[subRange,:,DCfg.gapRngX] = subFakeImages[DCfg.gapRng].detach()
+        fakeImages[subRange,...,DCfg.gapRngX] = subFakeImages[DCfg.gapRng].detach()
     optimizer_G.step()
     optimizer_G.zero_grad(set_to_none=True)
     trainRes.lossGA /= TCfg.batchSplit
@@ -1278,8 +1279,9 @@ def train_step(images):
     # prepare report
     with torch.no_grad() :
 
-        trainRes.lossMSE = loss_MSE(images[DCfg.gapRng], fakeImages[DCfg.gapRng]).item()
-        trainRes.lossL1L = loss_L1L(images[DCfg.gapRng], fakeImages[DCfg.gapRng]).item()
+        trainRes.lossMSE = loss_MSE(images[DCfg.gapRng], fakeImages[DCfg.gapRng]).item() / normMSE
+        trainRes.lossL1L = loss_L1L(images[DCfg.gapRng], fakeImages[DCfg.gapRng]).item() / normL1L
+        trainRes.lossGD /= normRec
 
         idx = random.randint(0, nofIm-1) if noAdv else pred_real.argmax()
         trainInfo.bestRealImage = fakeImages[idx,...].clone().detach() if noAdv \
@@ -1319,9 +1321,9 @@ def train_step(images):
 
 epoch=initIfNew('epoch', 0)
 iter = initIfNew('iter', 0)
+imer = initIfNew('iter', 0)
 minGEpoch = initIfNew('minGEpoch')
-minGdLoss = initIfNew('minGdLoss')
-prepGdLoss = initIfNew('prepGdLoss')
+minGdLoss = initIfNew('minGdLoss', 1)
 startFrom = initIfNew('startFrom', 0)
 
 def beforeEachEpoch(epoch) :
@@ -1338,10 +1340,14 @@ def afterReport() :
 
 dataLoader=None
 testLoader=None
+normTestMSE=1
+normTestL1L=1
+normTestRec=1
 
 def train(savedCheckPoint):
-    global epoch, minGdLoss, minGEpoch, prepGdLoss, iter, trainInfo, startFrom
+    global epoch, minGdLoss, minGEpoch, iter, trainInfo, startFrom, imer
     lastGdLoss = minGdLoss
+    lastGdLossTrain = 1
 
     discriminator.to(TCfg.device)
     generator.to(TCfg.device)
@@ -1361,9 +1367,9 @@ def train(savedCheckPoint):
             if startFrom :
                 startFrom -= 1
                 continue
-
             images = data[0].to(TCfg.device)
             nofIm = images.shape[0]
+            imer += nofIm
             totalIm += nofIm
             trainRes = train_step(images)
             resAcc += trainRes * nofIm
@@ -1402,38 +1408,38 @@ def train(savedCheckPoint):
                 addImage(4,1,collageR[0,3], stretch=False)
                 writer.add_scalars("Losses per iter",
                                    {'Dis': trainRes.lossD
-                                   ,'Adv': trainRes.lossGA
-                                   ,'Gen': lossAdvCoef * trainRes.lossGA + lossDifCoef * trainRes.lossGD
-                                   }, iter )
+                                   ,'Gen': trainRes.lossGA
+                                   ,'Rec': lossAdvCoef * trainRes.lossGA + lossDifCoef * trainRes.lossGD * normRec
+                                   }, imer )
                 writer.add_scalars("Distances per iter",
                                    {'MSE': trainRes.lossMSE
                                    ,'L1L': trainRes.lossL1L
                                    ,'REC': trainRes.lossGD
-                                   }, iter )
+                                   }, imer )
                 writer.add_scalars("Probs per iter",
                                    {'Ref':trainRes.predReal
                                    ,'Gen':trainRes.predFake
                                    ,'Pre':trainRes.predPre
-                                   }, iter )
+                                   }, imer )
 
                 IPython.display.clear_output(wait=True)
                 beforeReport()
                 print(f"Epoch: {epoch} ({minGEpoch}). " +
-                      ( f" L1L: {trainRes.lossL1L:.3e} " if noAdv \
+                      ( f" L1L: {trainRes.lossL1L:.3f} " if noAdv \
                           else \
                         f" Dis[{trainInfo.disPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossD:.3f} ({trainInfo.ratReal/trainInfo.totalImages:.3f})," ) +
-                      ( f" MSE: {trainRes.lossMSE:.3e} " if noAdv \
+                      ( f" MSE: {trainRes.lossMSE:.3f} " if noAdv \
                           else \
                         f" Gen[{trainInfo.genPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossGA:.3f} ({trainInfo.ratFake/trainInfo.totalImages:.3f})," ) +
-                      f" Rec: {lastGdLoss:.3e} ({minGdLoss:.3e} / {prepGdLoss:.3e})."
+                      f" Rec: {trainRes.lossGD:.3f} (Train: {lastGdLossTrain/normRec:.3f}, Test: {lastGdLoss/normTestRec:.3f} | {minGdLoss/normTestRec:.3f})."
                       )
                 print (f"TT: {trainInfo.bestRealProb:.2f} ({data[1][trainInfo.bestRealIndex]},{data[2][trainInfo.bestRealIndex]}),  "
                        f"FT: {trainInfo.bestFakeProb:.2f} ({data[1][trainInfo.bestFakeIndex]},{data[2][trainInfo.bestFakeIndex]}),  "
-                       f"HD: {trainInfo.highestDif:.3e} ({data[1][trainInfo.highestDifIndex]},{data[2][trainInfo.highestDifIndex]}),  "
+                       f"HD: {trainInfo.highestDif/normMSE:.3e} ({data[1][trainInfo.highestDifIndex]},{data[2][trainInfo.highestDifIndex]}),  "
                        f"GP: {probsR[0,2].item():.3f}, {probsR[0,1].item():.3f} " )
                 print (f"TF: {trainInfo.worstRealProb:.2f} ({data[1][trainInfo.worstRealIndex]},{data[2][trainInfo.worstRealIndex]}),  "
                        f"FF: {trainInfo.worstFakeProb:.2f} ({data[1][trainInfo.worstFakeIndex]},{data[2][trainInfo.worstFakeIndex]}),  "
-                       f"LD: {trainInfo.lowestDif:.3e} ({data[1][trainInfo.lowestDifIndex]},{data[2][trainInfo.lowestDifIndex]}),  "
+                       f"LD: {trainInfo.lowestDif/normMSE:.3e} ({data[1][trainInfo.lowestDifIndex]},{data[2][trainInfo.lowestDifIndex]}),  "
                        f"R : {probsR[0,0].item():.3f}." )
                 plotImage(showMe)
                 afterReport()
@@ -1442,7 +1448,7 @@ def train(savedCheckPoint):
             if time.time() - lastSaveTime > 3600 :
                 lastSaveTime = time.time()
                 saveCheckPoint(savedCheckPoint+"_hourly.pth",
-                               epoch-1, iter, minGEpoch, minGdLoss,
+                               epoch-1, imer, minGEpoch, minGdLoss/normRec,
                                generator, discriminator,
                                optimizer_G, optimizer_D, startFrom=it)
 
@@ -1451,7 +1457,7 @@ def train(savedCheckPoint):
         writer.add_scalars("Losses per epoch",
                            {'Dis': resAcc.lossD
                            ,'Adv': resAcc.lossGA
-                           ,'Gen': lossAdvCoef * resAcc.lossGA + lossDifCoef * resAcc.lossGD
+                           ,'Gen': lossAdvCoef * resAcc.lossGA + lossDifCoef * resAcc.lossGD * normRec
                            }, epoch )
         writer.add_scalars("Distances per epoch",
                            {'MSE': resAcc.lossMSE
@@ -1463,12 +1469,23 @@ def train(savedCheckPoint):
                            ,'Gen': resAcc.predFake
                            ,'Pre': resAcc.predPre
                            }, epoch )
-        lastGdLoss = resAcc.lossGD
-        if minGdLoss < 0.0 or resAcc.lossGD < minGdLoss  :
-            minGdLoss = resAcc.lossGD
+        lastGdLossTrain = resAcc.lossGD / normRec
+
+        Rec_test, MSE_test, L1L_test, Gen_test, Dis_test = summarizeSet(testLoader, False)
+        writer.add_scalars("Test per epoch",
+                           {'MSE': MSE_test / normTestMSE
+                           ,'L1L': L1L_test / normTestL1L
+                           ,'REC': Rec_test / normTestRec
+                           #,'Dis': Dis_test
+                           #,'Gen': Gen_test
+                           }, epoch )
+
+        lastGdLoss = Rec_test
+        if lastGdLoss < minGdLoss  :
+            minGdLoss = lastGdLoss
             minGEpoch = epoch
             saveCheckPoint(savedCheckPoint+"_B.pth",
-                           epoch, iter, minGEpoch, minGdLoss,
+                           epoch, imer, minGEpoch, minGdLoss,
                            generator, discriminator,
                            optimizer_G, optimizer_D)
             os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_BB.pth") # BB: before best
@@ -1476,18 +1493,9 @@ def train(savedCheckPoint):
             saveModels()
         else :
             saveCheckPoint(savedCheckPoint+".pth",
-                           epoch, iter, minGEpoch, minGdLoss,
+                           epoch, imer, minGEpoch, minGdLoss,
                            generator, discriminator,
                            optimizer_G, optimizer_D)
-
-        Rec_test, MSE_test, L1L_test, Gen_test, Dis_test = summarizeSet(testLoader, False)
-        writer.add_scalars("Test per epoch",
-                           {'MSE': MSE_test
-                           ,'L1L': L1L_test
-                           ,'REC': Rec_test
-                           ,'Dis': Dis_test
-                           ,'Gen': Gen_test
-                           }, epoch )
 
         afterEachEpoch(epoch)
 

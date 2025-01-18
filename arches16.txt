@@ -46,13 +46,15 @@ Adv             | Train         | PreTrain      | Progress
 no              | last          | low           | pureRec_trainLast
 no              | all           | low           | pureRec_trainAll
 no              | only          | -             | pureRec_noPreProc
+no              | all           | none          | pureRec_trainAll_pretrainedNone
+no              | all           | all           | pureRec_trainAll_pretrainAll
+yes             | only          | -             | rec128_noPreProc
 
-no              | all           | none          | - b0
-yes             | last          | low           | - b1
-no              | all           | all           | - b2
-yes             | only          | -             | - b3
+yes             | last          | low           | - b0          | bs=256, lr=0.0002
+yes             | last          | low           | - b1          | bs=64, lr=0.00005
+yes             | only          | -             | - b3          | rec=2048, lr=0.00002
+yes             | all           | low           | - d0
 
-yes             | all           | low           |
 yes             | all           | all           |
 no              | all           | all++         |
 
