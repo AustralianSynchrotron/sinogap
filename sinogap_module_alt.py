@@ -505,8 +505,8 @@ examplesDb[4] = [(2348095, 1684)
                 ]
 examplesDb[8] = [(2348095, 1684)
                 ,(1909160,333)
-                #,(2489646, 1240)
-                ,(5592152, 2722)
+                ,(2489646, 1240)
+                #,(5592152, 2722)
                 ,(1429010,666)
                 ,(152196,251)
                 ,(1707893,914)
@@ -519,14 +519,15 @@ examplesDb[16] = [ (2348095, 1684)
 examples = initIfNew('examples')
 
 
-listOfTrainData = [ "18515.Lamb1_Eiger_7m_45keV_360Scan"
-                  , "18692a.ExpChicken6mGyShift"
+listOfTrainData = [ "19736b.09_Feb.4176862R_Eig_Threshold-4keV"
+                  , "18515.Lamb1_Eiger_7m_45keV_360Scan"
+                  , "23574.8965435L.Eiger.32kev_org"
+                  #, "23574.8965435L.Eiger.32kev_sft"
                   , "18692b_input_PhantomM"
+                  , "18692a.ExpChicken6mGyShift"
                   , "18692b.MinceO"
                   , "19022g.11-EggLard"
-                  , "19736b.09_Feb.4176862R_Eig_Threshold-4keV"
                   , "20982b.04_774784R"
-                  , "23574.8965435L.Eiger.32kev_org"
                   ]
 def createTrainSet() :
     sinoRoot = StripesFromHDFs(listOfTrainData)

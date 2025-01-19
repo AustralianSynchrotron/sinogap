@@ -536,7 +536,7 @@ examplesDb[16] = [ (2348095, 1684)
 examples = initIfNew('examples')
 
 def createTrainSet() :
-    listOfData = [ "4176862R_Eig_Threshold-4keV"
+    listOfData = [ "19736b.09_Feb.4176862R_Eig_Threshold-4keV"
                  , "18515.Lamb1_Eiger_7m_45keV_360Scan"
                  , "23574.8965435L.Eiger.32kev_org"
                  , "23574.8965435L.Eiger.32kev_sft"
