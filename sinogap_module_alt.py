@@ -251,51 +251,6 @@ def load_model(model, model_path):
     return model
 
 
-def saveCheckPoint(path, epoch, iterations, minGEpoch, minGdLoss,
-                   generator, discriminator,
-                   optimizerGen=None, optimizerDis=None,
-                   schedulerGen=None, schedulerDis=None,
-                   startFrom=0) :
-    checkPoint = {}
-    checkPoint['epoch'] = epoch
-    checkPoint['iterations'] = iterations
-    checkPoint['minGEpoch'] = minGEpoch
-    checkPoint['minGdLoss'] = minGdLoss
-    checkPoint['startFrom'] = startFrom
-    checkPoint['generator'] = generator.state_dict()
-    checkPoint['discriminator'] = discriminator.state_dict()
-    if not optimizerGen is None :
-        checkPoint['optimizerGen'] = optimizerGen.state_dict()
-    if not schedulerGen is None :
-        checkPoint['schedulerGen'] = schedulerGen.state_dict()
-    if not optimizerDis is None :
-        checkPoint['optimizerDis'] = optimizerDis.state_dict()
-    if not schedulerDis is None :
-        checkPoint['schedulerDis'] = schedulerDis.state_dict()
-    torch.save(checkPoint, path)
-
-
-def loadCheckPoint(path, generator, discriminator,
-                   optimizerGen=None, optimizerDis=None,
-                   schedulerGen=None, schedulerDis=None) :
-    checkPoint = torch.load(path, map_location=TCfg.device)
-    epoch = checkPoint['epoch']
-    iterations = checkPoint['iterations']
-    minGEpoch = checkPoint['minGEpoch']
-    minGdLoss = checkPoint['minGdLoss']
-    startFrom = checkPoint['startFrom'] if 'startFrom' in checkPoint else 0
-    generator.load_state_dict(checkPoint['generator'])
-    discriminator.load_state_dict(checkPoint['discriminator'])
-    if not optimizerGen is None :
-        optimizerGen.load_state_dict(checkPoint['optimizerGen'])
-    if not schedulerGen is None :
-        schedulerGen.load_state_dict(checkPoint['schedulerGen'])
-    if not optimizerDis is None :
-        optimizerDis.load_state_dict(checkPoint['optimizerDis'])
-    if not schedulerDis is None :
-        schedulerDis.load_state_dict(checkPoint['schedulerDis'])
-    return epoch, iterations, minGEpoch, minGdLoss, startFrom
-
 
 def addToHDF(filename, containername, data) :
     if len(data.shape) == 2 :
@@ -1152,6 +1107,7 @@ class TrainResClass:
     predReal : any = 0
     predPre : any = 0
     predFake : any = 0
+    nofIm : int = 0
     def __add__(self, other):
         toRet = TrainResClass()
         for field in dataclasses.fields(TrainResClass):
@@ -1165,6 +1121,58 @@ class TrainResClass:
             setattr(toRet, fn, getattr(self, fn) * other )
         return toRet
     __rmul__ = __mul__
+
+
+
+
+def saveCheckPoint(path, epoch, iterations, minGEpoch, minGdLoss,
+                   generator, discriminator,
+                   optimizerGen=None, optimizerDis=None,
+                   schedulerGen=None, schedulerDis=None,
+                   startFrom=0, iterimRes=TrainResClass()) :
+    checkPoint = {}
+    checkPoint['epoch'] = epoch
+    checkPoint['iterations'] = iterations
+    checkPoint['minGEpoch'] = minGEpoch
+    checkPoint['minGdLoss'] = minGdLoss
+    checkPoint['startFrom'] = startFrom
+    checkPoint['generator'] = generator.state_dict()
+    checkPoint['discriminator'] = discriminator.state_dict()
+    if not optimizerGen is None :
+        checkPoint['optimizerGen'] = optimizerGen.state_dict()
+    if not schedulerGen is None :
+        checkPoint['schedulerGen'] = schedulerGen.state_dict()
+    if not optimizerDis is None :
+        checkPoint['optimizerDis'] = optimizerDis.state_dict()
+    if not schedulerDis is None :
+        checkPoint['schedulerDis'] = schedulerDis.state_dict()
+    checkPoint['resAcc'] = iterimRes
+    torch.save(checkPoint, path)
+
+
+def loadCheckPoint(path, generator, discriminator,
+                   optimizerGen=None, optimizerDis=None,
+                   schedulerGen=None, schedulerDis=None) :
+    checkPoint = torch.load(path, map_location=TCfg.device)
+    epoch = checkPoint['epoch']
+    iterations = checkPoint['iterations']
+    minGEpoch = checkPoint['minGEpoch']
+    minGdLoss = checkPoint['minGdLoss']
+    startFrom = checkPoint['startFrom'] if 'startFrom' in checkPoint else 0
+    generator.load_state_dict(checkPoint['generator'])
+    discriminator.load_state_dict(checkPoint['discriminator'])
+    if not optimizerGen is None :
+        optimizerGen.load_state_dict(checkPoint['optimizerGen'])
+    if not schedulerGen is None :
+        schedulerGen.load_state_dict(checkPoint['schedulerGen'])
+    if not optimizerDis is None :
+        optimizerDis.load_state_dict(checkPoint['optimizerDis'])
+    if not schedulerDis is None :
+        schedulerDis.load_state_dict(checkPoint['schedulerDis'])
+    iterimRes = checkPoint['resAcc'] if 'resAcc' in checkPoint else TrainResClass()
+
+    return epoch, iterations, minGEpoch, minGdLoss, startFrom, iterimRes
+
 
 
 trainInfo = TrainInfoClass()
@@ -1344,9 +1352,10 @@ testLoader=None
 normTestMSE=1
 normTestL1L=1
 normTestRec=1
+resAcc = TrainResClass()
 
 def train(savedCheckPoint):
-    global epoch, minGdLoss, minGEpoch, iter, trainInfo, startFrom, imer
+    global epoch, minGdLoss, minGEpoch, iter, trainInfo, startFrom, imer, resAcc
     lastGdLoss = minGdLoss
     lastGdLossTrain = 1
 
@@ -1360,7 +1369,7 @@ def train(savedCheckPoint):
         beforeEachEpoch(epoch)
         generator.train()
         discriminator.train()
-        resAcc = TrainResClass()
+        #resAcc = TrainResClass()
         totalIm = 0
 
         for it , data in tqdm.tqdm(enumerate(dataLoader), total=int(len(dataLoader))):
@@ -1374,6 +1383,7 @@ def train(savedCheckPoint):
             totalIm += nofIm
             trainRes = train_step(images)
             resAcc += trainRes * nofIm
+            resAcc.nofIm += nofIm
 
             #if True:
             #if False :
@@ -1451,7 +1461,8 @@ def train(savedCheckPoint):
                 saveCheckPoint(savedCheckPoint+"_hourly.pth",
                                epoch-1, imer, minGEpoch, minGdLoss/normRec,
                                generator, discriminator,
-                               optimizer_G, optimizer_D, startFrom=it)
+                               optimizer_G, optimizer_D,
+                               startFrom=it, resAcc=resAcc)
 
 
         resAcc *= 1.0/totalIm
@@ -1470,7 +1481,7 @@ def train(savedCheckPoint):
                            ,'Gen': resAcc.predFake
                            ,'Pre': resAcc.predPre
                            }, epoch )
-        lastGdLossTrain = resAcc.lossGD / normRec
+        lastGdLossTrain = resAcc.lossGD
 
         Rec_test, MSE_test, L1L_test, Gen_test, Dis_test = summarizeSet(testLoader, False)
         writer.add_scalars("Test per epoch",
@@ -1498,6 +1509,7 @@ def train(savedCheckPoint):
                            generator, discriminator,
                            optimizer_G, optimizer_D)
 
+        resAcc = TrainResClass()
         afterEachEpoch(epoch)
 
 
