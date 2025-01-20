@@ -390,7 +390,7 @@ class StripesFromHDFs :
         self.collection = []
         for base in bases :
             self.collection.append(
-                StripesFromHDF(f"storage/{base}.hdf:/data", f"storage/{base}.mask.tif", None, None) )
+                StripesFromHDF(f"storage/{base}.hdf:/data", f"storage/{base}.mask++.tif", None, None) )
             print("Loaded set " + base)
 
     def get_dataset(self, transform=None) :
@@ -439,50 +439,95 @@ class StripesFromHDFs :
 
 
 examplesDb = {}
-examplesDb[2] = [(2348095, 1684)
-                ,(1958164,1391)
-                ,(1429010,666)
-                ,(1271101, 570)
-                ,(1271426,1140)
-                ,(4076914,1642)
-                ,(2880692,530)
-                ,(1333420,160)
-                ,(102151, 418)
+
+
+
+examplesDb[2] = [
+                  263185,
+                  173496,
+                  213234,
+                  241201,
+                  264646,
+                  195114,
+                  195999,
+                  863528,
+                  755484,
+                  222701,
+                  818392,
+                  952538,
+                  801601,
+                  944579,
+                  1082431,
+                  842400,
                 ]
-examplesDb[4] = [(2348095, 1684)
-                ,(1958164,1391)
-                ,(1429010,666)
-                ,(1298309, 1015)
-                ,(1907990, 1545)
-                ,(2963058,233)
-                ,(200279,41)
-                ,(102151, 418)
+examplesDb[4] = [
+                  263185,
+                  173496,
+                  213234,
+                  241201,
+                  264646,
+                  195114,
+                  195999,
+                  863528,
+                  755484,
+                  222701,
+                  818392,
+                  #952538,
+                  #801601,
+                  #944579,
+                  #1082431,
+                  842400,
                 ]
-examplesDb[8] = [(2348095, 1684)
-                ,(1909160,333)
-                ,(2489646, 1240)
-                #,(5592152, 2722)
-                ,(1429010,666)
-                ,(152196,251)
-                ,(1707893,914)
-                ,(102151, 418)]
-examplesDb[16] = [ (2348095, 1684)
-                 , (1958164,1391)
-                 , (1429010,666)
-                 #, (1831107,164)
-                 , (102151, 418)]
+examplesDb[8] = [
+                  263185,
+                  173496,
+                  213234,
+                  241201,
+                  264646,
+                  195114,
+                  195999,
+                  #863528,
+                  #755484,
+                  #222701,
+                  #818392,
+                  #952538,
+                  #801601,
+                  #944579,
+                  #1082431,
+                  842400,
+                ]
+examplesDb[16] = [
+                  263185,
+                  173496,
+                  213234,
+                  #241201,
+                  #264646,
+                  #195114,
+                  #195999,
+                  #863528,
+                  #755484,
+                  #222701,
+                  #818392,
+                  #952538,
+                  #801601,
+                  #944579,
+                  #1082431,
+                  842400,
+                ]
+
+
 examples = initIfNew('examples')
 
 
-listOfTrainData = [ "19736b.09_Feb.4176862R_Eig_Threshold-4keV"
-                  , "18515.Lamb1_Eiger_7m_45keV_360Scan"
-                  , "23574.8965435L.Eiger.32kev_org"
-                  #, "23574.8965435L.Eiger.32kev_sft"
-                  , "18692b_input_PhantomM"
+listOfTrainData = [ "18515.Lamb1_Eiger_7m_45keV_360Scan"
                   , "18692a.ExpChicken6mGyShift"
+                  , "18692b_input_PhantomM"
                   , "18692b.MinceO"
                   , "19022g.11-EggLard"
+                  , "19736b.09_Feb.4176862R_Eig_Threshold-4keV"
+                  , "19736c.8733147R_Eig_Threshold-8keV.SAMPLE_Y1"
                   , "20982b.04_774784R"
+                  , "23574.8965435L.Eiger.32kev_org"
                   ]
 def createTrainSet() :
     sinoRoot = StripesFromHDFs(listOfTrainData)
@@ -540,9 +585,10 @@ class PrepackedHDF :
             def __len__(self):
                 return self.container.sh[0]
 
-            def __getitem__(self, index):
-                data=self.container.volume[[index],...]
-                data = self.transform(data)
+            def __getitem__(self, index, doTransform=True):
+                data=self.container.volume[index,...]
+                if doTransform :
+                    data = self.transform(data)
                 return data
 
         return Sinos(self, transform)
@@ -569,7 +615,7 @@ def createTestLoader(testSet, num_workers=os.cpu_count()) :
 
 
 
-def createReferences(trainSet, toShow = 0) :
+def createReferences(tSet, toShow = 0) :
     global examples
     examples = examplesDb[DCfg.gapW].copy()
     if toShow :
@@ -579,7 +625,7 @@ def createReferences(trainSet, toShow = 0) :
             transforms.Resize(DCfg.sinoSh),
             transforms.Normalize(mean=(0.5), std=(1))
     ])
-    refImages = torch.stack( [ mytransforms(trainSet.__getitem__(*ex, doTransform=False)[0])
+    refImages = torch.stack( [ mytransforms(tSet.__getitem__(ex, doTransform=False))#[0])
                                for ex in examples ] ).to(TCfg.device)
     refNoises = torch.randn((refImages.shape[0],TCfg.latentDim)).to(TCfg.device)
     return refImages, refNoises
@@ -1129,7 +1175,7 @@ def saveCheckPoint(path, epoch, iterations, minGEpoch, minGdLoss,
                    generator, discriminator,
                    optimizerGen=None, optimizerDis=None,
                    schedulerGen=None, schedulerDis=None,
-                   startFrom=0, iterimRes=TrainResClass()) :
+                   startFrom=0, interimRes=TrainResClass()) :
     checkPoint = {}
     checkPoint['epoch'] = epoch
     checkPoint['iterations'] = iterations
@@ -1146,7 +1192,7 @@ def saveCheckPoint(path, epoch, iterations, minGEpoch, minGdLoss,
         checkPoint['optimizerDis'] = optimizerDis.state_dict()
     if not schedulerDis is None :
         checkPoint['schedulerDis'] = schedulerDis.state_dict()
-    checkPoint['resAcc'] = iterimRes
+    checkPoint['resAcc'] = interimRes
     torch.save(checkPoint, path)
 
 
@@ -1169,9 +1215,9 @@ def loadCheckPoint(path, generator, discriminator,
         optimizerDis.load_state_dict(checkPoint['optimizerDis'])
     if not schedulerDis is None :
         schedulerDis.load_state_dict(checkPoint['schedulerDis'])
-    iterimRes = checkPoint['resAcc'] if 'resAcc' in checkPoint else TrainResClass()
+    interimRes = checkPoint['resAcc'] if 'resAcc' in checkPoint else TrainResClass()
 
-    return epoch, iterations, minGEpoch, minGdLoss, startFrom, iterimRes
+    return epoch, iterations, minGEpoch, minGdLoss, startFrom, interimRes
 
 
 
@@ -1442,7 +1488,7 @@ def train(savedCheckPoint):
                       ( f" MSE: {trainRes.lossMSE:.3f} " if noAdv \
                           else \
                         f" Gen[{trainInfo.genPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossGA:.3f} ({trainInfo.ratFake/trainInfo.totalImages:.3f})," ) +
-                      f" Rec: {trainRes.lossGD:.3f} (Train: {lastGdLossTrain/normRec:.3f}, Test: {lastGdLoss/normTestRec:.3f} | {minGdLoss/normTestRec:.3f})."
+                      f" Rec: {trainRes.lossGD:.3f} (Train: {lastGdLossTrain:.3f}, Test: {lastGdLoss/normTestRec:.3f} | {minGdLoss/normTestRec:.3f})."
                       )
                 print (f"TT: {trainInfo.bestRealProb:.2f} ({data[1][trainInfo.bestRealIndex]},{data[2][trainInfo.bestRealIndex]}),  "
                        f"FT: {trainInfo.bestFakeProb:.2f} ({data[1][trainInfo.bestFakeIndex]},{data[2][trainInfo.bestFakeIndex]}),  "
@@ -1462,7 +1508,7 @@ def train(savedCheckPoint):
                                epoch-1, imer, minGEpoch, minGdLoss/normRec,
                                generator, discriminator,
                                optimizer_G, optimizer_D,
-                               startFrom=it, resAcc=resAcc)
+                               startFrom=it, interimRes=resAcc)
 
 
         resAcc *= 1.0/totalIm
@@ -1530,3 +1576,41 @@ def freeGPUmem() :
     with torch.no_grad():
         torch.cuda.empty_cache()
 
+
+
+
+
+
+
+#examplesDb[2] = [(2348095, 1684)
+#                ,(1958164,1391)
+#                ,(1429010,666)
+#                ,(1271101, 570)
+#                ,(1271426,1140)
+#                ,(4076914,1642)
+#                ,(2880692,530)
+#                ,(1333420,160)
+#                ,(102151, 418)
+#                ]
+#examplesDb[4] = [(2348095, 1684)
+#                ,(1958164,1391)
+#                ,(1429010,666)
+#                ,(1298309, 1015)
+#                ,(1907990, 1545)
+#                ,(2963058,233)
+#                ,(200279,41)
+#                ,(102151, 418)
+#                ]
+#examplesDb[8] = [(2348095, 1684)
+#                ,(1909160,333)
+#                ,(2489646, 1240)
+#                #,(5592152, 2722)
+#                ,(1429010,666)
+#                ,(152196,251)
+#                ,(1707893,914)
+#                ,(102151, 418)]
+#examplesDb[16] = [ (2348095, 1684)
+#                 , (1958164,1391)
+#                 , (1429010,666)
+#                 #, (1831107,164)
+#                 , (102151, 418)]
