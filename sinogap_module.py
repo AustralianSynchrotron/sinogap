@@ -598,7 +598,7 @@ class PrepackedHDF :
                 return self.container.sh[0]
 
             def __getitem__(self, index):
-                data=self.container.volume[[index],...]
+                data=self.container.volume[index,...]
                 data = self.transform(data)
                 return data
 
