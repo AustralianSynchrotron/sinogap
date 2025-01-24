@@ -877,6 +877,12 @@ optimizer_G = initIfNew('optimizer_G')
 optimizer_D = initIfNew('optimizer_D')
 
 
+def createScheduler(optimizer) :
+    return torch.optim.lr_scheduler.ConstantLR(optimizer, factor=0.99999, total_iters=100000)
+scheduler_G = initIfNew('scheduler_G')
+scheduler_D = initIfNew('scheduler_D')
+
+
 def restoreCheckpoint(path=None, logDir=None) :
     if logDir is None :
         logDir = TCfg.logDir
@@ -1223,7 +1229,8 @@ def train_step(images):
                     torch.cat( (imWeights[subRange], imWeights[subRange]) )
                 subD_loss = loss_Adv(labelsDis, pred_both, wghts)
             # train discriminator only if it is not too good :
-            if not skipDis and ( subPred_fakeD.mean() > 0.2 or subPred_realD.mean() < 0.8 ) :
+            # if not skipDis and ( subPred_fakeD.mean() > 0.2 or subPred_realD.mean() < 0.8 ) :
+            if True:
                 trainInfo.disPerformed += 1/TCfg.batchSplit
                 subD_loss.backward()
             trainRes.lossD += subD_loss.item()
@@ -1419,6 +1426,7 @@ def train(savedCheckPoint):
                 IPython.display.clear_output(wait=True)
                 beforeReport()
                 print(f"Epoch: {epoch} ({minGEpoch}). " +
+                      ( f"Scheduler: {scheduler_D.get_last_lr()}/{scheduler_G.get_last_lr()} " ) +
                       ( f" L1L: {trainRes.lossL1L:.3e} " if noAdv \
                           else \
                         f" Dis[{trainInfo.disPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossD:.3f} ({trainInfo.ratReal/trainInfo.totalImages:.3f})," ) +
@@ -1444,7 +1452,9 @@ def train(savedCheckPoint):
                 saveCheckPoint(savedCheckPoint+"_hourly.pth",
                                epoch-1, iter, minGEpoch, minGdLoss,
                                generator, discriminator,
-                               optimizer_G, optimizer_D, startFrom=it)
+                               optimizer_G, optimizer_D,
+                               scheduler_G, scheduler_D,
+                               startFrom=it)
 
 
         resAcc *= 1.0/totalIm
@@ -1470,7 +1480,9 @@ def train(savedCheckPoint):
             saveCheckPoint(savedCheckPoint+"_B.pth",
                            epoch, iter, minGEpoch, minGdLoss,
                            generator, discriminator,
-                           optimizer_G, optimizer_D)
+                           optimizer_G, optimizer_D,
+                           scheduler_G, scheduler_D
+                           )
             os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_BB.pth") # BB: before best
             os.system(f"cp {savedCheckPoint}_B.pth {savedCheckPoint}.pth") # B: best
             saveModels()
@@ -1478,7 +1490,8 @@ def train(savedCheckPoint):
             saveCheckPoint(savedCheckPoint+".pth",
                            epoch, iter, minGEpoch, minGdLoss,
                            generator, discriminator,
-                           optimizer_G, optimizer_D)
+                           optimizer_G, optimizer_D,
+                           scheduler_G, scheduler_D)
 
         Rec_test, MSE_test, L1L_test, Gen_test, Dis_test = summarizeSet(testLoader, False)
         writer.add_scalars("Test per epoch",
