@@ -878,7 +878,8 @@ optimizer_D = initIfNew('optimizer_D')
 
 
 def createScheduler(optimizer) :
-    return torch.optim.lr_scheduler.ConstantLR(optimizer, factor=0.999, total_iters=1500)
+    return torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=0.999)
+    #return torch.optim.lr_scheduler.ConstantLR(optimizer, factor=0.999, total_iters=1500)
 scheduler_G = initIfNew('scheduler_G')
 scheduler_D = initIfNew('scheduler_D')
 
