@@ -338,110 +338,123 @@ class StripesFromHDF :
                     self.bg -= self.df
                 self.mask  &=  self.bg > 0.0
 
-            self.allIndices = []
+            self.forbidenSinos = self.mask
+            self.forbidenSinos[:, -DCfg.readSh[-1]:] = 0
             for yCr in range(0,self.fsh[0]) :
                 for xCr in range(0,self.fsh[1]) :
                     idx = np.s_[yCr,xCr]
-                    if self.mask[idx] :
-                        if self.volume is not None :
-                            if self.df is not None :
-                                self.volume[:,*idx] -= self.df[idx]
-                            if self.bg is not None :
-                                self.volume[:,*idx] /= self.bg[idx]
-                        if  xCr + DCfg.readSh[1] < self.fsh[1] \
-                        and np.all( self.mask[yCr,xCr+1:xCr+DCfg.readSh[1]] ) :
-                            self.allIndices.append(idx)
+                    if not self.mask[idx] :
+                        self.forbidenSinos[ yCr, max(0, xCr-DCfg.readSh[1]) : xCr ] = 0
+            self.availableSinos = np.count_nonzero(self.forbidenSinos)
+
+
+    def __len__(self):
+        return self.availableSinos
+
+
+    def __getitem__(self, index=None):
+
+        if type(index) is tuple and len(index) == 4 :
+            zdx, ydx, xdx, sinoHeight = index
+        else :
+            while True:
+                ydx = random.randint(0,self.fsh[0]-1)
+                xdx = random.randint(0,self.fsh[1]-DCfg.readSh[-1]-1)
+                if self.forbidenSinos[ydx,xdx] :
+                    break
+            sinoHeight = DCfg.readSh[0] if random.randint(0,1) else \
+                random.randint(DCfg.readSh[0]+1, self.sh[0])
+            zdx = random.randint(0,self.sh[0]-sinoHeight)
+        idx = np.s_[ ydx , xdx : xdx + DCfg.readSh[-1] ]
+
+        if self.volume is not None :
+            data = self.volume[zdx:zdx+sinoHeight, *idx ]
+        else :
+            data = self.data[zdx:zdx+sinoHeight, *idx ]
+            if self.df is not None :
+                data -= self.df[None,*idx]
+            if self.bg is not None :
+                data /= self.bg[None,*idx]
+        return (data, (zdx, ydx, xdx, sinoHeight) )
+        #data = torch.from_numpy(data).clone().unsqueeze(0).to(TCfg.device)
+        #if sinoHeight != DCfg.readSh[0] :
+        #    data = torch.nn.functional.interpolate(data.unsqueeze(0), size=DCfg.readSh,mode='bilinear').squeeze(0)
+
+
 
     def get_dataset(self, transform=None) :
 
         class Sinos(torch.utils.data.Dataset) :
-
             def __init__(self, root, transform=None):
                 self.container = root
-                self.transform = transforms.Compose([transforms.ToTensor(), transform]) \
-                    if transform else transforms.ToTensor()
-
+                self.oblTransform = transforms.Compose( [ transforms.ToTensor(), transforms.Resize(DCfg.readSh)] )
+                self.transform = transform
             def __len__(self):
-                return len(self.container.allIndices)
-
-            def __getitem__(self, index=None, idxs=None, doTransform=True):
-                if idxs is None or index is None :
-                    idxs = random.randint(0,self.container.sh[0]-DCfg.readSh[0]-1)
-                    index = random.randint(0,len(self.container.allIndices)-1)
-                idx = self.container.allIndices[index]
-                xyrng=np.s_[ idx[0], idx[1]:idx[1]+DCfg.readSh[1] ]
-                if self.container.volume is not None :
-                    data = self.container.volume[idxs:idxs+DCfg.readSh[0], *xyrng]
-                else :
-                    data = self.container.data[idxs:idxs+DCfg.readSh[0], *xyrng]
-                    if self.container.df is not None :
-                        data -= self.container.df[None,*xyrng]
-                    if self.container.bg is not None :
-                        data /= self.container.bg[None,*xyrng]
+                return self.container.__len__()
+            def __getitem__(self, index=None, doTransform=True):
+                data, index = self.container.__getitem__(index)
+                data = self.oblTransform(data)
                 if doTransform and self.transform :
                     data = self.transform(data)
-                return (data, index, idxs)
+                return (data, index)
 
         return Sinos(self, transform)
 
 
 class StripesFromHDFs :
+
     def __init__(self, bases):
         self.collection = []
         for base in bases :
+            print(f"Loading train set {len(self.collection)+1} of {len(bases)}: " + base + " ... ", end="")
             self.collection.append(
                 StripesFromHDF(f"storage/{base}.hdf:/data", f"storage/{base}.mask++.tif", None, None) )
-            print("Loaded set " + base)
+            print("Done")
+
+
+    def __getitem__(self, index=None):
+
+        if type(index) is tuple and len(index) == 5 :
+            setdx, zdx, ydx, xdx, sinoHeight = index
+            return self.collection[setdx].__getitem__((setdx, zdx, ydx, xdx, sinoHeight))
+        else :
+            cindex = random.randint(0,len(self)-1)
+            leftover = cindex
+            for setdx in range(len(self.collection)) :
+                setLen = len(self.collection[setdx])
+                if leftover >= setLen :
+                    leftover -= setLen
+                else :
+                    data, insetdx = self.collection[setdx].__getitem__()
+                    return (data, (setdx, *insetdx) )
+            else :
+                raise f"No set for index {cindex}. Should never happen."
+
+
+    def __len__(self):
+        return sum( [ len(set) for set in self.collection ] )
+
 
     def get_dataset(self, transform=None) :
 
         class Sinos(torch.utils.data.Dataset) :
-
             def __init__(self, root, transform=None):
                 self.container = root
-                self.transform = transforms.Compose([transforms.ToTensor(), transform]) \
-                    if transform else transforms.ToTensor()
-
+                self.oblTransform = transforms.Compose( [ transforms.ToTensor(), transforms.Resize(DCfg.readSh)] )
+                self.transform = transform
             def __len__(self):
-                return sum( [ len(set.allIndices) for set in self.container.collection ] )
-
-            def __getitem__(self, index=None, idxs=None, doTransform=True):
-                if idxs is None or index is None :
-                    index = random.randint(0,len(self)-1)
-                leftover = index
-                useset = None
-                for set in self.container.collection :
-                    setLen = len(set.allIndices)
-                    if leftover >= setLen :
-                        leftover -= setLen
-                    else :
-                        useset = set
-                        break
-                if useset is None :
-                    raise f"No set for index {index}."
-                if idxs is None :
-                    idxs = random.randint(0,useset.sh[0]-DCfg.readSh[0]-1)
-                idx = useset.allIndices[leftover]
-                xyrng=np.s_[ idx[0], idx[1]:idx[1]+DCfg.readSh[1] ]
-                if useset.volume is not None :
-                    data = useset.volume[idxs:idxs+DCfg.readSh[0], *xyrng]
-                else :
-                    data = useset.data[idxs:idxs+DCfg.readSh[0], *xyrng]
-                    if useset.df is not None :
-                        data -= useset.df[None,*xyrng]
-                    if useset.bg is not None :
-                        data /= useset.bg[None,*xyrng]
+                return self.container.__len__()
+            def __getitem__(self, index=None, doTransform=True):
+                data, index = self.container.__getitem__(index)
+                data = self.oblTransform(data)
                 if doTransform and self.transform :
                     data = self.transform(data)
-                return (data, index, idxs)
+                return (data, index)
 
         return Sinos(self, transform)
 
 
 examplesDb = {}
-
-
-
 examplesDb[2] = [
                   263185,
                   173496,
@@ -540,9 +553,9 @@ def createTrainSet() :
     return sinoRoot.get_dataset(mytransforms)
 
 
-def createTrainLoader(trainSet, num_workers=os.cpu_count()) :
+def createDataLoader(tSet, num_workers=os.cpu_count()) :
     return torch.utils.data.DataLoader(
-        dataset=trainSet,
+        dataset=tSet,
         batch_size=TCfg.batchSize,
         shuffle=False,
         num_workers=num_workers,
@@ -579,39 +592,29 @@ class PrepackedHDF :
 
             def __init__(self, root, transform=None):
                 self.container = root
-                self.transform = transforms.Compose([transforms.ToTensor(), transform]) \
-                    if transform else transforms.ToTensor()
+                self.transform = transform
 
             def __len__(self):
                 return self.container.sh[0]
 
             def __getitem__(self, index, doTransform=True):
                 data=self.container.volume[index,...]
+                data = torch.from_numpy(data).clone().unsqueeze(0)
                 if doTransform :
                     data = self.transform(data)
-                return data
+                return (data, index)
 
         return Sinos(self, transform)
 
 def createTestSet() :
+    print("Loading test set ... ", end="")
     sinoRoot = PrepackedHDF("storage/test/testSetSmall.hdf:/data")
+    print("Done")
     mytransforms = transforms.Compose([
             transforms.Resize(DCfg.sinoSh),
-#            transforms.RandomHorizontalFlip(),
-#            transforms.RandomVerticalFlip(),
             transforms.Normalize(mean=(0.5), std=(1))
     ])
     return sinoRoot.get_dataset(mytransforms)
-
-
-def createTestLoader(testSet, num_workers=os.cpu_count()) :
-    return torch.utils.data.DataLoader(
-        dataset=testSet,
-        batch_size = TCfg.batchSize, # test requires no grad
-        shuffle=False,
-        num_workers=num_workers,
-        drop_last=True
-    )
 
 
 
@@ -621,11 +624,10 @@ def createReferences(tSet, toShow = 0) :
     if toShow :
         examples.insert(0, examples.pop(toShow))
     mytransforms = transforms.Compose([
-            transforms.ToTensor(),
             transforms.Resize(DCfg.sinoSh),
             transforms.Normalize(mean=(0.5), std=(1))
     ])
-    refImages = torch.stack( [ mytransforms(tSet.__getitem__(ex, doTransform=False))#[0])
+    refImages = torch.stack( [ mytransforms(tSet.__getitem__(ex, doTransform=False)[0])
                                for ex in examples ] ).to(TCfg.device)
     refNoises = torch.randn((refImages.shape[0],TCfg.latentDim)).to(TCfg.device)
     return refImages, refNoises
@@ -633,19 +635,19 @@ refImages = initIfNew('refImages')
 refNoises = initIfNew('refNoises')
 
 
-def showMe(trainSet, item=None) :
+def showMe(tSet, item=None) :
     global refImages, refNoises
     image = None
     if item is None :
         while True:
-            image, index, idxs = trainSet[random.randint(0,len(trainSet)-1)]
+            image, index = tSet[random.randint(0,len(tSet)-1)]
             if image.mean() > 0 and image.min() < -0.1 :
-                print (f"{index}, {idxs}")
+                print (f"{index}")
                 break
     elif isinstance(item, int) :
         image = refImages[0,...]
     else :
-        image, _,_ = trainSet.__getitem__(*item)
+        image, _,_ = tSet.__getitem__(*item)
     image = image.squeeze()
     tensorStat(image)
     plotImage(image.cpu())
@@ -667,7 +669,7 @@ class GeneratorTemplate(nn.Module):
         self.gapRng = np.s_[...,self.gapRngX]
         self.latentChannels = latentChannels
         self.baseChannels = 64
-        self.amplitude = nn.Parameter(torch.full((1,), -2.9)) # coef ~0.1
+        #self.amplitude = nn.Parameter(torch.ones(1))
 
 
     def createLatent(self) :
@@ -795,8 +797,7 @@ class GeneratorTemplate(nn.Module):
             upTrain.append( decoder( torch.cat( (upTrain[-1], dwTrain[-1-level]), dim=1 ) ) )
         res = self.lastTouch(torch.cat( (upTrain[-1], modelIn ), dim=1 ))
 
-        resWeight = 2 * torch.sigmoid(self.amplitude)
-        patches = modelIn[self.gapRng] + resWeight * res[self.gapRng]
+        patches = modelIn[self.gapRng] + 2 * res[self.gapRng]
         return squeezeOrg(patches, orgDims)
 
 
@@ -877,7 +878,7 @@ def restoreCheckpoint(path=None, logDir=None) :
                             " Remove it .")
         try : os.remove(TCfg.historyHDF)
         except : pass
-        return 0, 0, 0, 1, 0
+        return 0, 0, 0, 1, 0, TrainResClass()
     else :
         return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D)
 
@@ -1307,7 +1308,8 @@ def train_step(images):
                 torch.cat( (imWeights[subRange], imWeights[subRange]) )
         subFakeImages = generator.generateImages(procImages[subRange,...])
         if noAdv :
-            subG_loss = loss_Rec(procImages[subRange,:,DCfg.gapRngX], subFakeImages[DCfg.gapRng], wghts)
+            subG_loss = loss_Rec(procImages[subRange,:,DCfg.gapRngX],
+                                 subFakeImages[DCfg.gapRng], wghts)
             subGD_loss = subGA_loss = subG_loss
         else :
             subPred_fakeG = discriminator(subFakeImages)
@@ -1490,13 +1492,13 @@ def train(savedCheckPoint):
                         f" Gen[{trainInfo.genPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossGA:.3f} ({trainInfo.ratFake/trainInfo.totalImages:.3f})," ) +
                       f" Rec: {trainRes.lossGD:.3f} (Train: {lastGdLossTrain:.3f}, Test: {lastGdLoss/normTestRec:.3f} | {minGdLoss/normTestRec:.3f})."
                       )
-                print (f"TT: {trainInfo.bestRealProb:.2f} ({data[1][trainInfo.bestRealIndex]},{data[2][trainInfo.bestRealIndex]}),  "
-                       f"FT: {trainInfo.bestFakeProb:.2f} ({data[1][trainInfo.bestFakeIndex]},{data[2][trainInfo.bestFakeIndex]}),  "
-                       f"HD: {trainInfo.highestDif/normMSE:.3e} ({data[1][trainInfo.highestDifIndex]},{data[2][trainInfo.highestDifIndex]}),  "
+                print (f"TT: {trainInfo.bestRealProb:.2f},  "
+                       f"FT: {trainInfo.bestFakeProb:.2f},  "
+                       f"HD: {trainInfo.highestDif/normMSE:.3e},  "
                        f"GP: {probsR[0,2].item():.3f}, {probsR[0,1].item():.3f} " )
-                print (f"TF: {trainInfo.worstRealProb:.2f} ({data[1][trainInfo.worstRealIndex]},{data[2][trainInfo.worstRealIndex]}),  "
-                       f"FF: {trainInfo.worstFakeProb:.2f} ({data[1][trainInfo.worstFakeIndex]},{data[2][trainInfo.worstFakeIndex]}),  "
-                       f"LD: {trainInfo.lowestDif/normMSE:.3e} ({data[1][trainInfo.lowestDifIndex]},{data[2][trainInfo.lowestDifIndex]}),  "
+                print (f"TF: {trainInfo.worstRealProb:.2f},  "
+                       f"FF: {trainInfo.worstFakeProb:.2f},  "
+                       f"LD: {trainInfo.lowestDif/normMSE:.3e},  "
                        f"R : {probsR[0,0].item():.3f}." )
                 plotImage(showMe)
                 afterReport()
