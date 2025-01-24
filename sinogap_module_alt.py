@@ -977,7 +977,7 @@ def summarizeSet(dataloader, onPrep=True):
     Real_prob = sum(Real_probs) / totalNofIm if not noAdv else 0
     Fake_prob = sum(Fake_probs) / totalNofIm if not noAdv else 0
     print (f"Summary. Rec: {Rec_diff:.3e}, MSE: {MSE_diff:.3e}, L1L: {L1L_diff:.3e}, Dis: {Real_prob:.3e}, Gen: {Fake_prob:.3e}.")
-    return Rec_diff, MSE_diff, L1L_diff, Real_prob, Fake_prob
+    return Rec_diff.item(), MSE_diff.item(), L1L_diff.item(), Real_prob.item(), Fake_prob.item()
 
 
 def generateDiffImages(images, layout=None) :
