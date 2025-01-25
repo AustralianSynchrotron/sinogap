@@ -288,11 +288,11 @@ def loadCheckPoint(path, generator, discriminator,
     discriminator.load_state_dict(checkPoint['discriminator'])
     if not optimizerGen is None :
         optimizerGen.load_state_dict(checkPoint['optimizerGen'])
-    if not schedulerGen is None :
+    if not schedulerGen is None and 'schedulerGen' in checkPoint :
         schedulerGen.load_state_dict(checkPoint['schedulerGen'])
     if not optimizerDis is None :
         optimizerDis.load_state_dict(checkPoint['optimizerDis'])
-    if not schedulerDis is None :
+    if not schedulerDis is None and 'schedulerDis' in checkPoint :
         schedulerDis.load_state_dict(checkPoint['schedulerDis'])
     return epoch, iterations, minGEpoch, minGdLoss, startFrom
 
@@ -1383,8 +1383,10 @@ def train(savedCheckPoint):
             if time.time() - lastUpdateTime > 60 :
                 lastUpdateTime = time.time()
 
-                scheduler_D.step()
-                scheduler_G.step()
+                if scheduler_D is not None :
+                    scheduler_D.step()
+                if scheduler_G is not None :
+                    scheduler_G.step()
                 _,_,_ =  logStep(iter)
                 collageR, probsR, _ = generateDiffImages(refImages[[0],...], layout=0)
                 showMe = np.zeros( (2*DCfg.sinoSh[1] + DCfg.gapW ,
@@ -1430,8 +1432,9 @@ def train(savedCheckPoint):
                 IPython.display.clear_output(wait=True)
                 beforeReport()
                 print(f"Epoch: {epoch} ({minGEpoch}). " +
-                      f"LR: {scheduler_D.get_last_lr()[0]/TCfg.learningRateD:.3f}" +
-                                f"/{scheduler_G.get_last_lr()[0]/TCfg.learningRateG:.3f} " +
+                      ( ( f"LR: {scheduler_D.get_last_lr()[0]/TCfg.learningRateD:.3f}" +
+                                f"/{scheduler_G.get_last_lr()[0]/TCfg.learningRateG:.3f} " ) \
+                        if scheduler_D is not None and  scheduler_D is not None else "" ) +
                       ( f" L1L: {trainRes.lossL1L:.3e} " if noAdv \
                           else \
                         f" Dis[{trainInfo.disPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossD:.3f} ({trainInfo.ratReal/trainInfo.totalImages:.3f})," ) +
