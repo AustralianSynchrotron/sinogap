@@ -875,11 +875,6 @@ def createOptimizer(model, lr) :
     )
 optimizer_G = initIfNew('optimizer_G')
 optimizer_D = initIfNew('optimizer_D')
-
-
-def createScheduler(optimizer) :
-    return torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=0.999)
-    #return torch.optim.lr_scheduler.ConstantLR(optimizer, factor=0.999, total_iters=1500)
 scheduler_G = initIfNew('scheduler_G')
 scheduler_D = initIfNew('scheduler_D')
 
@@ -895,7 +890,7 @@ def restoreCheckpoint(path=None, logDir=None) :
         except : pass
         return 0, 0, 0, -1, 0
     else :
-        return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D)#, scheduler_G, scheduler_D)
+        return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D, scheduler_G, scheduler_D)
 
 
 def saveModels(path="") :
@@ -1431,15 +1426,18 @@ def train(savedCheckPoint):
 
                 IPython.display.clear_output(wait=True)
                 beforeReport()
-                print(f"Epoch: {epoch} ({minGEpoch}). " +
-                      ( ( f"LR: {scheduler_D.get_last_lr()[0]/TCfg.learningRateD:.3f}" +
-                                f"/{scheduler_G.get_last_lr()[0]/TCfg.learningRateG:.3f} " ) \
-                        if scheduler_D is not None and  scheduler_D is not None else "" ) +
-                      ( f" L1L: {trainRes.lossL1L:.3e} " if noAdv \
-                          else \
+                lrReport = "" if scheduler_D is None  else \
+                    f"{scheduler_D.get_last_lr()[0]/TCfg.learningRateD:.3f}"
+                lrReport += "" if scheduler_G is None  else \
+                    f"/{scheduler_G.get_last_lr()[0]/TCfg.learningRateG:.3f}"
+                if len(lrReport) :
+                    lrReport = "LR: " + lrReport + ". "
+                print(f"Epoch: {epoch} ({minGEpoch}). " + lrReport +
+                      ( f" L1L: {trainRes.lossL1L:.3e} " \
+                          if noAdv else \
                         f" Dis[{trainInfo.disPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossD:.3f} ({trainInfo.ratReal/trainInfo.totalImages:.3f})," ) +
-                      ( f" MSE: {trainRes.lossMSE:.3e} " if noAdv \
-                          else \
+                      ( f" MSE: {trainRes.lossMSE:.3e} " \
+                          if noAdv else \
                         f" Gen[{trainInfo.genPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossGA:.3f} ({trainInfo.ratFake/trainInfo.totalImages:.3f})," ) +
                       f" Rec: {lastGdLoss:.3e} ({minGdLoss:.3e} / {prepGdLoss:.3e})."
                       )
