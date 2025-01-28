@@ -999,7 +999,7 @@ def generateDiffImages(images, layout=None) :
     hGap = DCfg.gapW // 2
     pre = images.clone()
     gen = images.clone()
-    with torch.inference_mode() :
+    with torch.no_grad() :
         #generator.eval()
         pre[DCfg.gapRng] = generator.preProc(images)
         gen[DCfg.gapRng] = generator.generatePatches(images)
