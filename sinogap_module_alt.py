@@ -944,7 +944,7 @@ def summarizeSet(dataloader, onPrep=True, storesPerIm=None):
     totalNofIm = 0
     generator.to(TCfg.device)
     #generator.train()
-    generator.eval()
+    #generator.eval()
     #discriminator.eval()
     if storesPerIm is not None : # must be list of five lists
         for lst in storesPerIm :
@@ -1000,7 +1000,7 @@ def generateDiffImages(images, layout=None) :
     pre = images.clone()
     gen = images.clone()
     with torch.inference_mode() :
-        generator.eval()
+        #generator.eval()
         pre[DCfg.gapRng] = generator.preProc(images)
         gen[DCfg.gapRng] = generator.generatePatches(images)
         dif[DCfg.gapRng] = (gen - pre)[DCfg.gapRng]
@@ -1100,7 +1100,7 @@ def initialTest() :
               f'Ref: {probs[0]:.3e}, '
               f'Gen: {probs[2]:.3e}, '
               f'Pre: {probs[1]:.3e}.')
-        generator.eval()
+        #generator.eval()
         pre = generator.preProc(refImages)
         ref_loss_Rec = loss_Rec(refImages[DCfg.gapRng], pre, calculateWeights(refImages))
         ref_loss_MSE = loss_MSE(refImages[DCfg.gapRng], pre)
@@ -1265,12 +1265,12 @@ def train_step(images):
 
         # calculate predictions of prefilled images - purely for metrics purposes
         #discriminator.eval()
-        generator.eval()
+        #generator.eval()
         trainRes.predPre = 0
         with torch.no_grad() :
             for i in range(TCfg.batchSplit) :
                 subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize] if TCfg.batchSplit > 1 else np.s_[...]
-                fakeImages[subRange,...,DCfg.gapRngX] = generator.preProc(procImages[subRange,...])
+                fakeImages[subRange,:,DCfg.gapRngX] = generator.preProc(procImages[subRange,...])
                 trainRes.predPre += discriminator(fakeImages[subRange,...]).mean().item()
             trainRes.predPre /= TCfg.batchSplit
 
@@ -1313,7 +1313,7 @@ def train_step(images):
     #discriminator.eval()
     for param in discriminator.parameters() :
         param.requires_grad = False
-    generator.train()
+    #generator.train()
     optimizer_G.zero_grad()
     for i in range(TCfg.batchSplit) :
         subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize] if TCfg.batchSplit > 1 else np.s_[:]
@@ -1338,7 +1338,7 @@ def train_step(images):
             subG_loss.backward()
         trainRes.lossGA += subGA_loss.item()
         trainRes.lossGD += subGD_loss.item()
-        fakeImages[subRange,...,DCfg.gapRngX] = subFakeImages[DCfg.gapRng].detach()
+        fakeImages[subRange,:,DCfg.gapRngX] = subFakeImages[DCfg.gapRng].detach()
     optimizer_G.step()
     optimizer_G.zero_grad(set_to_none=True)
     trainRes.lossGA /= TCfg.batchSplit
