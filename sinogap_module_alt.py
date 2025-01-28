@@ -884,8 +884,8 @@ def restoreCheckpoint(path=None, logDir=None) :
 
 
 def saveModels(path="") :
-    save_model(generator, model_path=f"model_{TCfg.exec}_gen.pt")
-    save_model(discriminator, model_path=f"model_{TCfg.exec}_dis.pt")
+    save_model(generator, model_path = ( path if path else f"model_{TCfg.exec}" ) + "_gen.pt" )
+    save_model(discriminator, model_path = ( path if path else f"model_{TCfg.exec}" ) + "_dis.pt"  )
 
 
 def createCriteria() :
@@ -897,7 +897,7 @@ BCE, MSE, L1L = createCriteria()
 lossDifCoef = 0
 lossAdvCoef = 1.0
 
-def applyWeights(inp, weights):
+def applyWeights(inp, weights, storePerIm=None):
     inp = inp.squeeze()
     if not inp.dim() :
         inp = inp.unsqueeze(0)
@@ -905,29 +905,31 @@ def applyWeights(inp, weights):
     if not weights is None :
         inp *= weights
         sum = weights.sum()
+    if storePerIm is not None : # must be list
+        storePerIm.extend(inp.tolist())
     return inp.sum()/sum
 
-def loss_Adv(y_true, y_pred, weights=None):
+def loss_Adv(y_true, y_pred, weights=None, storePerIm=None):
     loss = BCE(y_pred, y_true)
-    return applyWeights(loss,weights)
+    return applyWeights(loss, weights, storePerIm=storePerIm)
 
-def loss_MSE(p_true, p_pred, weights=None):
+def loss_MSE(p_true, p_pred, weights=None, storePerIm=None):
     loss = MSE(p_pred, p_true).mean(dim=(-1,-2))
-    return applyWeights(loss,weights)
+    return applyWeights(loss, weights, storePerIm=storePerIm)
 
-def loss_L1L(p_true, p_pred, weights=None):
+def loss_L1L(p_true, p_pred, weights=None, storePerIm=None):
     loss = L1L(p_pred, p_true).mean(dim=(-1,-2))
-    return applyWeights(loss,weights)
+    return applyWeights(loss, weights, storePerIm=storePerIm)
 
 eDinfo = None
-def loss_Rec(p_true, p_pred, weights=None):
+def loss_Rec(p_true, p_pred, weights=None, storePerIm=None):
     global eDinfo
     loss = MSE(p_pred, p_true).mean(dim=(-1,-2)).squeeze()
     if loss.dim() :
         hDindex = loss.argmax()
         lDindex = loss.argmin()
         eDinfo = (hDindex, loss[hDindex].item(), lDindex, loss[lDindex].item() )
-    return applyWeights(loss,weights)
+    return applyWeights(loss, weights, storePerIm=storePerIm)
 
 
 def loss_Gen(y_true, y_pred, p_true, p_pred, weights=None):
@@ -936,7 +938,7 @@ def loss_Gen(y_true, y_pred, p_true, p_pred, weights=None):
     return lossAdv, lossDif
 
 
-def summarizeSet(dataloader, onPrep=True):
+def summarizeSet(dataloader, onPrep=True, storesPerIm=None):
 
     MSE_diffs, L1L_diffs, Rec_diffs, Real_probs, Fake_probs = [], [], [], [], []
     totalNofIm = 0
@@ -944,6 +946,11 @@ def summarizeSet(dataloader, onPrep=True):
     #generator.train()
     generator.eval()
     #discriminator.eval()
+    if storesPerIm is not None : # must be list of five lists
+        for lst in storesPerIm :
+            lst.clear()
+    else :
+        storesPerIm = [None, None, None, None, None]
     with torch.no_grad() :
         for it , data in tqdm.tqdm(enumerate(dataloader), total=int(len(dataloader))):
             images = data[0].squeeze(1).to(TCfg.device)
@@ -962,12 +969,18 @@ def summarizeSet(dataloader, onPrep=True):
                               generator.generatePatches(subProcImages)
                 genImages[subRange,:,DCfg.gapRngX] = patchImages
                 if not noAdv :
-                    rprob += discriminator(subProcImages).sum().item()
-                    fprob += discriminator(genImages[subRange,...]).sum().item()
+                    rprobs = discriminator(subProcImages)
+                    if storesPerIm[3] is not None :
+                        storesPerIm[3].extend(rprobs.tolist())
+                    rprob += rprobs.sum().item()
+                    fprobs = discriminator(genImages[subRange,...])
+                    if storesPerIm[4] is not None :
+                        storesPerIm[4].extend(fprobs.tolist())
+                    fprob += fprobs.sum().item()
             procImages = imagesPostProc(genImages, procData)
-            MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages[DCfg.gapRng]))
-            L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], procImages[DCfg.gapRng]))
-            Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], procImages[DCfg.gapRng]))
+            MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages[DCfg.gapRng], storePerIm = storesPerIm[2]))
+            L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], procImages[DCfg.gapRng], storePerIm = storesPerIm[1]))
+            Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], procImages[DCfg.gapRng], storePerIm = storesPerIm[0]))
             Real_probs.append(rprob)
             Fake_probs.append(fprob)
 
@@ -977,7 +990,7 @@ def summarizeSet(dataloader, onPrep=True):
     Real_prob = sum(Real_probs) / totalNofIm if not noAdv else 0
     Fake_prob = sum(Fake_probs) / totalNofIm if not noAdv else 0
     print (f"Summary. Rec: {Rec_diff:.3e}, MSE: {MSE_diff:.3e}, L1L: {L1L_diff:.3e}, Dis: {Real_prob:.3e}, Gen: {Fake_prob:.3e}.")
-    return Rec_diff.item(), MSE_diff.item(), L1L_diff.item(), Real_prob.item(), Fake_prob.item()
+    return Rec_diff, MSE_diff, L1L_diff, Real_prob, Fake_prob
 
 
 def generateDiffImages(images, layout=None) :
@@ -1421,10 +1434,10 @@ def train(savedCheckPoint):
         totalIm = 0
 
         for it , data in tqdm.tqdm(enumerate(dataLoader), total=int(len(dataLoader))):
-            iter += 1
             if startFrom :
                 startFrom -= 1
                 continue
+            iter += 1
             images = data[0].to(TCfg.device)
             nofIm = images.shape[0]
             imer += nofIm
@@ -1437,6 +1450,7 @@ def train(savedCheckPoint):
             #if False :
             #if not it or it > len(dataloader)-2 or time.time() - lastUpdateTime > 60 :
             if time.time() - lastUpdateTime > 60 :
+
                 lastUpdateTime = time.time()
 
                 _,_,_ =  logStep(iter)
@@ -1511,6 +1525,7 @@ def train(savedCheckPoint):
                                generator, discriminator,
                                optimizer_G, optimizer_D,
                                startFrom=it, interimRes=resAcc)
+                saveModels(f"model_{TCfg.exec}_hourly")
 
 
         resAcc *= 1.0/totalIm
