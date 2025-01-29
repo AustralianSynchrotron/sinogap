@@ -684,7 +684,7 @@ class GeneratorTemplate(nn.Module):
         return toRet
 
 
-    def encblock(self, chIn, chOut, kernel, stride=1, norm=True, dopadding=False) :
+    def encblock(self, chIn, chOut, kernel, stride=1, norm=False, dopadding=False) :
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
@@ -700,7 +700,7 @@ class GeneratorTemplate(nn.Module):
         return torch.nn.Sequential(*layers)
 
 
-    def decblock(self, chIn, chOut, kernel, stride=1, norm=True, dopadding=False) :
+    def decblock(self, chIn, chOut, kernel, stride=1, norm=False, dopadding=False) :
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
@@ -813,7 +813,7 @@ class DiscriminatorTemplate(nn.Module):
         self.omitEdges = omitEdges
 
 
-    def encblock(self, chIn, chOut, kernel, stride=1, norm=True, dopadding=False) :
+    def encblock(self, chIn, chOut, kernel, stride=1, norm=False, dopadding=False) :
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
@@ -944,7 +944,7 @@ def summarizeSet(dataloader, onPrep=True, storesPerIm=None):
     totalNofIm = 0
     generator.to(TCfg.device)
     #generator.train()
-    #generator.eval()
+    generator.eval()
     #discriminator.eval()
     if storesPerIm is not None : # must be list of five lists
         for lst in storesPerIm :
@@ -1000,7 +1000,7 @@ def generateDiffImages(images, layout=None) :
     pre = images.clone()
     gen = images.clone()
     with torch.no_grad() :
-        #generator.eval()
+        generator.eval()
         pre[DCfg.gapRng] = generator.preProc(images)
         gen[DCfg.gapRng] = generator.generatePatches(images)
         dif[DCfg.gapRng] = (gen - pre)[DCfg.gapRng]

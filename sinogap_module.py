@@ -251,51 +251,6 @@ def load_model(model, model_path):
     return model
 
 
-def saveCheckPoint(path, epoch, iterations, minGEpoch, minGdLoss,
-                   generator, discriminator,
-                   optimizerGen=None, optimizerDis=None,
-                   schedulerGen=None, schedulerDis=None,
-                   startFrom=0) :
-    checkPoint = {}
-    checkPoint['epoch'] = epoch
-    checkPoint['iterations'] = iterations
-    checkPoint['minGEpoch'] = minGEpoch
-    checkPoint['minGdLoss'] = minGdLoss
-    checkPoint['startFrom'] = startFrom
-    checkPoint['generator'] = generator.state_dict()
-    checkPoint['discriminator'] = discriminator.state_dict()
-    if not optimizerGen is None :
-        checkPoint['optimizerGen'] = optimizerGen.state_dict()
-    if not schedulerGen is None :
-        checkPoint['schedulerGen'] = schedulerGen.state_dict()
-    if not optimizerDis is None :
-        checkPoint['optimizerDis'] = optimizerDis.state_dict()
-    if not schedulerDis is None :
-        checkPoint['schedulerDis'] = schedulerDis.state_dict()
-    torch.save(checkPoint, path)
-
-
-def loadCheckPoint(path, generator, discriminator,
-                   optimizerGen=None, optimizerDis=None,
-                   schedulerGen=None, schedulerDis=None) :
-    checkPoint = torch.load(path, map_location=TCfg.device)
-    epoch = checkPoint['epoch']
-    iterations = checkPoint['iterations']
-    minGEpoch = checkPoint['minGEpoch']
-    minGdLoss = checkPoint['minGdLoss']
-    startFrom = checkPoint['startFrom'] if 'startFrom' in checkPoint else 0
-    generator.load_state_dict(checkPoint['generator'])
-    discriminator.load_state_dict(checkPoint['discriminator'])
-    if not optimizerGen is None :
-        optimizerGen.load_state_dict(checkPoint['optimizerGen'])
-    if not schedulerGen is None and 'schedulerGen' in checkPoint :
-        schedulerGen.load_state_dict(checkPoint['schedulerGen'])
-    if not optimizerDis is None :
-        optimizerDis.load_state_dict(checkPoint['optimizerDis'])
-    if not schedulerDis is None and 'schedulerDis' in checkPoint :
-        schedulerDis.load_state_dict(checkPoint['schedulerDis'])
-    return epoch, iterations, minGEpoch, minGdLoss, startFrom
-
 
 def addToHDF(filename, containername, data) :
     if len(data.shape) == 2 :
@@ -383,166 +338,212 @@ class StripesFromHDF :
                     self.bg -= self.df
                 self.mask  &=  self.bg > 0.0
 
-            self.allIndices = []
+            self.forbidenSinos = self.mask
+            self.forbidenSinos[:, -DCfg.readSh[-1]:] = 0
             for yCr in range(0,self.fsh[0]) :
                 for xCr in range(0,self.fsh[1]) :
                     idx = np.s_[yCr,xCr]
-                    if self.mask[idx] :
-                        if self.volume is not None :
-                            if self.df is not None :
-                                self.volume[:,*idx] -= self.df[idx]
-                            if self.bg is not None :
-                                self.volume[:,*idx] /= self.bg[idx]
-                        if  xCr + DCfg.readSh[1] < self.fsh[1] \
-                        and np.all( self.mask[yCr,xCr+1:xCr+DCfg.readSh[1]] ) :
-                            self.allIndices.append(idx)
+                    if not self.mask[idx] :
+                        self.forbidenSinos[ yCr, max(0, xCr-DCfg.readSh[1]) : xCr ] = 0
+            self.availableSinos = np.count_nonzero(self.forbidenSinos)
+
+
+    def __len__(self):
+        return self.availableSinos
+
+
+    def __getitem__(self, index=None):
+
+        if type(index) is tuple and len(index) == 4 :
+            zdx, ydx, xdx, sinoHeight = index
+        else :
+            while True:
+                ydx = random.randint(0,self.fsh[0]-1)
+                xdx = random.randint(0,self.fsh[1]-DCfg.readSh[-1]-1)
+                if self.forbidenSinos[ydx,xdx] :
+                    break
+            sinoHeight = DCfg.readSh[0] if random.randint(0,1) else \
+                random.randint(DCfg.readSh[0]+1, self.sh[0])
+            zdx = random.randint(0,self.sh[0]-sinoHeight)
+        idx = np.s_[ ydx , xdx : xdx + DCfg.readSh[-1] ]
+
+        if self.volume is not None :
+            data = self.volume[zdx:zdx+sinoHeight, *idx ]
+        else :
+            data = self.data[zdx:zdx+sinoHeight, *idx ]
+            if self.df is not None :
+                data -= self.df[None,*idx]
+            if self.bg is not None :
+                data /= self.bg[None,*idx]
+        return (data, (zdx, ydx, xdx, sinoHeight) )
+        #data = torch.from_numpy(data).clone().unsqueeze(0).to(TCfg.device)
+        #if sinoHeight != DCfg.readSh[0] :
+        #    data = torch.nn.functional.interpolate(data.unsqueeze(0), size=DCfg.readSh,mode='bilinear').squeeze(0)
+
+
 
     def get_dataset(self, transform=None) :
 
         class Sinos(torch.utils.data.Dataset) :
-
             def __init__(self, root, transform=None):
                 self.container = root
-                self.transform = transforms.Compose([transforms.ToTensor(), transform]) \
-                    if transform else transforms.ToTensor()
-
+                self.oblTransform = transforms.Compose( [ transforms.ToTensor(), transforms.Resize(DCfg.readSh)] )
+                self.transform = transform
             def __len__(self):
-                return len(self.container.allIndices)
-
-            def __getitem__(self, index=None, idxs=None, doTransform=True):
-                if idxs is None or index is None :
-                    idxs = random.randint(0,self.container.sh[0]-DCfg.readSh[0]-1)
-                    index = random.randint(0,len(self.container.allIndices)-1)
-                idx = self.container.allIndices[index]
-                xyrng=np.s_[ idx[0], idx[1]:idx[1]+DCfg.readSh[1] ]
-                if self.container.volume is not None :
-                    data = self.container.volume[idxs:idxs+DCfg.readSh[0], *xyrng]
-                else :
-                    data = self.container.data[idxs:idxs+DCfg.readSh[0], *xyrng]
-                    if self.container.df is not None :
-                        data -= self.container.df[None,*xyrng]
-                    if self.container.bg is not None :
-                        data /= self.container.bg[None,*xyrng]
+                return self.container.__len__()
+            def __getitem__(self, index=None, doTransform=True):
+                data, index = self.container.__getitem__(index)
+                data = self.oblTransform(data)
                 if doTransform and self.transform :
                     data = self.transform(data)
-                return (data, index, idxs)
+                return (data, index)
 
         return Sinos(self, transform)
 
 
 class StripesFromHDFs :
+
     def __init__(self, bases):
         self.collection = []
         for base in bases :
+            print(f"Loading train set {len(self.collection)+1} of {len(bases)}: " + base + " ... ", end="")
             self.collection.append(
-                StripesFromHDF(f"storage/{base}.hdf:/data", f"storage/{base}.mask.tif", None, None) )
-            print("Loaded set " + base)
+                StripesFromHDF(f"storage/{base}.hdf:/data", f"storage/{base}.mask++.tif", None, None) )
+            print("Done")
+
+
+    def __getitem__(self, index=None):
+
+        if type(index) is tuple and len(index) == 5 :
+            setdx, zdx, ydx, xdx, sinoHeight = index
+            return self.collection[setdx].__getitem__((setdx, zdx, ydx, xdx, sinoHeight))
+        else :
+            cindex = random.randint(0,len(self)-1)
+            leftover = cindex
+            for setdx in range(len(self.collection)) :
+                setLen = len(self.collection[setdx])
+                if leftover >= setLen :
+                    leftover -= setLen
+                else :
+                    data, insetdx = self.collection[setdx].__getitem__()
+                    return (data, (setdx, *insetdx) )
+            else :
+                raise f"No set for index {cindex}. Should never happen."
+
+
+    def __len__(self):
+        return sum( [ len(set) for set in self.collection ] )
+
 
     def get_dataset(self, transform=None) :
 
         class Sinos(torch.utils.data.Dataset) :
-
             def __init__(self, root, transform=None):
                 self.container = root
-                self.transform = transforms.Compose([transforms.ToTensor(), transform]) \
-                    if transform else transforms.ToTensor()
-
+                self.oblTransform = transforms.Compose( [ transforms.ToTensor(), transforms.Resize(DCfg.readSh)] )
+                self.transform = transform
             def __len__(self):
-                return sum( [ len(set.allIndices) for set in self.container.collection ] )
-
-            def __getitem__(self, index=None, idxs=None, doTransform=True):
-                if idxs is None or index is None :
-                    index = random.randint(0,len(self)-1)
-                leftover = index
-                useset = None
-                for set in self.container.collection :
-                    setLen = len(set.allIndices)
-                    if leftover >= setLen :
-                        leftover -= setLen
-                    else :
-                        useset = set
-                        break
-                if useset is None :
-                    raise f"No set for index {index}."
-                if idxs is None :
-                    idxs = random.randint(0,useset.sh[0]-DCfg.readSh[0]-1)
-                idx = useset.allIndices[leftover]
-                xyrng=np.s_[ idx[0], idx[1]:idx[1]+DCfg.readSh[1] ]
-                if useset.volume is not None :
-                    data = useset.volume[idxs:idxs+DCfg.readSh[0], *xyrng]
-                else :
-                    data = useset.data[idxs:idxs+DCfg.readSh[0], *xyrng]
-                    if useset.df is not None :
-                        data -= useset.df[None,*xyrng]
-                    if useset.bg is not None :
-                        data /= useset.bg[None,*xyrng]
+                return self.container.__len__()
+            def __getitem__(self, index=None, doTransform=True):
+                data, index = self.container.__getitem__(index)
+                data = self.oblTransform(data)
                 if doTransform and self.transform :
                     data = self.transform(data)
-                return (data, index, idxs)
+                return (data, index)
 
         return Sinos(self, transform)
 
 
 examplesDb = {}
-examplesDb[2] = [(2348095, 1684)
-                ,(1958164,1391)
-                ,(1429010,666)
-                ,(1271101, 570)
-                ,(3007773,2063)
-                #,(1271426,1140)
-                ,(176088,893)
-                #,(173107,273)
-                #,(141881,817)
-                #,(4076914,1642)
-                ,(2880692,530)
-                #,(1333420,160)
-                ,(2997700,2321)
-                #,(1385331,653)
-                #,(132424,868)
-                #,(1440290,204)
-                #,(132352,757)
-                ,(102151, 418)
+examplesDb[2] = [
+                  263185,
+                  173496,
+                  213234,
+                  241201,
+                  264646,
+                  195114,
+                  195999,
+                  863528,
+                  755484,
+                  222701,
+                  818392,
+                  952538,
+                  801601,
+                  944579,
+                  1082431,
+                  842400,
                 ]
-examplesDb[4] = [(1298309, 1015)
-                #,(4612947, 2882)
-                ,(2215760, 500)
-                ,(2348095, 1684)
-                ,(1907990, 1545)
-                ,(291661, 724)
-                ,(2489646, 1240)
-                ,(1142687, 230)
-                #,(974214, 631)
-                ,(1429007,666)
-                ,(152196,251)
-                ,(1284589,62)
-                ,(2963058,233)
-                ,(200279,41)
-                ,(1707893,914)
-                ,(102151, 418)
+examplesDb[4] = [
+                  263185,
+                  173496,
+                  213234,
+                  241201,
+                  264646,
+                  195114,
+                  195999,
+                  863528,
+                  755484,
+                  222701,
+                  818392,
+                  #952538,
+                  #801601,
+                  #944579,
+                  #1082431,
+                  842400,
                 ]
-examplesDb[8] = [(2348095, 1684)
-                ,(1909160,333)
-                #,(2489646, 1240)
-                ,(5592152, 2722)
-                ,(1429010,666)
-                ,(152196,251)
-                ,(1707893,914)
-                ,(102151, 418)]
-examplesDb[16] = [ (2348095, 1684)
-                 , (1958164,1391)
-                 , (1429010,666)
-                 #, (1831107,164)
-                 , (102151, 418)]
+examplesDb[8] = [
+                  263185,
+                  173496,
+                  213234,
+                  241201,
+                  264646,
+                  195114,
+                  195999,
+                  #863528,
+                  #755484,
+                  #222701,
+                  #818392,
+                  #952538,
+                  #801601,
+                  #944579,
+                  #1082431,
+                  842400,
+                ]
+examplesDb[16] = [
+                  263185,
+                  173496,
+                  213234,
+                  #241201,
+                  #264646,
+                  #195114,
+                  #195999,
+                  #863528,
+                  #755484,
+                  #222701,
+                  #818392,
+                  #952538,
+                  #801601,
+                  #944579,
+                  #1082431,
+                  842400,
+                ]
+
+
 examples = initIfNew('examples')
 
+
+listOfTrainData = [ "18515.Lamb1_Eiger_7m_45keV_360Scan"
+                  , "18692a.ExpChicken6mGyShift"
+                  , "18692b_input_PhantomM"
+                  , "18692b.MinceO"
+                  , "19022g.11-EggLard"
+                  , "19736b.09_Feb.4176862R_Eig_Threshold-4keV"
+                  , "19736c.8733147R_Eig_Threshold-8keV.SAMPLE_Y1"
+                  , "20982b.04_774784R"
+                  , "23574.8965435L.Eiger.32kev_org"
+                  ]
 def createTrainSet() :
-    listOfData = [ "19736b.09_Feb.4176862R_Eig_Threshold-4keV"
-                 , "18515.Lamb1_Eiger_7m_45keV_360Scan"
-                 , "23574.8965435L.Eiger.32kev_org"
-                 , "23574.8965435L.Eiger.32kev_sft"
-                 , "18692b_input_PhantomM"
-                 ]
-    sinoRoot = StripesFromHDFs(listOfData)
+    sinoRoot = StripesFromHDFs(listOfTrainData)
     mytransforms = transforms.Compose([
             transforms.Resize(DCfg.sinoSh),
             transforms.RandomHorizontalFlip(),
@@ -552,9 +553,9 @@ def createTrainSet() :
     return sinoRoot.get_dataset(mytransforms)
 
 
-def createTrainLoader(trainSet, num_workers=os.cpu_count()) :
+def createDataLoader(tSet, num_workers=os.cpu_count()) :
     return torch.utils.data.DataLoader(
-        dataset=trainSet,
+        dataset=tSet,
         batch_size=TCfg.batchSize,
         shuffle=False,
         num_workers=num_workers,
@@ -591,52 +592,42 @@ class PrepackedHDF :
 
             def __init__(self, root, transform=None):
                 self.container = root
-                self.transform = transforms.Compose([transforms.ToTensor(), transform]) \
-                    if transform else transforms.ToTensor()
+                self.transform = transform
 
             def __len__(self):
                 return self.container.sh[0]
 
-            def __getitem__(self, index):
+            def __getitem__(self, index, doTransform=True):
                 data=self.container.volume[index,...]
-                data = self.transform(data)
-                return data
+                data = torch.from_numpy(data).clone().unsqueeze(0)
+                if doTransform :
+                    data = self.transform(data)
+                return (data, index)
 
         return Sinos(self, transform)
 
 def createTestSet() :
+    print("Loading test set ... ", end="")
     sinoRoot = PrepackedHDF("storage/test/testSetSmall.hdf:/data")
+    print("Done")
     mytransforms = transforms.Compose([
             transforms.Resize(DCfg.sinoSh),
-#            transforms.RandomHorizontalFlip(),
-#            transforms.RandomVerticalFlip(),
             transforms.Normalize(mean=(0.5), std=(1))
     ])
     return sinoRoot.get_dataset(mytransforms)
 
 
-def createTestLoader(testSet, num_workers=os.cpu_count()) :
-    return torch.utils.data.DataLoader(
-        dataset=testSet,
-        batch_size = TCfg.batchSize, # test requires no grad
-        shuffle=False,
-        num_workers=num_workers,
-        drop_last=True
-    )
 
-
-
-def createReferences(trainSet, toShow = 0) :
+def createReferences(tSet, toShow = 0) :
     global examples
     examples = examplesDb[DCfg.gapW].copy()
     if toShow :
         examples.insert(0, examples.pop(toShow))
     mytransforms = transforms.Compose([
-            transforms.ToTensor(),
             transforms.Resize(DCfg.sinoSh),
             transforms.Normalize(mean=(0.5), std=(1))
     ])
-    refImages = torch.stack( [ mytransforms(trainSet.__getitem__(*ex, doTransform=False)[0])
+    refImages = torch.stack( [ mytransforms(tSet.__getitem__(ex, doTransform=False)[0])
                                for ex in examples ] ).to(TCfg.device)
     refNoises = torch.randn((refImages.shape[0],TCfg.latentDim)).to(TCfg.device)
     return refImages, refNoises
@@ -644,19 +635,19 @@ refImages = initIfNew('refImages')
 refNoises = initIfNew('refNoises')
 
 
-def showMe(trainSet, item=None) :
+def showMe(tSet, item=None) :
     global refImages, refNoises
     image = None
     if item is None :
         while True:
-            image, index, idxs = trainSet[random.randint(0,len(trainSet)-1)]
+            image, index = tSet[random.randint(0,len(tSet)-1)]
             if image.mean() > 0 and image.min() < -0.1 :
-                print (f"{index}, {idxs}")
+                print (f"{index}")
                 break
     elif isinstance(item, int) :
         image = refImages[0,...]
     else :
-        image, _,_ = trainSet.__getitem__(*item)
+        image, _,_ = tSet.__getitem__(*item)
     image = image.squeeze()
     tensorStat(image)
     plotImage(image.cpu())
@@ -678,6 +669,7 @@ class GeneratorTemplate(nn.Module):
         self.gapRng = np.s_[...,self.gapRngX]
         self.latentChannels = latentChannels
         self.baseChannels = 64
+        #self.amplitude = nn.Parameter(torch.ones(1))
 
 
     def createLatent(self) :
@@ -875,8 +867,6 @@ def createOptimizer(model, lr) :
     )
 optimizer_G = initIfNew('optimizer_G')
 optimizer_D = initIfNew('optimizer_D')
-scheduler_G = initIfNew('scheduler_G')
-scheduler_D = initIfNew('scheduler_D')
 
 
 def restoreCheckpoint(path=None, logDir=None) :
@@ -888,14 +878,14 @@ def restoreCheckpoint(path=None, logDir=None) :
                             " Remove it .")
         try : os.remove(TCfg.historyHDF)
         except : pass
-        return 0, 0, 0, -1, 0
+        return 0, 0, 0, 1, 0, TrainResClass()
     else :
-        return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D, scheduler_G, scheduler_D)
+        return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D)
 
 
 def saveModels(path="") :
-    save_model(generator, model_path=f"model_{TCfg.exec}_gen.pt")
-    save_model(discriminator, model_path=f"model_{TCfg.exec}_dis.pt")
+    save_model(generator, model_path = ( path if path else f"model_{TCfg.exec}" ) + "_gen.pt" )
+    save_model(discriminator, model_path = ( path if path else f"model_{TCfg.exec}" ) + "_dis.pt"  )
 
 
 def createCriteria() :
@@ -907,7 +897,7 @@ BCE, MSE, L1L = createCriteria()
 lossDifCoef = 0
 lossAdvCoef = 1.0
 
-def applyWeights(inp, weights):
+def applyWeights(inp, weights, storePerIm=None):
     inp = inp.squeeze()
     if not inp.dim() :
         inp = inp.unsqueeze(0)
@@ -915,29 +905,31 @@ def applyWeights(inp, weights):
     if not weights is None :
         inp *= weights
         sum = weights.sum()
+    if storePerIm is not None : # must be list
+        storePerIm.extend(inp.tolist())
     return inp.sum()/sum
 
-def loss_Adv(y_true, y_pred, weights=None):
+def loss_Adv(y_true, y_pred, weights=None, storePerIm=None):
     loss = BCE(y_pred, y_true)
-    return applyWeights(loss,weights)
+    return applyWeights(loss, weights, storePerIm=storePerIm)
 
-def loss_MSE(p_true, p_pred, weights=None):
+def loss_MSE(p_true, p_pred, weights=None, storePerIm=None):
     loss = MSE(p_pred, p_true).mean(dim=(-1,-2))
-    return applyWeights(loss,weights)
+    return applyWeights(loss, weights, storePerIm=storePerIm)
 
-def loss_L1L(p_true, p_pred, weights=None):
+def loss_L1L(p_true, p_pred, weights=None, storePerIm=None):
     loss = L1L(p_pred, p_true).mean(dim=(-1,-2))
-    return applyWeights(loss,weights)
+    return applyWeights(loss, weights, storePerIm=storePerIm)
 
 eDinfo = None
-def loss_Rec(p_true, p_pred, weights=None):
+def loss_Rec(p_true, p_pred, weights=None, storePerIm=None):
     global eDinfo
     loss = MSE(p_pred, p_true).mean(dim=(-1,-2)).squeeze()
     if loss.dim() :
         hDindex = loss.argmax()
         lDindex = loss.argmin()
         eDinfo = (hDindex, loss[hDindex].item(), lDindex, loss[lDindex].item() )
-    return applyWeights(loss,weights)
+    return applyWeights(loss, weights, storePerIm=storePerIm)
 
 
 def loss_Gen(y_true, y_pred, p_true, p_pred, weights=None):
@@ -946,31 +938,51 @@ def loss_Gen(y_true, y_pred, p_true, p_pred, weights=None):
     return lossAdv, lossDif
 
 
-def summarizeSet(dataloader, onPrep=True):
+def summarizeSet(dataloader, onPrep=True, storesPerIm=None):
 
     MSE_diffs, L1L_diffs, Rec_diffs, Real_probs, Fake_probs = [], [], [], [], []
     totalNofIm = 0
     generator.to(TCfg.device)
+    #generator.train()
     generator.eval()
     #discriminator.eval()
+    if storesPerIm is not None : # must be list of five lists
+        for lst in storesPerIm :
+            lst.clear()
+    else :
+        storesPerIm = [None, None, None, None, None]
     with torch.no_grad() :
         for it , data in tqdm.tqdm(enumerate(dataloader), total=int(len(dataloader))):
             images = data[0].squeeze(1).to(TCfg.device)
             nofIm = images.shape[0]
+            subBatchSize = nofIm // TCfg.batchSplit
             totalNofIm += nofIm
             procImages, procData = imagesPreProc(images)
             genImages = procImages.clone()
-            patchImages = generator.preProc(procImages) \
-                          if onPrep else \
-                          generator.generatePatches(procImages)
-            genImages[DCfg.gapRng] = patchImages
-            if not noAdv :
-                Real_probs.append(discriminator(procImages).sum().item())
-                Fake_probs.append(discriminator(genImages).sum().item())
-            procImages = imagesPostProc(patchImages, procData)
-            MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages))
-            L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], procImages))
-            Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], procImages))
+
+            rprob = fprob = 0
+            for i in range(TCfg.batchSplit) :
+                subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize] if TCfg.batchSplit > 1 else np.s_[...]
+                subProcImages = procImages[subRange,...]
+                patchImages = generator.preProc(subProcImages) \
+                              if onPrep else \
+                              generator.generatePatches(subProcImages)
+                genImages[subRange,:,DCfg.gapRngX] = patchImages
+                if not noAdv :
+                    rprobs = discriminator(subProcImages)
+                    if storesPerIm[3] is not None :
+                        storesPerIm[3].extend(rprobs.tolist())
+                    rprob += rprobs.sum().item()
+                    fprobs = discriminator(genImages[subRange,...])
+                    if storesPerIm[4] is not None :
+                        storesPerIm[4].extend(fprobs.tolist())
+                    fprob += fprobs.sum().item()
+            procImages = imagesPostProc(genImages, procData)
+            MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages[DCfg.gapRng], storePerIm = storesPerIm[2]))
+            L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], procImages[DCfg.gapRng], storePerIm = storesPerIm[1]))
+            Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], procImages[DCfg.gapRng], storePerIm = storesPerIm[0]))
+            Real_probs.append(rprob)
+            Fake_probs.append(fprob)
 
     MSE_diff = sum(MSE_diffs) / totalNofIm
     L1L_diff = sum(L1L_diffs) / totalNofIm
@@ -987,7 +999,7 @@ def generateDiffImages(images, layout=None) :
     hGap = DCfg.gapW // 2
     pre = images.clone()
     gen = images.clone()
-    with torch.inference_mode() :
+    with torch.no_grad() :
         generator.eval()
         pre[DCfg.gapRng] = generator.preProc(images)
         gen[DCfg.gapRng] = generator.generatePatches(images)
@@ -1088,7 +1100,7 @@ def initialTest() :
               f'Ref: {probs[0]:.3e}, '
               f'Gen: {probs[2]:.3e}, '
               f'Pre: {probs[1]:.3e}.')
-        generator.eval()
+        #generator.eval()
         pre = generator.preProc(refImages)
         ref_loss_Rec = loss_Rec(refImages[DCfg.gapRng], pre, calculateWeights(refImages))
         ref_loss_MSE = loss_MSE(refImages[DCfg.gapRng], pre)
@@ -1155,6 +1167,7 @@ class TrainResClass:
     predReal : any = 0
     predPre : any = 0
     predFake : any = 0
+    nofIm : int = 0
     def __add__(self, other):
         toRet = TrainResClass()
         for field in dataclasses.fields(TrainResClass):
@@ -1170,7 +1183,62 @@ class TrainResClass:
     __rmul__ = __mul__
 
 
+
+
+def saveCheckPoint(path, epoch, iterations, minGEpoch, minGdLoss,
+                   generator, discriminator,
+                   optimizerGen=None, optimizerDis=None,
+                   schedulerGen=None, schedulerDis=None,
+                   startFrom=0, interimRes=TrainResClass()) :
+    checkPoint = {}
+    checkPoint['epoch'] = epoch
+    checkPoint['iterations'] = iterations
+    checkPoint['minGEpoch'] = minGEpoch
+    checkPoint['minGdLoss'] = minGdLoss
+    checkPoint['startFrom'] = startFrom
+    checkPoint['generator'] = generator.state_dict()
+    checkPoint['discriminator'] = discriminator.state_dict()
+    if not optimizerGen is None :
+        checkPoint['optimizerGen'] = optimizerGen.state_dict()
+    if not schedulerGen is None :
+        checkPoint['schedulerGen'] = schedulerGen.state_dict()
+    if not optimizerDis is None :
+        checkPoint['optimizerDis'] = optimizerDis.state_dict()
+    if not schedulerDis is None :
+        checkPoint['schedulerDis'] = schedulerDis.state_dict()
+    checkPoint['resAcc'] = interimRes
+    torch.save(checkPoint, path)
+
+
+def loadCheckPoint(path, generator, discriminator,
+                   optimizerGen=None, optimizerDis=None,
+                   schedulerGen=None, schedulerDis=None) :
+    checkPoint = torch.load(path, map_location=TCfg.device)
+    epoch = checkPoint['epoch']
+    iterations = checkPoint['iterations']
+    minGEpoch = checkPoint['minGEpoch']
+    minGdLoss = checkPoint['minGdLoss']
+    startFrom = checkPoint['startFrom'] if 'startFrom' in checkPoint else 0
+    generator.load_state_dict(checkPoint['generator'])
+    discriminator.load_state_dict(checkPoint['discriminator'])
+    if not optimizerGen is None :
+        optimizerGen.load_state_dict(checkPoint['optimizerGen'])
+    if not schedulerGen is None :
+        schedulerGen.load_state_dict(checkPoint['schedulerGen'])
+    if not optimizerDis is None :
+        optimizerDis.load_state_dict(checkPoint['optimizerDis'])
+    if not schedulerDis is None :
+        schedulerDis.load_state_dict(checkPoint['schedulerDis'])
+    interimRes = checkPoint['resAcc'] if 'resAcc' in checkPoint else TrainResClass()
+
+    return epoch, iterations, minGEpoch, minGdLoss, startFrom, interimRes
+
+
+
 trainInfo = TrainInfoClass()
+normMSE=1
+normL1L=1
+normRec=1
 skipDis = False
 
 def train_step(images):
@@ -1197,7 +1265,7 @@ def train_step(images):
 
         # calculate predictions of prefilled images - purely for metrics purposes
         #discriminator.eval()
-        generator.eval()
+        #generator.eval()
         trainRes.predPre = 0
         with torch.no_grad() :
             for i in range(TCfg.batchSplit) :
@@ -1225,8 +1293,7 @@ def train_step(images):
                     torch.cat( (imWeights[subRange], imWeights[subRange]) )
                 subD_loss = loss_Adv(labelsDis, pred_both, wghts)
             # train discriminator only if it is not too good :
-            # if not skipDis and ( subPred_fakeD.mean() > 0.2 or subPred_realD.mean() < 0.8 ) :
-            if True:
+            if not skipDis and ( subPred_fakeD.mean() > 0.2 or subPred_realD.mean() < 0.8 ) :
                 trainInfo.disPerformed += 1/TCfg.batchSplit
                 subD_loss.backward()
             trainRes.lossD += subD_loss.item()
@@ -1246,7 +1313,7 @@ def train_step(images):
     #discriminator.eval()
     for param in discriminator.parameters() :
         param.requires_grad = False
-    generator.train()
+    #generator.train()
     optimizer_G.zero_grad()
     for i in range(TCfg.batchSplit) :
         subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize] if TCfg.batchSplit > 1 else np.s_[:]
@@ -1254,7 +1321,8 @@ def train_step(images):
                 torch.cat( (imWeights[subRange], imWeights[subRange]) )
         subFakeImages = generator.generateImages(procImages[subRange,...])
         if noAdv :
-            subG_loss = loss_Rec(procImages[subRange,:,DCfg.gapRngX], subFakeImages[DCfg.gapRng], wghts)
+            subG_loss = loss_Rec(procImages[subRange,:,DCfg.gapRngX],
+                                 subFakeImages[DCfg.gapRng], wghts)
             subGD_loss = subGA_loss = subG_loss
         else :
             subPred_fakeG = discriminator(subFakeImages)
@@ -1281,8 +1349,9 @@ def train_step(images):
     # prepare report
     with torch.no_grad() :
 
-        trainRes.lossMSE = loss_MSE(images[DCfg.gapRng], fakeImages[DCfg.gapRng]).item()
-        trainRes.lossL1L = loss_L1L(images[DCfg.gapRng], fakeImages[DCfg.gapRng]).item()
+        trainRes.lossMSE = loss_MSE(images[DCfg.gapRng], fakeImages[DCfg.gapRng]).item() / normMSE
+        trainRes.lossL1L = loss_L1L(images[DCfg.gapRng], fakeImages[DCfg.gapRng]).item() / normL1L
+        trainRes.lossGD /= normRec
 
         idx = random.randint(0, nofIm-1) if noAdv else pred_real.argmax()
         trainInfo.bestRealImage = fakeImages[idx,...].clone().detach() if noAdv \
@@ -1322,9 +1391,9 @@ def train_step(images):
 
 epoch=initIfNew('epoch', 0)
 iter = initIfNew('iter', 0)
+imer = initIfNew('iter', 0)
 minGEpoch = initIfNew('minGEpoch')
-minGdLoss = initIfNew('minGdLoss')
-prepGdLoss = initIfNew('prepGdLoss')
+minGdLoss = initIfNew('minGdLoss', 1)
 startFrom = initIfNew('startFrom', 0)
 
 def beforeEachEpoch(epoch) :
@@ -1341,10 +1410,15 @@ def afterReport() :
 
 dataLoader=None
 testLoader=None
+normTestMSE=1
+normTestL1L=1
+normTestRec=1
+resAcc = TrainResClass()
 
 def train(savedCheckPoint):
-    global epoch, minGdLoss, minGEpoch, prepGdLoss, iter, trainInfo, startFrom
+    global epoch, minGdLoss, minGEpoch, iter, trainInfo, startFrom, imer, resAcc
     lastGdLoss = minGdLoss
+    lastGdLossTrain = 1
 
     discriminator.to(TCfg.device)
     generator.to(TCfg.device)
@@ -1356,32 +1430,29 @@ def train(savedCheckPoint):
         beforeEachEpoch(epoch)
         generator.train()
         discriminator.train()
-        resAcc = TrainResClass()
+        #resAcc = TrainResClass()
         totalIm = 0
-        scheduleCounter = 0
 
         for it , data in tqdm.tqdm(enumerate(dataLoader), total=int(len(dataLoader))):
-            iter += 1
             if startFrom :
                 startFrom -= 1
                 continue
-
+            iter += 1
             images = data[0].to(TCfg.device)
             nofIm = images.shape[0]
+            imer += nofIm
             totalIm += nofIm
             trainRes = train_step(images)
             resAcc += trainRes * nofIm
+            resAcc.nofIm += nofIm
 
             #if True:
             #if False :
             #if not it or it > len(dataloader)-2 or time.time() - lastUpdateTime > 60 :
             if time.time() - lastUpdateTime > 60 :
+
                 lastUpdateTime = time.time()
 
-                if scheduler_D is not None :
-                    scheduler_D.step()
-                if scheduler_G is not None :
-                    scheduler_G.step()
                 _,_,_ =  logStep(iter)
                 collageR, probsR, _ = generateDiffImages(refImages[[0],...], layout=0)
                 showMe = np.zeros( (2*DCfg.sinoSh[1] + DCfg.gapW ,
@@ -1410,44 +1481,38 @@ def train(savedCheckPoint):
                 addImage(4,1,collageR[0,3], stretch=False)
                 writer.add_scalars("Losses per iter",
                                    {'Dis': trainRes.lossD
-                                   ,'Adv': trainRes.lossGA
-                                   ,'Gen': lossAdvCoef * trainRes.lossGA + lossDifCoef * trainRes.lossGD
-                                   }, iter )
+                                   ,'Gen': trainRes.lossGA
+                                   ,'Rec': lossAdvCoef * trainRes.lossGA + lossDifCoef * trainRes.lossGD * normRec
+                                   }, imer )
                 writer.add_scalars("Distances per iter",
                                    {'MSE': trainRes.lossMSE
                                    ,'L1L': trainRes.lossL1L
                                    ,'REC': trainRes.lossGD
-                                   }, iter )
+                                   }, imer )
                 writer.add_scalars("Probs per iter",
                                    {'Ref':trainRes.predReal
                                    ,'Gen':trainRes.predFake
                                    ,'Pre':trainRes.predPre
-                                   }, iter )
+                                   }, imer )
 
                 IPython.display.clear_output(wait=True)
                 beforeReport()
-                lrReport = "" if scheduler_D is None  else \
-                    f"{scheduler_D.get_last_lr()[0]/TCfg.learningRateD:.3f}"
-                lrReport += "" if scheduler_G is None  else \
-                    f"/{scheduler_G.get_last_lr()[0]/TCfg.learningRateG:.3f}"
-                if len(lrReport) :
-                    lrReport = "LR: " + lrReport + ". "
-                print(f"Epoch: {epoch} ({minGEpoch}). " + lrReport +
-                      ( f" L1L: {trainRes.lossL1L:.3e} " \
-                          if noAdv else \
+                print(f"Epoch: {epoch} ({minGEpoch}). " +
+                      ( f" L1L: {trainRes.lossL1L:.3f} " if noAdv \
+                          else \
                         f" Dis[{trainInfo.disPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossD:.3f} ({trainInfo.ratReal/trainInfo.totalImages:.3f})," ) +
-                      ( f" MSE: {trainRes.lossMSE:.3e} " \
-                          if noAdv else \
+                      ( f" MSE: {trainRes.lossMSE:.3f} " if noAdv \
+                          else \
                         f" Gen[{trainInfo.genPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossGA:.3f} ({trainInfo.ratFake/trainInfo.totalImages:.3f})," ) +
-                      f" Rec: {lastGdLoss:.3e} ({minGdLoss:.3e} / {prepGdLoss:.3e})."
+                      f" Rec: {trainRes.lossGD:.3f} (Train: {lastGdLossTrain:.3f}, Test: {lastGdLoss/normTestRec:.3f} | {minGdLoss/normTestRec:.3f})."
                       )
-                print (f"TT: {trainInfo.bestRealProb:.2f} ({data[1][trainInfo.bestRealIndex]},{data[2][trainInfo.bestRealIndex]}),  "
-                       f"FT: {trainInfo.bestFakeProb:.2f} ({data[1][trainInfo.bestFakeIndex]},{data[2][trainInfo.bestFakeIndex]}),  "
-                       f"HD: {trainInfo.highestDif:.3e} ({data[1][trainInfo.highestDifIndex]},{data[2][trainInfo.highestDifIndex]}),  "
+                print (f"TT: {trainInfo.bestRealProb:.2f},  "
+                       f"FT: {trainInfo.bestFakeProb:.2f},  "
+                       f"HD: {trainInfo.highestDif/normMSE:.3e},  "
                        f"GP: {probsR[0,2].item():.3f}, {probsR[0,1].item():.3f} " )
-                print (f"TF: {trainInfo.worstRealProb:.2f} ({data[1][trainInfo.worstRealIndex]},{data[2][trainInfo.worstRealIndex]}),  "
-                       f"FF: {trainInfo.worstFakeProb:.2f} ({data[1][trainInfo.worstFakeIndex]},{data[2][trainInfo.worstFakeIndex]}),  "
-                       f"LD: {trainInfo.lowestDif:.3e} ({data[1][trainInfo.lowestDifIndex]},{data[2][trainInfo.lowestDifIndex]}),  "
+                print (f"TF: {trainInfo.worstRealProb:.2f},  "
+                       f"FF: {trainInfo.worstFakeProb:.2f},  "
+                       f"LD: {trainInfo.lowestDif/normMSE:.3e},  "
                        f"R : {probsR[0,0].item():.3f}." )
                 plotImage(showMe)
                 afterReport()
@@ -1456,18 +1521,18 @@ def train(savedCheckPoint):
             if time.time() - lastSaveTime > 3600 :
                 lastSaveTime = time.time()
                 saveCheckPoint(savedCheckPoint+"_hourly.pth",
-                               epoch-1, iter, minGEpoch, minGdLoss,
+                               epoch-1, imer, minGEpoch, minGdLoss/normRec,
                                generator, discriminator,
                                optimizer_G, optimizer_D,
-                               scheduler_G, scheduler_D,
-                               startFrom=it)
+                               startFrom=it, interimRes=resAcc)
+                saveModels(f"model_{TCfg.exec}_hourly")
 
 
         resAcc *= 1.0/totalIm
         writer.add_scalars("Losses per epoch",
                            {'Dis': resAcc.lossD
                            ,'Adv': resAcc.lossGA
-                           ,'Gen': lossAdvCoef * resAcc.lossGA + lossDifCoef * resAcc.lossGD
+                           ,'Gen': lossAdvCoef * resAcc.lossGA + lossDifCoef * resAcc.lossGD * normRec
                            }, epoch )
         writer.add_scalars("Distances per epoch",
                            {'MSE': resAcc.lossMSE
@@ -1479,35 +1544,35 @@ def train(savedCheckPoint):
                            ,'Gen': resAcc.predFake
                            ,'Pre': resAcc.predPre
                            }, epoch )
-        lastGdLoss = resAcc.lossGD
-        if minGdLoss < 0.0 or resAcc.lossGD < minGdLoss  :
-            minGdLoss = resAcc.lossGD
+        lastGdLossTrain = resAcc.lossGD
+
+        Rec_test, MSE_test, L1L_test, Gen_test, Dis_test = summarizeSet(testLoader, False)
+        writer.add_scalars("Test per epoch",
+                           {'MSE': MSE_test / normTestMSE
+                           ,'L1L': L1L_test / normTestL1L
+                           ,'REC': Rec_test / normTestRec
+                           #,'Dis': Dis_test
+                           #,'Gen': Gen_test
+                           }, epoch )
+
+        lastGdLoss = Rec_test
+        if lastGdLoss < minGdLoss  :
+            minGdLoss = lastGdLoss
             minGEpoch = epoch
             saveCheckPoint(savedCheckPoint+"_B.pth",
-                           epoch, iter, minGEpoch, minGdLoss,
+                           epoch, imer, minGEpoch, minGdLoss,
                            generator, discriminator,
-                           optimizer_G, optimizer_D,
-                           scheduler_G, scheduler_D
-                           )
+                           optimizer_G, optimizer_D)
             os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_BB.pth") # BB: before best
             os.system(f"cp {savedCheckPoint}_B.pth {savedCheckPoint}.pth") # B: best
             saveModels()
         else :
             saveCheckPoint(savedCheckPoint+".pth",
-                           epoch, iter, minGEpoch, minGdLoss,
+                           epoch, imer, minGEpoch, minGdLoss,
                            generator, discriminator,
-                           optimizer_G, optimizer_D,
-                           scheduler_G, scheduler_D)
+                           optimizer_G, optimizer_D)
 
-        Rec_test, MSE_test, L1L_test, Gen_test, Dis_test = summarizeSet(testLoader, False)
-        writer.add_scalars("Test per epoch",
-                           {'MSE': MSE_test
-                           ,'L1L': L1L_test
-                           ,'REC': Rec_test
-                           ,'Dis': Dis_test
-                           ,'Gen': Gen_test
-                           }, epoch )
-
+        resAcc = TrainResClass()
         afterEachEpoch(epoch)
 
 
@@ -1528,3 +1593,41 @@ def freeGPUmem() :
     with torch.no_grad():
         torch.cuda.empty_cache()
 
+
+
+
+
+
+
+#examplesDb[2] = [(2348095, 1684)
+#                ,(1958164,1391)
+#                ,(1429010,666)
+#                ,(1271101, 570)
+#                ,(1271426,1140)
+#                ,(4076914,1642)
+#                ,(2880692,530)
+#                ,(1333420,160)
+#                ,(102151, 418)
+#                ]
+#examplesDb[4] = [(2348095, 1684)
+#                ,(1958164,1391)
+#                ,(1429010,666)
+#                ,(1298309, 1015)
+#                ,(1907990, 1545)
+#                ,(2963058,233)
+#                ,(200279,41)
+#                ,(102151, 418)
+#                ]
+#examplesDb[8] = [(2348095, 1684)
+#                ,(1909160,333)
+#                ,(2489646, 1240)
+#                #,(5592152, 2722)
+#                ,(1429010,666)
+#                ,(152196,251)
+#                ,(1707893,914)
+#                ,(102151, 418)]
+#examplesDb[16] = [ (2348095, 1684)
+#                 , (1958164,1391)
+#                 , (1429010,666)
+#                 #, (1831107,164)
+#                 , (102151, 418)]
