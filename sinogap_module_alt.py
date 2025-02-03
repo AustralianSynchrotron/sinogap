@@ -867,6 +867,8 @@ def createOptimizer(model, lr) :
     )
 optimizer_G = initIfNew('optimizer_G')
 optimizer_D = initIfNew('optimizer_D')
+scheduler_G = initIfNew('scheduler_G')
+scheduler_D = initIfNew('scheduler_D')
 
 
 def restoreCheckpoint(path=None, logDir=None) :
@@ -880,7 +882,7 @@ def restoreCheckpoint(path=None, logDir=None) :
         except : pass
         return 0, 0, 0, 1, 0, TrainResClass()
     else :
-        return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D)
+        return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D, scheduler_G, scheduler_D)
 
 
 def saveModels(path="") :
@@ -1223,11 +1225,11 @@ def loadCheckPoint(path, generator, discriminator,
     discriminator.load_state_dict(checkPoint['discriminator'])
     if not optimizerGen is None :
         optimizerGen.load_state_dict(checkPoint['optimizerGen'])
-    if not schedulerGen is None :
+    if not schedulerGen is None and 'schedulerGen' in checkPoint:
         schedulerGen.load_state_dict(checkPoint['schedulerGen'])
     if not optimizerDis is None :
         optimizerDis.load_state_dict(checkPoint['optimizerDis'])
-    if not schedulerDis is None :
+    if not schedulerDis is None and 'schedulerDis' in checkPoint:
         schedulerDis.load_state_dict(checkPoint['schedulerDis'])
     interimRes = checkPoint['resAcc'] if 'resAcc' in checkPoint else TrainResClass()
 
@@ -1241,12 +1243,19 @@ normL1L=1
 normRec=1
 skipDis = False
 
+def beforeEachStep() :
+    return
+
+def afterEachStep() :
+    return
+
 def train_step(images):
     global trainDis, trainGen, eDinfo, noAdv, withNoGrad, skipGen, skipDis
     trainInfo.iterations += 1
     trainInfo.totPerformed += 1
     trainRes = TrainResClass()
 
+    beforeEachStep()
     nofIm = images.shape[0]
     images = images.squeeze(1).to(TCfg.device)
     procImages, procReverseData = imagesPreProc(images)
@@ -1345,7 +1354,6 @@ def train_step(images):
     trainRes.lossGD /= TCfg.batchSplit
     trainRes.predFake = pred_fake.mean().item()
 
-
     # prepare report
     with torch.no_grad() :
 
@@ -1386,6 +1394,7 @@ def train_step(images):
         trainInfo.ratFake += nofIm * torch.count_nonzero(pred_fake > 0.5)/nofIm
         trainInfo.totalImages += nofIm
 
+    afterEachStep()
     return trainRes
 
 
@@ -1497,7 +1506,13 @@ def train(savedCheckPoint):
 
                 IPython.display.clear_output(wait=True)
                 beforeReport()
-                print(f"Epoch: {epoch} ({minGEpoch}). " +
+                lrReport = "" if scheduler_D is None  else \
+                    f"{scheduler_D.get_last_lr()[0]/TCfg.learningRateD:.3f}"
+                lrReport += "" if scheduler_G is None  else \
+                    f"/{scheduler_G.get_last_lr()[0]/TCfg.learningRateG:.3f}"
+                if len(lrReport) :
+                    lrReport = "LR: " + lrReport + ". "
+                print(f"Epoch: {epoch} ({minGEpoch}). " + lrReport +
                       ( f" L1L: {trainRes.lossL1L:.3f} " if noAdv \
                           else \
                         f" Dis[{trainInfo.disPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossD:.3f} ({trainInfo.ratReal/trainInfo.totalImages:.3f})," ) +

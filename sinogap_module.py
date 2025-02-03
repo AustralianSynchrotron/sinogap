@@ -629,6 +629,7 @@ def createReferences(tSet, toShow = 0) :
     ])
     refImages = torch.stack( [ mytransforms(tSet.__getitem__(ex, doTransform=False)[0])
                                for ex in examples ] ).to(TCfg.device)
+    #refImages = torch.stack( [ tSet.__getitem__(ex, doTransform=False)[0] for ex in examples ] ).to(TCfg.device)
     refNoises = torch.randn((refImages.shape[0],TCfg.latentDim)).to(TCfg.device)
     return refImages, refNoises
 refImages = initIfNew('refImages')
@@ -684,7 +685,7 @@ class GeneratorTemplate(nn.Module):
         return toRet
 
 
-    def encblock(self, chIn, chOut, kernel, stride=1, norm=True, dopadding=False) :
+    def encblock(self, chIn, chOut, kernel, stride=1, norm=False, dopadding=False) :
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
@@ -700,7 +701,7 @@ class GeneratorTemplate(nn.Module):
         return torch.nn.Sequential(*layers)
 
 
-    def decblock(self, chIn, chOut, kernel, stride=1, norm=True, dopadding=False) :
+    def decblock(self, chIn, chOut, kernel, stride=1, norm=False, dopadding=False) :
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
@@ -783,6 +784,7 @@ class GeneratorTemplate(nn.Module):
         images, orgDims = unsqeeze4dim(images)
         modelIn = images.clone()
         modelIn[self.gapRng] = self.preProc(images)
+        stDev = modelIn.std(dim=(-1,-2))[...,None,None]
 
         if self.latentChannels :
             latent = self.noise2latent(noises)
@@ -797,7 +799,7 @@ class GeneratorTemplate(nn.Module):
             upTrain.append( decoder( torch.cat( (upTrain[-1], dwTrain[-1-level]), dim=1 ) ) )
         res = self.lastTouch(torch.cat( (upTrain[-1], modelIn ), dim=1 ))
 
-        patches = modelIn[self.gapRng] + 2 * res[self.gapRng]
+        patches = modelIn[self.gapRng] + 2 * stDev * res[self.gapRng]
         return squeezeOrg(patches, orgDims)
 
 
@@ -813,7 +815,7 @@ class DiscriminatorTemplate(nn.Module):
         self.omitEdges = omitEdges
 
 
-    def encblock(self, chIn, chOut, kernel, stride=1, norm=True, dopadding=False) :
+    def encblock(self, chIn, chOut, kernel, stride=1, norm=False, dopadding=False) :
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
@@ -922,9 +924,11 @@ def loss_L1L(p_true, p_pred, weights=None, storePerIm=None):
     return applyWeights(loss, weights, storePerIm=storePerIm)
 
 eDinfo = None
-def loss_Rec(p_true, p_pred, weights=None, storePerIm=None):
+def loss_Rec(p_true, p_pred, weights=None, storePerIm=None, normalizeRec=None):
     global eDinfo
-    loss = MSE(p_pred, p_true).mean(dim=(-1,-2)).squeeze()
+    loss = MSE(p_pred, p_true).mean(dim=(-1,-2))
+    if normalizeRec is not None :
+        loss *= normalizeRec
     if loss.dim() :
         hDindex = loss.argmax()
         lDindex = loss.argmin()
@@ -932,9 +936,9 @@ def loss_Rec(p_true, p_pred, weights=None, storePerIm=None):
     return applyWeights(loss, weights, storePerIm=storePerIm)
 
 
-def loss_Gen(y_true, y_pred, p_true, p_pred, weights=None):
+def loss_Gen(y_true, y_pred, p_true, p_pred, weights=None, normalizeRec=None):
     lossAdv = loss_Adv(y_true, y_pred, weights)
-    lossDif = loss_Rec(p_pred, p_true)
+    lossDif = loss_Rec(p_pred, p_true, weights, normalizeRec=normalizeRec)
     return lossAdv, lossDif
 
 
@@ -978,9 +982,13 @@ def summarizeSet(dataloader, onPrep=True, storesPerIm=None):
                         storesPerIm[4].extend(fprobs.tolist())
                     fprob += fprobs.sum().item()
             procImages = imagesPostProc(genImages, procData)
-            MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages[DCfg.gapRng], storePerIm = storesPerIm[2]))
-            L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], procImages[DCfg.gapRng], storePerIm = storesPerIm[1]))
-            Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], procImages[DCfg.gapRng], storePerIm = storesPerIm[0]))
+            MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages[DCfg.gapRng]
+                                              ,storePerIm = storesPerIm[2]))
+            L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], procImages[DCfg.gapRng]
+                                              ,storePerIm = storesPerIm[1]))
+            Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], procImages[DCfg.gapRng]
+                                              ,storePerIm = storesPerIm[0]
+                                              ,normalizeRec=calculateNorm(images)))
             Real_probs.append(rprob)
             Fake_probs.append(fprob)
 
@@ -1000,6 +1008,7 @@ def generateDiffImages(images, layout=None) :
     pre = images.clone()
     gen = images.clone()
     with torch.no_grad() :
+        wghts = calculateWeights(images)
         generator.eval()
         pre[DCfg.gapRng] = generator.preProc(images)
         gen[DCfg.gapRng] = generator.generatePatches(images)
@@ -1017,9 +1026,9 @@ def generateDiffImages(images, layout=None) :
         probs[:,0] = discriminator(images)[:,0]
         probs[:,1] = discriminator(pre)[:,0]
         probs[:,2] = discriminator(gen)[:,0]
-        dists[:,0] = loss_Rec(images[DCfg.gapRng], gen[DCfg.gapRng], calculateWeights(images))
-        dists[:,1] = loss_MSE(images[DCfg.gapRng], gen[DCfg.gapRng])
-        dists[:,2] = loss_L1L(images[DCfg.gapRng], gen[DCfg.gapRng])
+        dists[:,0] = loss_Rec(images[DCfg.gapRng], gen[DCfg.gapRng], wghts, normalizeRec=calculateNorm(images))
+        dists[:,1] = loss_MSE(images[DCfg.gapRng], gen[DCfg.gapRng], wghts)
+        dists[:,2] = loss_L1L(images[DCfg.gapRng], gen[DCfg.gapRng], wghts)
 
     simages = None
     if not layout is None :
@@ -1102,9 +1111,10 @@ def initialTest() :
               f'Pre: {probs[1]:.3e}.')
         #generator.eval()
         pre = generator.preProc(refImages)
-        ref_loss_Rec = loss_Rec(refImages[DCfg.gapRng], pre, calculateWeights(refImages))
-        ref_loss_MSE = loss_MSE(refImages[DCfg.gapRng], pre)
-        ref_loss_L1L = loss_L1L(refImages[DCfg.gapRng], pre)
+        wghts = calculateWeights(refImages)
+        ref_loss_Rec = loss_Rec(refImages[DCfg.gapRng], pre, wghts, normalizeRec=calculateNorm(refImages))
+        ref_loss_MSE = loss_MSE(refImages[DCfg.gapRng], pre, wghts)
+        ref_loss_L1L = loss_L1L(refImages[DCfg.gapRng], pre, wghts)
         print("Distances of reference images: "
               f"REC: {ref_loss_Rec:.3e}, "
               f"MSE: {ref_loss_MSE:.3e}, "
@@ -1120,6 +1130,12 @@ def initialTest() :
 
 def calculateWeights(images) :
     return None
+
+def calculateNorm(images) :
+    mean2 = images[...,:DCfg.gapRngX.start].mean(dim=(-1,-2)) \
+          + images[...,DCfg.gapRngX.stop:].mean(dim=(-1,-2))
+    return 2 / ( 1 + mean2 + 1e-5 ) # to denorm and adjust for mean
+
 
 
 def imagesPreProc(images) :
@@ -1253,6 +1269,7 @@ def train_step(images):
     fakeImages = procImages.clone().detach().requires_grad_(False)
     subBatchSize = nofIm // TCfg.batchSplit
     imWeights = calculateWeights(images)
+    normDiff = calculateNorm(images)
 
     labelsTrue = torch.full((subBatchSize, 1),  1 - TCfg.labelSmoothFac,
                         dtype=torch.float, device=TCfg.device, requires_grad=False)
@@ -1321,14 +1338,14 @@ def train_step(images):
                 torch.cat( (imWeights[subRange], imWeights[subRange]) )
         subFakeImages = generator.generateImages(procImages[subRange,...])
         if noAdv :
-            subG_loss = loss_Rec(procImages[subRange,:,DCfg.gapRngX],
-                                 subFakeImages[DCfg.gapRng], wghts)
+            subG_loss = loss_Rec( procImages[subRange,:,DCfg.gapRngX], subFakeImages[DCfg.gapRng]
+                                , wghts, normalizeRec=normDiff[subRange,...])
             subGD_loss = subGA_loss = subG_loss
         else :
             subPred_fakeG = discriminator(subFakeImages)
             subGA_loss, subGD_loss = loss_Gen(labelsTrue, subPred_fakeG,
-                                              procImages[subRange,:,DCfg.gapRngX],
-                                              subFakeImages[DCfg.gapRng])
+                                              procImages[subRange,:,DCfg.gapRngX], subFakeImages[DCfg.gapRng],
+                                              wghts, normalizeRec=normDiff[subRange,...])
             subG_loss = lossAdvCoef * subGA_loss + lossDifCoef * subGD_loss
             pred_fake[subRange] = subPred_fakeG.clone().detach()
         # train generator only if it is not too good :
@@ -1532,7 +1549,7 @@ def train(savedCheckPoint):
         writer.add_scalars("Losses per epoch",
                            {'Dis': resAcc.lossD
                            ,'Adv': resAcc.lossGA
-                           ,'Gen': lossAdvCoef * resAcc.lossGA + lossDifCoef * resAcc.lossGD * normRec
+                           ,'Gen': lossAdvCoef * resAcc.lossGA + lossDifCoef * resAcc.lossGD
                            }, epoch )
         writer.add_scalars("Distances per epoch",
                            {'MSE': resAcc.lossMSE
