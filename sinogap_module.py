@@ -670,7 +670,7 @@ class GeneratorTemplate(nn.Module):
         self.gapRng = np.s_[...,self.gapRngX]
         self.latentChannels = latentChannels
         self.baseChannels = 64
-        #self.amplitude = nn.Parameter(torch.ones(1))
+        self.amplitude = 2
 
 
     def createLatent(self) :
@@ -799,7 +799,7 @@ class GeneratorTemplate(nn.Module):
             upTrain.append( decoder( torch.cat( (upTrain[-1], dwTrain[-1-level]), dim=1 ) ) )
         res = self.lastTouch(torch.cat( (upTrain[-1], modelIn ), dim=1 ))
 
-        patches = modelIn[self.gapRng] + 2 * stDev * res[self.gapRng]
+        patches = modelIn[self.gapRng] + self.amplitude * stDev * res[self.gapRng]
         return squeezeOrg(patches, orgDims)
 
 
