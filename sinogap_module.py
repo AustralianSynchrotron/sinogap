@@ -671,6 +671,7 @@ class GeneratorTemplate(nn.Module):
         self.latentChannels = latentChannels
         self.baseChannels = 64
         self.amplitude = 2
+        self.lowResGenerator = None
 
 
     def createLatent(self) :
@@ -767,14 +768,15 @@ class GeneratorTemplate(nn.Module):
             res[...,0] += 2*images[...,self.gapRngX.start-1] + images[...,self.gapRngX.stop]
             res[...,1] += 2*images[...,self.gapRngX.stop] + images[...,self.gapRngX.start-1]
             res /= 3
-        elif self.gapW//2 in lowResGenerators :
-            preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
-            # lowRes generator to be trained if they are parts of the generator
-            with torch.set_grad_enabled(hasattr(self, 'lowResGen')) :
-                res = lowResGenerators[self.gapW//2].generatePatches(preImages)
-                res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
-        else :
+        elif self.lowResGenerator is None and not self.gapW//2 in lowResGenerators :
             res = torch.zeros(images[self.gapRng].shape, device=images.device, requires_grad=False)
+        else :
+            preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
+            # lowRes generator to be trained if they are a part of the generator
+            lrGen = lowResGenerators[self.gapW//2] if self.lowResGenerator is None else self.lowResGenerator
+            with torch.set_grad_enabled(not self.lowResGenerator is None) :
+                res = lrGen.generatePatches(preImages)
+                res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
         return squeezeOrg(res, orgDims)
 
 
