@@ -655,6 +655,8 @@ def showMe(tSet, item=None) :
     image = image.to(TCfg.device)
 
 
+save_interim = None
+
 
 class GeneratorTemplate(nn.Module):
 
@@ -782,10 +784,17 @@ class GeneratorTemplate(nn.Module):
 
     def forward(self, input):
 
+        if not save_interim is None :
+            save_interim[self.gapW] = {}
+
         images, noises = input
+        if not save_interim is None :
+            save_interim[self.gapW]['input'] = images.clone().detach()
         images, orgDims = unsqeeze4dim(images)
         modelIn = images.clone()
         modelIn[self.gapRng] = self.preProc(images)
+        if not save_interim is None :
+            save_interim[self.gapW]['preproc'] = modelIn.clone().detach()
         stDev = modelIn.std(dim=(-1,-2))[...,None,None]
 
         if self.latentChannels :
@@ -802,6 +811,9 @@ class GeneratorTemplate(nn.Module):
         res = self.lastTouch(torch.cat( (upTrain[-1], modelIn ), dim=1 ))
 
         patches = modelIn[self.gapRng] + self.amplitude * stDev * res[self.gapRng]
+        if not save_interim is None :
+            save_interim[self.gapW]['output'] = save_interim[self.gapW]['input'].clone()
+            save_interim[self.gapW]['output'][self.gapRng] = patches.clone().detach()
         return squeezeOrg(patches, orgDims)
 
 
@@ -1231,7 +1243,7 @@ def saveCheckPoint(path, epoch, iterations, minGEpoch, minGdLoss,
 def loadCheckPoint(path, generator, discriminator,
                    optimizerGen=None, optimizerDis=None,
                    schedulerGen=None, schedulerDis=None) :
-    checkPoint = torch.load(path, map_location=TCfg.device)
+    checkPoint = torch.load(path, map_location=TCfg.device, weights_only=False)
     epoch = checkPoint['epoch']
     iterations = checkPoint['iterations']
     minGEpoch = checkPoint['minGEpoch']
@@ -1595,8 +1607,8 @@ def train(savedCheckPoint):
         afterEachEpoch(epoch)
 
 
-def testMe(trainSet, nofIm=1) :
-    testSet = [ trainSet.__getitem__() for _ in range(nofIm) ]
+def testMe(tSet, nofIm=1) :
+    testSet = [ tSet.__getitem__() for _ in range(nofIm) ]
     testImages = torch.stack( [ testItem[0] for testItem in testSet ] ).to(TCfg.device)
     colImgs, probs, dists = generateDiffImages(testImages, layout=4)
     for im in range(nofIm) :
