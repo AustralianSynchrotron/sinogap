@@ -1596,12 +1596,13 @@ def train(savedCheckPoint):
                            optimizer_G, optimizer_D)
             os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_BB.pth") # BB: before best
             os.system(f"cp {savedCheckPoint}_B.pth {savedCheckPoint}.pth") # B: best
-            saveModels()
+            saveModels(f"model_{TCfg.exec}_B")
         else :
             saveCheckPoint(savedCheckPoint+".pth",
                            epoch, imer, minGEpoch, minGdLoss,
                            generator, discriminator,
                            optimizer_G, optimizer_D)
+        saveModels()
 
         resAcc = TrainResClass()
         afterEachEpoch(epoch)
