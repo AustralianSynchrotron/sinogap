@@ -597,7 +597,9 @@ class PrepackedHDF :
             def __len__(self):
                 return self.container.sh[0]
 
-            def __getitem__(self, index, doTransform=True):
+            def __getitem__(self, index=None, doTransform=True):
+                if index is None :
+                    index = random.randint(0,self.container.volume.shape[0]-1)
                 data=self.container.volume[index,...]
                 data = torch.from_numpy(data).clone().unsqueeze(0)
                 if doTransform :
@@ -1608,16 +1610,24 @@ def train(savedCheckPoint):
         afterEachEpoch(epoch)
 
 
-def testMe(tSet, nofIm=1) :
-    testSet = [ tSet.__getitem__() for _ in range(nofIm) ]
-    testImages = torch.stack( [ testItem[0] for testItem in testSet ] ).to(TCfg.device)
+def testMe(tSet, imags=1):
+    if isinstance(imags, int) :
+        testSubSet = [ tSet.__getitem__() for _ in range(imags) ]
+    else :
+        testSubSet = [ tSet.__getitem__(index) for index in imags ]
+    testImages = torch.stack( [ testItem[0] for testItem in testSubSet ] ).to(TCfg.device)
     colImgs, probs, dists = generateDiffImages(testImages, layout=4)
-    for im in range(nofIm) :
-        testItem = testSet[im]
-        print(f"Index: ({testItem[1], testItem[2]})")
+    testIndeces = []
+    for im in range(len(testSubSet)) :
+        testItem = testSubSet[im]
+        testIndeces.append(testItem[1])
+        print(f"Index: ({testItem[1]})")
         print(f"Probabilities. Org: {probs[im,0]:.3e},  Gen: {probs[im,2]:.3e},  Pre: {probs[im,1]:.3e}.")
         print(f"Distances. Rec: {dists[im,0]:.4e},  MSE: {dists[im,1]:.4e},  L1L: {dists[im,2]:.4e}.")
         plotImage(colImgs[im].squeeze().cpu())
+    return testIndeces
+
+
 
 
 def freeGPUmem() :
@@ -1630,36 +1640,3 @@ def freeGPUmem() :
 
 
 
-
-#examplesDb[2] = [(2348095, 1684)
-#                ,(1958164,1391)
-#                ,(1429010,666)
-#                ,(1271101, 570)
-#                ,(1271426,1140)
-#                ,(4076914,1642)
-#                ,(2880692,530)
-#                ,(1333420,160)
-#                ,(102151, 418)
-#                ]
-#examplesDb[4] = [(2348095, 1684)
-#                ,(1958164,1391)
-#                ,(1429010,666)
-#                ,(1298309, 1015)
-#                ,(1907990, 1545)
-#                ,(2963058,233)
-#                ,(200279,41)
-#                ,(102151, 418)
-#                ]
-#examplesDb[8] = [(2348095, 1684)
-#                ,(1909160,333)
-#                ,(2489646, 1240)
-#                #,(5592152, 2722)
-#                ,(1429010,666)
-#                ,(152196,251)
-#                ,(1707893,914)
-#                ,(102151, 418)]
-#examplesDb[16] = [ (2348095, 1684)
-#                 , (1958164,1391)
-#                 , (1429010,666)
-#                 #, (1831107,164)
-#                 , (102151, 418)]
