@@ -1024,8 +1024,8 @@ def summarizeSet(dataloader, onPrep=True, storesPerIm=None):
                 D_losses.append( nofIm * subD_loss )
                 GA_losses.append( nofIm * subGA_loss )
                 GD_losses.append( nofIm * subGD_loss )
-                Real_probs.append( nofIm * rprob)
-                Fake_probs.append( nofIm * fprob)
+                Real_probs.append(rprob)
+                Fake_probs.append(fprob)
 
     MSE_diff = sum(MSE_diffs) / totalNofIm
     L1L_diff = sum(L1L_diffs) / totalNofIm
