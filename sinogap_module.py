@@ -12,6 +12,7 @@ from enum import Enum
 
 import math
 import statistics
+from cv2 import norm
 import numpy as np
 import torch
 import torch.nn as nn
@@ -960,7 +961,8 @@ def loss_Gen(y_true, y_pred, p_true, p_pred, weights=None, normalizeRec=None):
 
 def summarizeSet(dataloader, onPrep=True, storesPerIm=None):
 
-    MSE_diffs, L1L_diffs, Rec_diffs, Real_probs, Fake_probs = [], [], [], [], []
+    MSE_diffs, L1L_diffs, Rec_diffs = [], [], []
+    Real_probs, Fake_probs, GA_losses, GD_losses, D_losses = [], [], [], [], []
     totalNofIm = 0
     generator.to(TCfg.device)
     #generator.train()
@@ -979,6 +981,8 @@ def summarizeSet(dataloader, onPrep=True, storesPerIm=None):
             totalNofIm += nofIm
             procImages, procData = imagesPreProc(images)
             genImages = procImages.clone()
+            fprobs = torch.zeros((nofIm,1), device=TCfg.device)
+            rprobs = torch.zeros((nofIm,1), device=TCfg.device)
 
             rprob = fprob = 0
             for i in range(TCfg.batchSplit) :
@@ -989,14 +993,16 @@ def summarizeSet(dataloader, onPrep=True, storesPerIm=None):
                               generator.generatePatches(subProcImages)
                 genImages[subRange,:,DCfg.gapRngX] = patchImages
                 if not noAdv :
-                    rprobs = discriminator(subProcImages)
-                    if storesPerIm[3] is not None :
-                        storesPerIm[3].extend(rprobs.tolist())
-                    rprob += rprobs.sum().item()
-                    fprobs = discriminator(genImages[subRange,...])
-                    if storesPerIm[4] is not None :
-                        storesPerIm[4].extend(fprobs.tolist())
-                    fprob += fprobs.sum().item()
+                    subRprobs = discriminator(subProcImages)
+                    #if storesPerIm[3] is not None :
+                    #    storesPerIm[3].extend(rprobs.tolist())
+                    rprobs[subRange,...] = subRprobs
+                    rprob += subRprobs.sum().item()
+                    subFprobs = discriminator(genImages[subRange,...])
+                    #if storesPerIm[4] is not None :
+                    #    storesPerIm[4].extend(fprobs.tolist())
+                    fprobs[subRange,...] = subFprobs
+                    fprob += subFprobs.sum().item()
             procImages = imagesPostProc(genImages, procData)
             MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages[DCfg.gapRng]
                                               ,storePerIm = storesPerIm[2]))
@@ -1005,16 +1011,33 @@ def summarizeSet(dataloader, onPrep=True, storesPerIm=None):
             Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], procImages[DCfg.gapRng]
                                               ,storePerIm = storesPerIm[0]
                                               ,normalizeRec=calculateNorm(images)))
-            Real_probs.append(rprob)
-            Fake_probs.append(fprob)
+            if not noAdv :
+                labelsTrue = torch.full((nofIm, 1),  1 - TCfg.labelSmoothFac,
+                            dtype=torch.float, device=TCfg.device, requires_grad=False)
+                labelsFalse = torch.full((nofIm, 1),  TCfg.labelSmoothFac,
+                            dtype=torch.float, device=TCfg.device, requires_grad=False)
+                labelsDis = torch.cat( (labelsTrue, labelsFalse), dim=0).to(TCfg.device).requires_grad_(False)
+                subD_loss = loss_Adv(labelsDis, torch.cat((rprobs, fprobs), dim=0))
+                subGA_loss, subGD_loss = loss_Gen(labelsTrue, fprobs,
+                                                  images[DCfg.gapRng], procImages[DCfg.gapRng],
+                                                  normalizeRec=calculateNorm(images))
+                D_losses.append( nofIm * subD_loss )
+                GA_losses.append( nofIm * subGA_loss )
+                GD_losses.append( nofIm * subGD_loss )
+                Real_probs.append( nofIm * rprob)
+                Fake_probs.append( nofIm * fprob)
 
     MSE_diff = sum(MSE_diffs) / totalNofIm
     L1L_diff = sum(L1L_diffs) / totalNofIm
     Rec_diff = sum(Rec_diffs) / totalNofIm
     Real_prob = sum(Real_probs) / totalNofIm if not noAdv else 0
     Fake_prob = sum(Fake_probs) / totalNofIm if not noAdv else 0
+    D_loss = sum(D_losses) / totalNofIm if not noAdv else 0
+    GA_loss = sum(GA_losses) / totalNofIm if not noAdv else 0
+    GD_loss = sum(GD_losses) / totalNofIm if not noAdv else 0
+
     print (f"Summary. Rec: {Rec_diff:.3e}, MSE: {MSE_diff:.3e}, L1L: {L1L_diff:.3e}, Dis: {Real_prob:.3e}, Gen: {Fake_prob:.3e}.")
-    return Rec_diff, MSE_diff, L1L_diff, Real_prob, Fake_prob
+    return Rec_diff, MSE_diff, L1L_diff, Real_prob, Fake_prob, D_loss, GA_loss, GD_loss
 
 
 def generateDiffImages(images, layout=None) :
@@ -1446,6 +1469,11 @@ testLoader=None
 normTestMSE=1
 normTestL1L=1
 normTestRec=1
+normTestDis=1
+normTestGen=1
+normTestGDloss=1
+normTestGAloss=1
+normTestDloss=1
 resAcc = TrainResClass()
 
 def train(savedCheckPoint):
@@ -1515,7 +1543,8 @@ def train(savedCheckPoint):
                 writer.add_scalars("Losses per iter",
                                    {'Dis': trainRes.lossD
                                    ,'Gen': trainRes.lossGA
-                                   ,'Rec': lossAdvCoef * trainRes.lossGA + lossDifCoef * trainRes.lossGD * normRec
+                                   ,'Rec':   lossAdvCoef * trainRes.lossGA \
+                                           + lossDifCoef * trainRes.lossGD * normRec
                                    }, imer )
                 writer.add_scalars("Distances per iter",
                                    {'MSE': trainRes.lossMSE
@@ -1579,13 +1608,23 @@ def train(savedCheckPoint):
                            }, epoch )
         lastGdLossTrain = resAcc.lossGD
 
-        Rec_test, MSE_test, L1L_test, Gen_test, Dis_test = summarizeSet(testLoader, False)
+        Rec_test, MSE_test, L1L_test, Rprob_test, Fprob_test, Dloss_test, GAloss_test, GDloss_test \
+            = summarizeSet(testLoader, False)
         writer.add_scalars("Test per epoch",
                            {'MSE': MSE_test / normTestMSE
                            ,'L1L': L1L_test / normTestL1L
                            ,'REC': Rec_test / normTestRec
                            #,'Dis': Dis_test
                            #,'Gen': Gen_test
+                           }, epoch )
+        writer.add_scalars("Test losses per epoch",
+                           { 'Dis': Dloss_test
+                           , 'Adv': GAloss_test
+                           , 'Gen': lossAdvCoef * GAloss_test + lossDifCoef * GDloss_test
+                           }, epoch )
+        writer.add_scalars("Test probs per epoch",
+                           {'Ref': Rprob_test
+                           ,'Gen': Fprob_test
                            }, epoch )
 
         lastGdLoss = Rec_test
