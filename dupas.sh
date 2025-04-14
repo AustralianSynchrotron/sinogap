@@ -17,7 +17,7 @@ rm -rf runs/experiment_$devNum/
 cp -v -r ${iDir}/logs runs/experiment_$devNum
 cp -v ${iDir}/checkPoint.pth checkPoint_${devNum}.pth 
 cp -v ${iDir}/train.hdf train_${devNum}.hdf 
-cp -v ${iDir}/sinogap.ipynb sinogap_${devNum}.ipynb
+cp -v ${iDir}/sinogap.ipynb sinogap${devNum}.ipynb
 cp -v ${iDir}/model_gen.pt model_${devNum}_gen.pt
 
 
