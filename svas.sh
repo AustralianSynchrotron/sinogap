@@ -16,11 +16,12 @@ fi
 oDir="${2}"
 
 mkdir -p "$oDir"
-ls sinogap_module*.py *_${iMask}* sinogap${iMask}.ipynb  | 
+ls sinogap_module*.py *${iMask}*  | 
 while read flnm ; do
   onm=$(sed "s:${iMask}::g" <<< "${flnm}" )
   cp -Lvr "$flnm" "$oDir/$onm"
 done
+cp -Lv "sinogap${iMask:1}.ipynb" "$oDir/sinogap.ipynb"
 #echo cp -r sinogap_module.py *${iMask}* "$oDir"
 #cp -rf runs/*${iMask}/* "$oDir/logs"
 rsync -av runs/*${iMask}/ "$oDir/logs"

@@ -29,6 +29,8 @@ import h5py
 import tifffile
 import tqdm
 
+import ssim
+
 
 def initIfNew(var, val=None) :
     if var in locals() :
@@ -907,14 +909,13 @@ def saveModels(path="") :
     save_model(discriminator, model_path = ( path if path else f"model_{TCfg.exec}" ) + "_dis.pt"  )
 
 
-def createCriteria() :
-    BCE = nn.BCELoss(reduction='none')
-    MSE = nn.MSELoss(reduction='none')
-    L1L = nn.L1Loss(reduction='none')
-    return BCE, MSE, L1L
-BCE, MSE, L1L = createCriteria()
+BCE = nn.BCELoss(reduction='none')
+MSE = nn.MSELoss(reduction='none')
+L1L = nn.L1Loss(reduction='none')
+SSIM = ssim.SSIM(data_range=2.0, size_average=False, channel=1, win_size=3)
 lossDifCoef = 0
 lossAdvCoef = 1.0
+ADV_DIF = 1
 
 def applyWeights(inp, weights, storePerIm=None):
     inp = inp.squeeze()
@@ -936,16 +937,28 @@ def loss_MSE(p_true, p_pred, weights=None, storePerIm=None):
     loss = MSE(p_pred, p_true).mean(dim=(-1,-2))
     return applyWeights(loss, weights, storePerIm=storePerIm)
 
+def loss_SSIM(p_true, p_pred, weights=None):
+    p_true, _ = unsqeeze4dim(p_true)
+    p_pred, _ = unsqeeze4dim(p_pred)
+    loss = (1 - SSIM( p_true+0.5, p_pred+0.5 ) ) / 2
+    return applyWeights(loss, weights)
+
 def loss_L1L(p_true, p_pred, weights=None, storePerIm=None):
-    loss = L1L(p_pred, p_true).mean(dim=(-1,-2))
-    return applyWeights(loss, weights, storePerIm=storePerIm)
+    return loss_SSIM(p_true, p_pred, weights)
+    #loss = L1L(p_pred, p_true).mean(dim=(-1,-2))
+    #return applyWeights(loss, weights, storePerIm=storePerIm)
+
 
 eDinfo = None
+SSIM_MSE = 0
 def loss_Rec(p_true, p_pred, weights=None, storePerIm=None, normalizeRec=None):
     global eDinfo
-    loss = MSE(p_pred, p_true).mean(dim=(-1,-2))
+    mse = MSE(p_pred, p_true).mean(dim=(-1,-2))
+    ssim = (1 - SSIM( unsqeeze4dim(p_true)[0]+0.5, unsqeeze4dim(p_pred)[0]+0.5 ) ) / 2
+    loss = ( 1 - SSIM_MSE ) * mse.view(-1) + \
+           SSIM_MSE * ssim.view(-1) #* (normTestMSE/normTestSSIM)
     if normalizeRec is not None :
-        loss *= normalizeRec
+        loss *= normalizeRec.view(-1)
     if loss.dim() :
         hDindex = loss.argmax()
         lDindex = loss.argmin()
@@ -1027,9 +1040,9 @@ def summarizeSet(dataloader, onPrep=True, storesPerIm=None):
                 Real_probs.append(rprob)
                 Fake_probs.append(fprob)
 
-    MSE_diff = sum(MSE_diffs) / totalNofIm
-    L1L_diff = sum(L1L_diffs) / totalNofIm
-    Rec_diff = sum(Rec_diffs) / totalNofIm
+    MSE_diff = sum(MSE_diffs).item() / totalNofIm
+    L1L_diff = sum(L1L_diffs).item() / totalNofIm
+    Rec_diff = sum(Rec_diffs).item() / totalNofIm
     Real_prob = sum(Real_probs) / totalNofIm if not noAdv else 0
     Fake_prob = sum(Fake_probs) / totalNofIm if not noAdv else 0
     D_loss = sum(D_losses) / totalNofIm if not noAdv else 0
@@ -1292,6 +1305,7 @@ def loadCheckPoint(path, generator, discriminator,
 
 trainInfo = TrainInfoClass()
 normMSE=1
+normSSIM=1
 normL1L=1
 normRec=1
 skipDis = False
@@ -1385,7 +1399,7 @@ def train_step(images):
             subGA_loss, subGD_loss = loss_Gen(labelsTrue, subPred_fakeG,
                                               procImages[subRange,:,DCfg.gapRngX], subFakeImages[DCfg.gapRng],
                                               wghts, normalizeRec=normDiff[subRange,...])
-            subG_loss = lossAdvCoef * subGA_loss + lossDifCoef * subGD_loss
+            subG_loss = ADV_DIF * subGA_loss + (1-ADV_DIF) * subGD_loss
             pred_fake[subRange] = subPred_fakeG.clone().detach()
         # train generator only if it is not too good :
         #if noAdv  or  subPred_fakeD.mean() < pred_real[subRange].mean() :
@@ -1467,6 +1481,7 @@ def afterReport() :
 dataLoader=None
 testLoader=None
 normTestMSE=1
+normTestSSIM=1
 normTestL1L=1
 normTestRec=1
 normTestDis=1
@@ -1543,8 +1558,8 @@ def train(savedCheckPoint):
                 writer.add_scalars("Losses per iter",
                                    {'Dis': trainRes.lossD
                                    ,'Gen': trainRes.lossGA
-                                   ,'Rec':   lossAdvCoef * trainRes.lossGA \
-                                           + lossDifCoef * trainRes.lossGD * normRec
+                                   ,'Rec': ADV_DIF * trainRes.lossGA \
+                                           + (1-ADV_DIF) * trainRes.lossGD * normRec
                                    }, imer )
                 writer.add_scalars("Distances per iter",
                                    {'MSE': trainRes.lossMSE
@@ -1594,7 +1609,7 @@ def train(savedCheckPoint):
         writer.add_scalars("Losses per epoch",
                            {'Dis': resAcc.lossD
                            ,'Adv': resAcc.lossGA
-                           ,'Gen': lossAdvCoef * resAcc.lossGA + lossDifCoef * resAcc.lossGD
+                           ,'Gen': ADV_DIF * resAcc.lossGA + (1-ADV_DIF) * resAcc.lossGD
                            }, epoch )
         writer.add_scalars("Distances per epoch",
                            {'MSE': resAcc.lossMSE
@@ -1620,7 +1635,7 @@ def train(savedCheckPoint):
         writer.add_scalars("Test losses per epoch",
                            { 'Dis': Dloss_test
                            , 'Adv': GAloss_test
-                           , 'Gen': lossAdvCoef * GAloss_test + lossDifCoef * GDloss_test
+                           , 'Gen': ADV_DIF * GAloss_test + (1-ADV_DIF) * GDloss_test
                            }, epoch )
         writer.add_scalars("Test probs per epoch",
                            {'Ref': Rprob_test

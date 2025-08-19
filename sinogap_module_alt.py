@@ -12,6 +12,7 @@ from enum import Enum
 
 import math
 import statistics
+from cv2 import norm
 import numpy as np
 import torch
 import torch.nn as nn
@@ -25,8 +26,11 @@ import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.image import imread, imsave
 import h5py
+from h5py import h5d
 import tifffile
 import tqdm
+
+import ssim
 
 
 def initIfNew(var, val=None) :
@@ -64,7 +68,6 @@ TCfg = initIfNew('TCfg')
 class DCfgClass:
     gapW : int
     sinoSh : tuple = field(repr = True, init = False)
-    readSh : tuple = field(repr = True, init = False)
     sinoSize : int = field(repr = True, init = False)
     gapSh : tuple = field(repr = True, init = False)
     gapSize : int = field(repr = True, init = False)
@@ -72,8 +75,7 @@ class DCfgClass:
     gapRng : type(np.s_[:]) = field(repr = True, init = False)
     disRng : type(np.s_[:]) = field(repr = True, init = False)
     def __post_init__(self):
-        self.sinoSh = (5*self.gapW,5*self.gapW)
-        self.readSh = (80, 80)
+        self.sinoSh = (256*self.gapW,5*self.gapW)
         self.sinoSize = math.prod(self.sinoSh)
         self.gapSh = (self.sinoSh[0],self.gapW)
         self.gapSize = math.prod(self.gapSh)
@@ -285,6 +287,78 @@ def addToHDF(filename, containername, data) :
     return 0
 
 
+
+def loadImage(imageName, expectedShape=None) :
+    if not imageName:
+        return None
+    #imdata = imread(imageName).astype(np.float32)
+    imdata = tifffile.imread(imageName).astype(np.float32)
+    if len(imdata.shape) == 3 :
+        imdata = np.mean(imdata[:,:,0:3], 2)
+    if not expectedShape is None  and  imdata.shape != expectedShape :
+        raise Exception(f"Dimensions of the input image \"{imageName}\" {imdata.shape} "
+                        f"do not match expected shape {expectedShape}.")
+    return imdata
+
+
+def getInData(inputString, verbose=False, preread=False):
+    nameSplit = inputString.split(':')
+    if len(nameSplit) != 2 :
+        raise Exception(f"String \"{inputString}\" does not represent an HDF5 format \"fileName:container\".")
+    hdfName = nameSplit[0]
+    hdfVolume = nameSplit[1]
+    try :
+        trgH5F =  h5py.File(hdfName,'r', swmr=True)
+    except :
+        raise Exception(f"Failed to open HDF file '{hdfName}'.")
+    if  hdfVolume not in trgH5F.keys():
+        raise Exception(f"No dataset '{hdfVolume}' in input file {hdfName}.")
+    data = trgH5F[hdfVolume]
+    if not data.size :
+        raise Exception(f"Container \"{inputString}\" is zero size.")
+    sh = data.shape
+    if len(sh) != 3 :
+        raise Exception(f"Dimensions of the container \"{inputString}\" is not 3: {sh}.")
+    try : # try to mmap hdf5 if it is in memory
+        mmapPrefixes = os.environ["CTAS_MMAP_PATH"].split(':')
+        mmapPrefixes.append["/dev/shm"]
+        residesInMemory = False
+        for mmapPrefix in mmapPrefixes :
+            if hdfName.startswith(mmapPrefix) :
+                residesInMemory = True
+        if not residesInMemory :
+            raise Exception()
+        fileSize = trgH5F.id.get_filesize()
+        offset = data.id.get_offset()
+        dtype = data.id.dtype
+        plist = data.id.get_create_plist()
+        if offset < 0 \
+        or not plist.get_layout() in (h5d.CONTIGUOUS, h5d.CONTIGUOUS) \
+        or plist.get_external_count() \
+        or plist.get_nfilters() \
+        or fileSize - offset < math.prod(sh) * data.dtype().itemsize() :
+            raise Exception()
+        # now all is ready
+        hdfName = os.path.realpath(hdfName)
+        dataN = np.memmap(hdfName, shape=sh, dtype=dtype, mode='r', offset=offset)
+        data = dataN
+        trgH5F.close()
+        #plist = trgH5F.id.get_access_plist()
+        #fileno = trgH5F.id.get_vfd_handle(plist)
+        #dataM = mmap.mmap(fileno, fileSize, offset=offset, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
+    except :
+        if preread :
+            dataN = np.empty(data.shape, dtype=np.float32)
+            if verbose :
+                print("Reading input ... ", end="", flush=True)
+            data.read_direct(dataN)
+            if verbose :
+                print("Done.")
+            data = dataN
+            trgH5F.close()
+    return data
+
+
 def createWriter(logDir, addToExisting=False) :
     if not addToExisting and os.path.exists(logDir) :
         raise Exception(f"Log directory \"{logDir}\" for the experiment already exists."
@@ -293,59 +367,36 @@ def createWriter(logDir, addToExisting=False) :
 writer = initIfNew('writer')
 
 
+class DevicePlace:
+    def __call__(self, x):
+        return x.to(TCfg.device)
+
 class StripesFromHDF :
 
-    def __init__(self, sampleName, maskName, bgName=None, dfName=None, loadToMem=True):
+    def __init__(self, sampleName, maskName, loadToMem=True):
 
-        sampleHDF = sampleName.split(':')
-        if len(sampleHDF) != 2 :
-            raise Exception(f"String \"{sampleName}\" does not represent an HDF5 format.")
-        with h5py.File(sampleHDF[0],'r') as trgH5F:
-            if  sampleHDF[1] not in trgH5F.keys():
-                raise Exception(f"No dataset '{sampleHDF[1]}' in input file {sampleHDF[0]}.")
-            self.data = trgH5F[sampleHDF[1]]
-            if not self.data.size :
-                raise Exception(f"Container \"{sampleName}\" is zero size.")
-            self.sh = self.data.shape
-            if len(self.sh) != 3 :
-                raise Exception(f"Dimensions of the container \"{sampleName}\" is not 3 {self.sh}.")
-            self.fsh = self.sh[1:3]
-            self.volume = None
-            if loadToMem :
-                self.volume = np.empty(self.sh, dtype=np.float32)
-                self.data.read_direct(self.volume)
-                trgH5F.close()
+        self.volume = getInData(sampleName, False, False)
+        self.sh = self.volume.shape
+        self.fsh = self.sh[1:3]
 
-            def loadImage(imageName) :
-                if not imageName:
-                    return None
-                imdata = imread(imageName).astype(np.float32)
-                if len(imdata.shape) == 3 :
-                    imdata = np.mean(imdata[:,:,0:3], 2)
-                if imdata.shape != self.fsh :
-                    raise Exception(f"Dimensions of the input image \"{imageName}\" {imdata.shape} "
-                                    f"do not match the face of the container \"{sampleName}\" {self.fsh}.")
-                return imdata
-
-            self.mask = loadImage(maskName)
-            if self.mask is None :
-                self.mask = np.ones(self.fsh, dtype=np.uint8)
-            self.mask = self.mask.astype(bool)
-            self.bg = loadImage(bgName)
-            self.df = loadImage(dfName)
-            if self.bg is not None :
-                if self.df is not None:
-                    self.bg -= self.df
-                self.mask  &=  self.bg > 0.0
-
-            self.forbidenSinos = self.mask
-            self.forbidenSinos[:, -DCfg.readSh[-1]:] = 0
-            for yCr in range(0,self.fsh[0]) :
-                for xCr in range(0,self.fsh[1]) :
-                    idx = np.s_[yCr,xCr]
-                    if not self.mask[idx] :
-                        self.forbidenSinos[ yCr, max(0, xCr-DCfg.readSh[1]) : xCr ] = 0
-            self.availableSinos = np.count_nonzero(self.forbidenSinos)
+        self.mask = loadImage(maskName)
+        if self.mask is None :
+            self.mask = np.ones(self.fsh, dtype=np.uint8)
+        self.mask = self.mask.astype(bool)
+        #self.bg = loadImage(bgName)
+        #self.df = loadImage(dfName)
+        #if self.bg is not None :
+        #    if self.df is not None:
+        #        self.bg -= self.df
+        #    self.mask  &=  self.bg > 0.0
+        self.forbidenSinos = self.mask
+        self.forbidenSinos[:, -DCfg.sinoSh[-1]:] = 0
+        for yCr in range(0,self.fsh[0]) :
+            for xCr in range(0,self.fsh[1]) :
+                idx = np.s_[yCr,xCr]
+                if not self.mask[idx] :
+                    self.forbidenSinos[ yCr, max(0, xCr-DCfg.sinoSh[-1]) : xCr ] = 0
+        self.availableSinos = np.count_nonzero(self.forbidenSinos)
 
 
     def __len__(self):
@@ -354,31 +405,20 @@ class StripesFromHDF :
 
     def __getitem__(self, index=None):
 
-        if type(index) is tuple and len(index) == 4 :
-            zdx, ydx, xdx, sinoHeight = index
+        if type(index) is tuple and len(index) == 3 :
+            ydx, xdx, sinoHeight = index
         else :
             while True:
                 ydx = random.randint(0,self.fsh[0]-1)
-                xdx = random.randint(0,self.fsh[1]-DCfg.readSh[-1]-1)
+                xdx = random.randint(0,self.fsh[1]-DCfg.sinoSh[-1]-1)
                 if self.forbidenSinos[ydx,xdx] :
                     break
-            sinoHeight = DCfg.readSh[0] if random.randint(0,1) else \
-                random.randint(DCfg.readSh[0]+1, self.sh[0])
-            zdx = random.randint(0,self.sh[0]-sinoHeight)
-        idx = np.s_[ ydx , xdx : xdx + DCfg.readSh[-1] ]
-
-        if self.volume is not None :
-            data = self.volume[zdx:zdx+sinoHeight, *idx ]
-        else :
-            data = self.data[zdx:zdx+sinoHeight, *idx ]
-            if self.df is not None :
-                data -= self.df[None,*idx]
-            if self.bg is not None :
-                data /= self.bg[None,*idx]
-        return (data, (zdx, ydx, xdx, sinoHeight) )
+        idx = np.s_[ ydx , xdx : xdx + DCfg.sinoSh[-1] ]
+        data = self.volume[..., *idx ]
+        return (data, (ydx, xdx, data.shape[0]) )
         #data = torch.from_numpy(data).clone().unsqueeze(0).to(TCfg.device)
-        #if sinoHeight != DCfg.readSh[0] :
-        #    data = torch.nn.functional.interpolate(data.unsqueeze(0), size=DCfg.readSh,mode='bilinear').squeeze(0)
+        #if sinoHeight != DCfg.sinoSh[0] :
+        #    data = torch.nn.functional.interpolate(data.unsqueeze(0), size=DCfg.sinoSh,mode='bilinear').squeeze(0)
 
 
 
@@ -387,7 +427,9 @@ class StripesFromHDF :
         class Sinos(torch.utils.data.Dataset) :
             def __init__(self, root, transform=None):
                 self.container = root
-                self.oblTransform = transforms.Compose( [ transforms.ToTensor(), transforms.Resize(DCfg.readSh)] )
+                self.oblTransform = transforms.Compose( [transforms.ToTensor(),
+                                                         DevicePlace(),
+                                                         transforms.Resize(DCfg.sinoSh)] )
                 self.transform = transform
             def __len__(self):
                 return self.container.__len__()
@@ -408,15 +450,15 @@ class StripesFromHDFs :
         for base in bases :
             print(f"Loading train set {len(self.collection)+1} of {len(bases)}: " + base + " ... ", end="")
             self.collection.append(
-                StripesFromHDF(f"storage/{base}.hdf:/data", f"storage/{base}.mask++.tif", None, None) )
+                StripesFromHDF(f"storage/{base}.hdf:/data", f"storage/{base}.mask++.tif") )
             print("Done")
 
 
     def __getitem__(self, index=None):
 
-        if type(index) is tuple and len(index) == 5 :
-            setdx, zdx, ydx, xdx, sinoHeight = index
-            return self.collection[setdx].__getitem__((setdx, zdx, ydx, xdx, sinoHeight))
+        if type(index) is tuple and len(index) == 4 :
+            setdx, ydx, xdx, sinoHeight = index
+            return self.collection[setdx].__getitem__((setdx, ydx, xdx, sinoHeight))
         else :
             cindex = random.randint(0,len(self)-1)
             leftover = cindex
@@ -440,7 +482,9 @@ class StripesFromHDFs :
         class Sinos(torch.utils.data.Dataset) :
             def __init__(self, root, transform=None):
                 self.container = root
-                self.oblTransform = transforms.Compose( [ transforms.ToTensor(), transforms.Resize(DCfg.readSh)] )
+                self.oblTransform = transforms.Compose( [transforms.ToTensor(),
+                                                         DevicePlace(),
+                                                         transforms.Resize(DCfg.sinoSh)] )
                 self.transform = transform
             def __len__(self):
                 return self.container.__len__()
@@ -532,7 +576,7 @@ examplesDb[16] = [
 examples = initIfNew('examples')
 
 
-listOfTrainData = [ "18515.Lamb1_Eiger_7m_45keV_360Scan"
+listOfTrainData = [ "18515.Lamb1_Eiger_7m_45keV_360Scan"#, ]
                   , "18692a.ExpChicken6mGyShift"
                   , "18692b_input_PhantomM"
                   , "18692b.MinceO"
@@ -597,7 +641,9 @@ class PrepackedHDF :
             def __len__(self):
                 return self.container.sh[0]
 
-            def __getitem__(self, index, doTransform=True):
+            def __getitem__(self, index=None, doTransform=True):
+                if index is None :
+                    index = random.randint(0,self.container.volume.shape[0]-1)
                 data=self.container.volume[index,...]
                 data = torch.from_numpy(data).clone().unsqueeze(0)
                 if doTransform :
@@ -629,6 +675,7 @@ def createReferences(tSet, toShow = 0) :
     ])
     refImages = torch.stack( [ mytransforms(tSet.__getitem__(ex, doTransform=False)[0])
                                for ex in examples ] ).to(TCfg.device)
+    #refImages = torch.stack( [ tSet.__getitem__(ex, doTransform=False)[0] for ex in examples ] ).to(TCfg.device)
     refNoises = torch.randn((refImages.shape[0],TCfg.latentDim)).to(TCfg.device)
     return refImages, refNoises
 refImages = initIfNew('refImages')
@@ -654,6 +701,8 @@ def showMe(tSet, item=None) :
     image = image.to(TCfg.device)
 
 
+save_interim = None
+
 
 class GeneratorTemplate(nn.Module):
 
@@ -661,15 +710,16 @@ class GeneratorTemplate(nn.Module):
         super(GeneratorTemplate, self).__init__()
 
         self.gapW = gapW
-        self.sinoSh = (5*self.gapW,5*self.gapW) # 10,10
+        self.sinoSh = (256*self.gapW,5*self.gapW) # 10,10
         self.sinoSize = math.prod(self.sinoSh)
         self.gapSh = (self.sinoSh[0],self.gapW)
         self.gapSize = math.prod(self.gapSh)
         self.gapRngX = np.s_[ self.sinoSh[1]//2 - self.gapW//2 : self.sinoSh[1]//2 + self.gapW//2 ]
         self.gapRng = np.s_[...,self.gapRngX]
         self.latentChannels = latentChannels
-        self.baseChannels = 64
-        #self.amplitude = nn.Parameter(torch.ones(1))
+        self.baseChannels = 4
+        self.amplitude = 4
+        self.lowResGenerator = None
 
 
     def createLatent(self) :
@@ -684,15 +734,12 @@ class GeneratorTemplate(nn.Module):
         return toRet
 
 
-    def encblock(self, chIn, chOut, kernel, stride=1, norm=False, dopadding=False) :
+    def encblock(self, chIn, chOut, kernel, stride=1, norm=False, padding=0) :
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
-        layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias=True,
-                                padding='same', padding_mode='reflect') \
-                                if stride == 1 and dopadding else \
-                                nn.Conv2d(chIn, chOut, kernel, stride=stride, bias=True)
-                     )
+        layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias = not norm,
+                                padding=padding, padding_mode='reflect')  )
         if norm :
             layers.append(nn.BatchNorm2d(chOut))
         layers.append(nn.LeakyReLU(0.2))
@@ -700,15 +747,12 @@ class GeneratorTemplate(nn.Module):
         return torch.nn.Sequential(*layers)
 
 
-    def decblock(self, chIn, chOut, kernel, stride=1, norm=False, dopadding=False) :
+    def decblock(self, chIn, chOut, kernel, stride=1, norm=False, padding=0, outputPadding=0) :
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
-        layers.append( nn.ConvTranspose2d(chIn, chOut, kernel, stride, bias=True,
-                                          padding=1) \
-                       if stride == 1 and dopadding else \
-                       nn.ConvTranspose2d(chIn, chOut, kernel, stride, bias=True)
-                      )
+        layers.append( nn.ConvTranspose2d(chIn, chOut, kernel, stride=stride, bias = not norm,
+                                          padding=padding, padding_mode='zeros', output_padding=outputPadding) )
         if norm :
             layers.append(nn.BatchNorm2d(chOut))
         layers.append(nn.LeakyReLU(0.2))
@@ -766,23 +810,32 @@ class GeneratorTemplate(nn.Module):
             res[...,0] += 2*images[...,self.gapRngX.start-1] + images[...,self.gapRngX.stop]
             res[...,1] += 2*images[...,self.gapRngX.stop] + images[...,self.gapRngX.start-1]
             res /= 3
-        elif self.gapW//2 in lowResGenerators :
-            preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
-            # lowRes generator to be trained if they are parts of the generator
-            with torch.set_grad_enabled(hasattr(self, 'lowResGen')) :
-                res = lowResGenerators[self.gapW//2].generatePatches(preImages)
-                res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
-        else :
+        elif self.lowResGenerator is None and not self.gapW//2 in lowResGenerators :
             res = torch.zeros(images[self.gapRng].shape, device=images.device, requires_grad=False)
+        else :
+            preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
+            # lowRes generator to be trained if they are a part of the generator
+            lrGen = lowResGenerators[self.gapW//2] if self.lowResGenerator is None else self.lowResGenerator
+            with torch.set_grad_enabled(not self.lowResGenerator is None) :
+                res = lrGen.generatePatches(preImages)
+                res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
         return squeezeOrg(res, orgDims)
 
 
     def forward(self, input):
 
+        if not save_interim is None :
+            save_interim[self.gapW] = {}
+
         images, noises = input
+        if not save_interim is None :
+            save_interim[self.gapW]['input'] = images.clone().detach()
         images, orgDims = unsqeeze4dim(images)
         modelIn = images.clone()
         modelIn[self.gapRng] = self.preProc(images)
+        if not save_interim is None :
+            save_interim[self.gapW]['preproc'] = modelIn.clone().detach()
+        stDev = modelIn.std(dim=(-1,-2))[...,None,None]
 
         if self.latentChannels :
             latent = self.noise2latent(noises)
@@ -792,12 +845,16 @@ class GeneratorTemplate(nn.Module):
         for encoder in self.encoders :
             dwTrain.append(encoder(dwTrain[-1]))
         mid = self.fcLink(dwTrain[-1])
+        #return mid
         upTrain = [mid]
         for level, decoder in enumerate(self.decoders) :
             upTrain.append( decoder( torch.cat( (upTrain[-1], dwTrain[-1-level]), dim=1 ) ) )
         res = self.lastTouch(torch.cat( (upTrain[-1], modelIn ), dim=1 ))
 
-        patches = modelIn[self.gapRng] + 2 * res[self.gapRng]
+        patches = modelIn[self.gapRng] + self.amplitude * stDev * res[self.gapRng]
+        if not save_interim is None :
+            save_interim[self.gapW]['output'] = save_interim[self.gapW]['input'].clone()
+            save_interim[self.gapW]['output'][self.gapRng] = patches.clone().detach()
         return squeezeOrg(patches, orgDims)
 
 
@@ -867,8 +924,6 @@ def createOptimizer(model, lr) :
     )
 optimizer_G = initIfNew('optimizer_G')
 optimizer_D = initIfNew('optimizer_D')
-scheduler_G = initIfNew('scheduler_G')
-scheduler_D = initIfNew('scheduler_D')
 
 
 def restoreCheckpoint(path=None, logDir=None) :
@@ -882,7 +937,7 @@ def restoreCheckpoint(path=None, logDir=None) :
         except : pass
         return 0, 0, 0, 1, 0, TrainResClass()
     else :
-        return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D, scheduler_G, scheduler_D)
+        return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D)
 
 
 def saveModels(path="") :
@@ -890,14 +945,13 @@ def saveModels(path="") :
     save_model(discriminator, model_path = ( path if path else f"model_{TCfg.exec}" ) + "_dis.pt"  )
 
 
-def createCriteria() :
-    BCE = nn.BCELoss(reduction='none')
-    MSE = nn.MSELoss(reduction='none')
-    L1L = nn.L1Loss(reduction='none')
-    return BCE, MSE, L1L
-BCE, MSE, L1L = createCriteria()
+BCE = nn.BCELoss(reduction='none')
+MSE = nn.MSELoss(reduction='none')
+L1L = nn.L1Loss(reduction='none')
+SSIM = ssim.SSIM(data_range=2.0, size_average=False, channel=1, win_size=3)
 lossDifCoef = 0
 lossAdvCoef = 1.0
+ADV_DIF = 0
 
 def applyWeights(inp, weights, storePerIm=None):
     inp = inp.squeeze()
@@ -919,14 +973,28 @@ def loss_MSE(p_true, p_pred, weights=None, storePerIm=None):
     loss = MSE(p_pred, p_true).mean(dim=(-1,-2))
     return applyWeights(loss, weights, storePerIm=storePerIm)
 
+def loss_SSIM(p_true, p_pred, weights=None):
+    p_true, _ = unsqeeze4dim(p_true)
+    p_pred, _ = unsqeeze4dim(p_pred)
+    loss = (1 - SSIM( p_true+0.5, p_pred+0.5 ) ) / 2
+    return applyWeights(loss, weights)
+
 def loss_L1L(p_true, p_pred, weights=None, storePerIm=None):
-    loss = L1L(p_pred, p_true).mean(dim=(-1,-2))
-    return applyWeights(loss, weights, storePerIm=storePerIm)
+    return loss_SSIM(p_true, p_pred, weights)
+    #loss = L1L(p_pred, p_true).mean(dim=(-1,-2))
+    #return applyWeights(loss, weights, storePerIm=storePerIm)
+
 
 eDinfo = None
-def loss_Rec(p_true, p_pred, weights=None, storePerIm=None):
+SSIM_MSE = 0
+def loss_Rec(p_true, p_pred, weights=None, storePerIm=None, normalizeRec=None):
     global eDinfo
-    loss = MSE(p_pred, p_true).mean(dim=(-1,-2)).squeeze()
+    mse = MSE(p_pred, p_true).mean(dim=(-1,-2))
+    ssim = (1 - SSIM( unsqeeze4dim(p_true)[0]+0.5, unsqeeze4dim(p_pred)[0]+0.5 ) ) / 2
+    loss = ( 1 - SSIM_MSE ) * mse.view(-1) + \
+           SSIM_MSE * ssim.view(-1) #* (normTestMSE/normTestSSIM)
+    if normalizeRec is not None :
+        loss *= normalizeRec.view(-1)
     if loss.dim() :
         hDindex = loss.argmax()
         lDindex = loss.argmin()
@@ -934,15 +1002,16 @@ def loss_Rec(p_true, p_pred, weights=None, storePerIm=None):
     return applyWeights(loss, weights, storePerIm=storePerIm)
 
 
-def loss_Gen(y_true, y_pred, p_true, p_pred, weights=None):
+def loss_Gen(y_true, y_pred, p_true, p_pred, weights=None, normalizeRec=None):
     lossAdv = loss_Adv(y_true, y_pred, weights)
-    lossDif = loss_Rec(p_pred, p_true)
+    lossDif = loss_Rec(p_pred, p_true, weights, normalizeRec=normalizeRec)
     return lossAdv, lossDif
 
 
 def summarizeSet(dataloader, onPrep=True, storesPerIm=None):
 
-    MSE_diffs, L1L_diffs, Rec_diffs, Real_probs, Fake_probs = [], [], [], [], []
+    MSE_diffs, L1L_diffs, Rec_diffs = [], [], []
+    Real_probs, Fake_probs, GA_losses, GD_losses, D_losses = [], [], [], [], []
     totalNofIm = 0
     generator.to(TCfg.device)
     #generator.train()
@@ -961,6 +1030,8 @@ def summarizeSet(dataloader, onPrep=True, storesPerIm=None):
             totalNofIm += nofIm
             procImages, procData = imagesPreProc(images)
             genImages = procImages.clone()
+            fprobs = torch.zeros((nofIm,1), device=TCfg.device)
+            rprobs = torch.zeros((nofIm,1), device=TCfg.device)
 
             rprob = fprob = 0
             for i in range(TCfg.batchSplit) :
@@ -971,28 +1042,51 @@ def summarizeSet(dataloader, onPrep=True, storesPerIm=None):
                               generator.generatePatches(subProcImages)
                 genImages[subRange,:,DCfg.gapRngX] = patchImages
                 if not noAdv :
-                    rprobs = discriminator(subProcImages)
-                    if storesPerIm[3] is not None :
-                        storesPerIm[3].extend(rprobs.tolist())
-                    rprob += rprobs.sum().item()
-                    fprobs = discriminator(genImages[subRange,...])
-                    if storesPerIm[4] is not None :
-                        storesPerIm[4].extend(fprobs.tolist())
-                    fprob += fprobs.sum().item()
+                    subRprobs = discriminator(subProcImages)
+                    #if storesPerIm[3] is not None :
+                    #    storesPerIm[3].extend(rprobs.tolist())
+                    rprobs[subRange,...] = subRprobs
+                    rprob += subRprobs.sum().item()
+                    subFprobs = discriminator(genImages[subRange,...])
+                    #if storesPerIm[4] is not None :
+                    #    storesPerIm[4].extend(fprobs.tolist())
+                    fprobs[subRange,...] = subFprobs
+                    fprob += subFprobs.sum().item()
             procImages = imagesPostProc(genImages, procData)
-            MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages[DCfg.gapRng], storePerIm = storesPerIm[2]))
-            L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], procImages[DCfg.gapRng], storePerIm = storesPerIm[1]))
-            Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], procImages[DCfg.gapRng], storePerIm = storesPerIm[0]))
-            Real_probs.append(rprob)
-            Fake_probs.append(fprob)
+            MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages[DCfg.gapRng]
+                                              ,storePerIm = storesPerIm[2]))
+            L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], procImages[DCfg.gapRng]
+                                              ,storePerIm = storesPerIm[1]))
+            Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], procImages[DCfg.gapRng]
+                                              ,storePerIm = storesPerIm[0]
+                                              ,normalizeRec=calculateNorm(images)))
+            if not noAdv :
+                labelsTrue = torch.full((nofIm, 1),  1 - TCfg.labelSmoothFac,
+                            dtype=torch.float, device=TCfg.device, requires_grad=False)
+                labelsFalse = torch.full((nofIm, 1),  TCfg.labelSmoothFac,
+                            dtype=torch.float, device=TCfg.device, requires_grad=False)
+                labelsDis = torch.cat( (labelsTrue, labelsFalse), dim=0).to(TCfg.device).requires_grad_(False)
+                subD_loss = loss_Adv(labelsDis, torch.cat((rprobs, fprobs), dim=0))
+                subGA_loss, subGD_loss = loss_Gen(labelsTrue, fprobs,
+                                                  images[DCfg.gapRng], procImages[DCfg.gapRng],
+                                                  normalizeRec=calculateNorm(images))
+                D_losses.append( nofIm * subD_loss )
+                GA_losses.append( nofIm * subGA_loss )
+                GD_losses.append( nofIm * subGD_loss )
+                Real_probs.append(rprob)
+                Fake_probs.append(fprob)
 
-    MSE_diff = sum(MSE_diffs) / totalNofIm
-    L1L_diff = sum(L1L_diffs) / totalNofIm
-    Rec_diff = sum(Rec_diffs) / totalNofIm
+    MSE_diff = sum(MSE_diffs).item() / totalNofIm
+    L1L_diff = sum(L1L_diffs).item() / totalNofIm
+    Rec_diff = sum(Rec_diffs).item() / totalNofIm
     Real_prob = sum(Real_probs) / totalNofIm if not noAdv else 0
     Fake_prob = sum(Fake_probs) / totalNofIm if not noAdv else 0
+    D_loss = sum(D_losses) / totalNofIm if not noAdv else 0
+    GA_loss = sum(GA_losses) / totalNofIm if not noAdv else 0
+    GD_loss = sum(GD_losses) / totalNofIm if not noAdv else 0
+
     print (f"Summary. Rec: {Rec_diff:.3e}, MSE: {MSE_diff:.3e}, L1L: {L1L_diff:.3e}, Dis: {Real_prob:.3e}, Gen: {Fake_prob:.3e}.")
-    return Rec_diff, MSE_diff, L1L_diff, Real_prob, Fake_prob
+    return Rec_diff, MSE_diff, L1L_diff, Real_prob, Fake_prob, D_loss, GA_loss, GD_loss
 
 
 def generateDiffImages(images, layout=None) :
@@ -1002,6 +1096,7 @@ def generateDiffImages(images, layout=None) :
     pre = images.clone()
     gen = images.clone()
     with torch.no_grad() :
+        wghts = calculateWeights(images)
         generator.eval()
         pre[DCfg.gapRng] = generator.preProc(images)
         gen[DCfg.gapRng] = generator.generatePatches(images)
@@ -1019,9 +1114,9 @@ def generateDiffImages(images, layout=None) :
         probs[:,0] = discriminator(images)[:,0]
         probs[:,1] = discriminator(pre)[:,0]
         probs[:,2] = discriminator(gen)[:,0]
-        dists[:,0] = loss_Rec(images[DCfg.gapRng], gen[DCfg.gapRng], calculateWeights(images))
-        dists[:,1] = loss_MSE(images[DCfg.gapRng], gen[DCfg.gapRng])
-        dists[:,2] = loss_L1L(images[DCfg.gapRng], gen[DCfg.gapRng])
+        dists[:,0] = loss_Rec(images[DCfg.gapRng], gen[DCfg.gapRng], wghts, normalizeRec=calculateNorm(images))
+        dists[:,1] = loss_MSE(images[DCfg.gapRng], gen[DCfg.gapRng], wghts)
+        dists[:,2] = loss_L1L(images[DCfg.gapRng], gen[DCfg.gapRng], wghts)
 
     simages = None
     if not layout is None :
@@ -1104,9 +1199,10 @@ def initialTest() :
               f'Pre: {probs[1]:.3e}.')
         #generator.eval()
         pre = generator.preProc(refImages)
-        ref_loss_Rec = loss_Rec(refImages[DCfg.gapRng], pre, calculateWeights(refImages))
-        ref_loss_MSE = loss_MSE(refImages[DCfg.gapRng], pre)
-        ref_loss_L1L = loss_L1L(refImages[DCfg.gapRng], pre)
+        wghts = calculateWeights(refImages)
+        ref_loss_Rec = loss_Rec(refImages[DCfg.gapRng], pre, wghts, normalizeRec=calculateNorm(refImages))
+        ref_loss_MSE = loss_MSE(refImages[DCfg.gapRng], pre, wghts)
+        ref_loss_L1L = loss_L1L(refImages[DCfg.gapRng], pre, wghts)
         print("Distances of reference images: "
               f"REC: {ref_loss_Rec:.3e}, "
               f"MSE: {ref_loss_MSE:.3e}, "
@@ -1122,6 +1218,12 @@ def initialTest() :
 
 def calculateWeights(images) :
     return None
+
+def calculateNorm(images) :
+    mean2 = images[...,:DCfg.gapRngX.start].mean(dim=(-1,-2)) \
+          + images[...,DCfg.gapRngX.stop:].mean(dim=(-1,-2))
+    return 2 / ( 1 + mean2 + 1e-5 ) # to denorm and adjust for mean
+
 
 
 def imagesPreProc(images) :
@@ -1215,7 +1317,7 @@ def saveCheckPoint(path, epoch, iterations, minGEpoch, minGdLoss,
 def loadCheckPoint(path, generator, discriminator,
                    optimizerGen=None, optimizerDis=None,
                    schedulerGen=None, schedulerDis=None) :
-    checkPoint = torch.load(path, map_location=TCfg.device)
+    checkPoint = torch.load(path, map_location=TCfg.device, weights_only=False)
     epoch = checkPoint['epoch']
     iterations = checkPoint['iterations']
     minGEpoch = checkPoint['minGEpoch']
@@ -1225,11 +1327,11 @@ def loadCheckPoint(path, generator, discriminator,
     discriminator.load_state_dict(checkPoint['discriminator'])
     if not optimizerGen is None :
         optimizerGen.load_state_dict(checkPoint['optimizerGen'])
-    if not schedulerGen is None and 'schedulerGen' in checkPoint:
+    if not schedulerGen is None :
         schedulerGen.load_state_dict(checkPoint['schedulerGen'])
     if not optimizerDis is None :
         optimizerDis.load_state_dict(checkPoint['optimizerDis'])
-    if not schedulerDis is None and 'schedulerDis' in checkPoint:
+    if not schedulerDis is None :
         schedulerDis.load_state_dict(checkPoint['schedulerDis'])
     interimRes = checkPoint['resAcc'] if 'resAcc' in checkPoint else TrainResClass()
 
@@ -1239,15 +1341,10 @@ def loadCheckPoint(path, generator, discriminator,
 
 trainInfo = TrainInfoClass()
 normMSE=1
+normSSIM=1
 normL1L=1
 normRec=1
 skipDis = False
-
-def beforeEachStep() :
-    return
-
-def afterEachStep() :
-    return
 
 def train_step(images):
     global trainDis, trainGen, eDinfo, noAdv, withNoGrad, skipGen, skipDis
@@ -1255,13 +1352,13 @@ def train_step(images):
     trainInfo.totPerformed += 1
     trainRes = TrainResClass()
 
-    beforeEachStep()
     nofIm = images.shape[0]
     images = images.squeeze(1).to(TCfg.device)
     procImages, procReverseData = imagesPreProc(images)
     fakeImages = procImages.clone().detach().requires_grad_(False)
     subBatchSize = nofIm // TCfg.batchSplit
     imWeights = calculateWeights(images)
+    normDiff = calculateNorm(images)
 
     labelsTrue = torch.full((subBatchSize, 1),  1 - TCfg.labelSmoothFac,
                         dtype=torch.float, device=TCfg.device, requires_grad=False)
@@ -1330,15 +1427,15 @@ def train_step(images):
                 torch.cat( (imWeights[subRange], imWeights[subRange]) )
         subFakeImages = generator.generateImages(procImages[subRange,...])
         if noAdv :
-            subG_loss = loss_Rec(procImages[subRange,:,DCfg.gapRngX],
-                                 subFakeImages[DCfg.gapRng], wghts)
+            subG_loss = loss_Rec( procImages[subRange,:,DCfg.gapRngX], subFakeImages[DCfg.gapRng]
+                                , wghts, normalizeRec=normDiff[subRange,...])
             subGD_loss = subGA_loss = subG_loss
         else :
             subPred_fakeG = discriminator(subFakeImages)
             subGA_loss, subGD_loss = loss_Gen(labelsTrue, subPred_fakeG,
-                                              procImages[subRange,:,DCfg.gapRngX],
-                                              subFakeImages[DCfg.gapRng])
-            subG_loss = lossAdvCoef * subGA_loss + lossDifCoef * subGD_loss
+                                              procImages[subRange,:,DCfg.gapRngX], subFakeImages[DCfg.gapRng],
+                                              wghts, normalizeRec=normDiff[subRange,...])
+            subG_loss = ADV_DIF * subGA_loss + (1-ADV_DIF) * subGD_loss
             pred_fake[subRange] = subPred_fakeG.clone().detach()
         # train generator only if it is not too good :
         #if noAdv  or  subPred_fakeD.mean() < pred_real[subRange].mean() :
@@ -1353,6 +1450,7 @@ def train_step(images):
     trainRes.lossGA /= TCfg.batchSplit
     trainRes.lossGD /= TCfg.batchSplit
     trainRes.predFake = pred_fake.mean().item()
+
 
     # prepare report
     with torch.no_grad() :
@@ -1394,7 +1492,6 @@ def train_step(images):
         trainInfo.ratFake += nofIm * torch.count_nonzero(pred_fake > 0.5)/nofIm
         trainInfo.totalImages += nofIm
 
-    afterEachStep()
     return trainRes
 
 
@@ -1420,8 +1517,14 @@ def afterReport() :
 dataLoader=None
 testLoader=None
 normTestMSE=1
+normTestSSIM=1
 normTestL1L=1
 normTestRec=1
+normTestDis=1
+normTestGen=1
+normTestGDloss=1
+normTestGAloss=1
+normTestDloss=1
 resAcc = TrainResClass()
 
 def train(savedCheckPoint):
@@ -1439,7 +1542,7 @@ def train(savedCheckPoint):
         beforeEachEpoch(epoch)
         generator.train()
         discriminator.train()
-        #resAcc = TrainResClass()
+        resAcc = TrainResClass()
         totalIm = 0
 
         for it , data in tqdm.tqdm(enumerate(dataLoader), total=int(len(dataLoader))):
@@ -1462,36 +1565,37 @@ def train(savedCheckPoint):
 
                 lastUpdateTime = time.time()
 
-                _,_,_ =  logStep(iter)
-                collageR, probsR, _ = generateDiffImages(refImages[[0],...], layout=0)
-                showMe = np.zeros( (2*DCfg.sinoSh[1] + DCfg.gapW ,
-                                    5*DCfg.sinoSh[0] + 4*DCfg.gapW), dtype=np.float32  )
-                for clmn in range (5) : # mark gaps
-                    showMe[ DCfg.sinoSh[0] : DCfg.sinoSh[0] + DCfg.gapW ,
-                            clmn*(DCfg.sinoSh[1]+DCfg.gapW) + 2*DCfg.gapW : clmn*(DCfg.sinoSh[1]+DCfg.gapW) + 3*DCfg.gapW ] = -1
-                def addImage(clmn, row, img, stretch=True) :
-                    imgToAdd = img.clone().detach().squeeze()
-                    if stretch :
-                        minv = imgToAdd.min()
-                        ampl = imgToAdd.max() - minv
-                        imgToAdd[()] = 2 * ( imgToAdd - minv ) / ampl - 1  if ampl!=0.0 else 0
-                    showMe[ row * ( DCfg.sinoSh[1]+DCfg.gapW) : (row+1) * DCfg.sinoSh[1] + row*DCfg.gapW ,
-                            clmn * ( DCfg.sinoSh[0]+DCfg.gapW) : (clmn+1) * DCfg.sinoSh[0] + clmn*DCfg.gapW ] = \
-                        imgToAdd.cpu().numpy()
-                addImage(0,0,trainInfo.bestRealImage)
-                addImage(0,1,trainInfo.worstRealImage)
-                addImage(1,0,trainInfo.bestFakeImage)
-                addImage(1,1,trainInfo.worstFakeImage)
-                addImage(2,0,trainInfo.highestDifImageGen)
-                addImage(2,1,trainInfo.highestDifImageOrg)
-                addImage(3,0,collageR[0,2])
-                addImage(3,1,collageR[0,0])
-                addImage(4,0,collageR[0,1])
-                addImage(4,1,collageR[0,3], stretch=False)
+                #_,_,_ =  logStep(iter)
+                #collageR, probsR, _ = generateDiffImages(refImages[[0],...], layout=0)
+                #showMe = np.zeros( (2*DCfg.sinoSh[1] + DCfg.gapW ,
+                #                    5*DCfg.sinoSh[0] + 4*DCfg.gapW), dtype=np.float32  )
+                #for clmn in range (5) : # mark gaps
+                #    showMe[ DCfg.sinoSh[0] : DCfg.sinoSh[0] + DCfg.gapW ,
+                #            clmn*(DCfg.sinoSh[1]+DCfg.gapW) + 2*DCfg.gapW : clmn*(DCfg.sinoSh[1]+DCfg.gapW) + 3*DCfg.gapW ] = -1
+                #def addImage(clmn, row, img, stretch=True) :
+                #    imgToAdd = img.clone().detach().squeeze()
+                #    if stretch :
+                #        minv = imgToAdd.min()
+                #        ampl = imgToAdd.max() - minv
+                #        imgToAdd[()] = 2 * ( imgToAdd - minv ) / ampl - 1  if ampl!=0.0 else 0
+                #    showMe[ row * ( DCfg.sinoSh[1]+DCfg.gapW) : (row+1) * DCfg.sinoSh[1] + row*DCfg.gapW ,
+                #            clmn * ( DCfg.sinoSh[0]+DCfg.gapW) : (clmn+1) * DCfg.sinoSh[0] + clmn*DCfg.gapW ] = \
+                #        imgToAdd.cpu().numpy()
+                #addImage(0,0,trainInfo.bestRealImage)
+                #addImage(0,1,trainInfo.worstRealImage)
+                #addImage(1,0,trainInfo.bestFakeImage)
+                #addImage(1,1,trainInfo.worstFakeImage)
+                #addImage(2,0,trainInfo.highestDifImageGen)
+                #addImage(2,1,trainInfo.highestDifImageOrg)
+                #addImage(3,0,collageR[0,2])
+                #addImage(3,1,collageR[0,0])
+                #addImage(4,0,collageR[0,1])
+                #addImage(4,1,collageR[0,3], stretch=False)
                 writer.add_scalars("Losses per iter",
                                    {'Dis': trainRes.lossD
                                    ,'Gen': trainRes.lossGA
-                                   ,'Rec': lossAdvCoef * trainRes.lossGA + lossDifCoef * trainRes.lossGD * normRec
+                                   ,'Rec': ADV_DIF * trainRes.lossGA \
+                                           + (1-ADV_DIF) * trainRes.lossGD * normRec
                                    }, imer )
                 writer.add_scalars("Distances per iter",
                                    {'MSE': trainRes.lossMSE
@@ -1506,13 +1610,7 @@ def train(savedCheckPoint):
 
                 IPython.display.clear_output(wait=True)
                 beforeReport()
-                lrReport = "" if scheduler_D is None  else \
-                    f"{scheduler_D.get_last_lr()[0]/TCfg.learningRateD:.3f}"
-                lrReport += "" if scheduler_G is None  else \
-                    f"/{scheduler_G.get_last_lr()[0]/TCfg.learningRateG:.3f}"
-                if len(lrReport) :
-                    lrReport = "LR: " + lrReport + ". "
-                print(f"Epoch: {epoch} ({minGEpoch}). " + lrReport +
+                print(f"Epoch: {epoch} ({minGEpoch}). " +
                       ( f" L1L: {trainRes.lossL1L:.3f} " if noAdv \
                           else \
                         f" Dis[{trainInfo.disPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossD:.3f} ({trainInfo.ratReal/trainInfo.totalImages:.3f})," ) +
@@ -1524,12 +1622,12 @@ def train(savedCheckPoint):
                 print (f"TT: {trainInfo.bestRealProb:.2f},  "
                        f"FT: {trainInfo.bestFakeProb:.2f},  "
                        f"HD: {trainInfo.highestDif/normMSE:.3e},  "
-                       f"GP: {probsR[0,2].item():.3f}, {probsR[0,1].item():.3f} " )
+                       ) #f"GP: {probsR[0,2].item():.3f}, {probsR[0,1].item():.3f} " )
                 print (f"TF: {trainInfo.worstRealProb:.2f},  "
                        f"FF: {trainInfo.worstFakeProb:.2f},  "
                        f"LD: {trainInfo.lowestDif/normMSE:.3e},  "
-                       f"R : {probsR[0,0].item():.3f}." )
-                plotImage(showMe)
+                       ) #f"R : {probsR[0,0].item():.3f}." )
+                #plotImage(showMe)
                 afterReport()
                 trainInfo = TrainInfoClass() # reset for the next iteration
 
@@ -1547,7 +1645,7 @@ def train(savedCheckPoint):
         writer.add_scalars("Losses per epoch",
                            {'Dis': resAcc.lossD
                            ,'Adv': resAcc.lossGA
-                           ,'Gen': lossAdvCoef * resAcc.lossGA + lossDifCoef * resAcc.lossGD * normRec
+                           ,'Gen': ADV_DIF * resAcc.lossGA + (1-ADV_DIF) * resAcc.lossGD
                            }, epoch )
         writer.add_scalars("Distances per epoch",
                            {'MSE': resAcc.lossMSE
@@ -1561,16 +1659,26 @@ def train(savedCheckPoint):
                            }, epoch )
         lastGdLossTrain = resAcc.lossGD
 
-        Rec_test, MSE_test, L1L_test, Gen_test, Dis_test = summarizeSet(testLoader, False)
-        writer.add_scalars("Test per epoch",
-                           {'MSE': MSE_test / normTestMSE
-                           ,'L1L': L1L_test / normTestL1L
-                           ,'REC': Rec_test / normTestRec
-                           #,'Dis': Dis_test
-                           #,'Gen': Gen_test
-                           }, epoch )
+        #Rec_test, MSE_test, L1L_test, Rprob_test, Fprob_test, Dloss_test, GAloss_test, GDloss_test \
+        #    = summarizeSet(testLoader, False)
+        #writer.add_scalars("Test per epoch",
+        #                   {'MSE': MSE_test / normTestMSE
+        #                   ,'L1L': L1L_test / normTestL1L
+        #                   ,'REC': Rec_test / normTestRec
+        #                   #,'Dis': Dis_test
+        #                   #,'Gen': Gen_test
+        #                   }, epoch )
+        #writer.add_scalars("Test losses per epoch",
+        #                   { 'Dis': Dloss_test
+        #                   , 'Adv': GAloss_test
+        #                   , 'Gen': ADV_DIF * GAloss_test + (1-ADV_DIF) * GDloss_test
+        #                   }, epoch )
+        #writer.add_scalars("Test probs per epoch",
+        #                   {'Ref': Rprob_test
+        #                   ,'Gen': Fprob_test
+        #                   }, epoch )
 
-        lastGdLoss = Rec_test
+        lastGdLoss = resAcc.lossGD # Rec_test
         if lastGdLoss < minGdLoss  :
             minGdLoss = lastGdLoss
             minGEpoch = epoch
@@ -1580,27 +1688,36 @@ def train(savedCheckPoint):
                            optimizer_G, optimizer_D)
             os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_BB.pth") # BB: before best
             os.system(f"cp {savedCheckPoint}_B.pth {savedCheckPoint}.pth") # B: best
-            saveModels()
+            saveModels(f"model_{TCfg.exec}_B")
         else :
             saveCheckPoint(savedCheckPoint+".pth",
                            epoch, imer, minGEpoch, minGdLoss,
                            generator, discriminator,
                            optimizer_G, optimizer_D)
+        saveModels()
 
         resAcc = TrainResClass()
         afterEachEpoch(epoch)
 
 
-def testMe(trainSet, nofIm=1) :
-    testSet = [ trainSet.__getitem__() for _ in range(nofIm) ]
-    testImages = torch.stack( [ testItem[0] for testItem in testSet ] ).to(TCfg.device)
+def testMe(tSet, imags=1):
+    if isinstance(imags, int) :
+        testSubSet = [ tSet.__getitem__() for _ in range(imags) ]
+    else :
+        testSubSet = [ tSet.__getitem__(index) for index in imags ]
+    testImages = torch.stack( [ testItem[0] for testItem in testSubSet ] ).to(TCfg.device)
     colImgs, probs, dists = generateDiffImages(testImages, layout=4)
-    for im in range(nofIm) :
-        testItem = testSet[im]
-        print(f"Index: ({testItem[1], testItem[2]})")
+    testIndeces = []
+    for im in range(len(testSubSet)) :
+        testItem = testSubSet[im]
+        testIndeces.append(testItem[1])
+        print(f"Index: ({testItem[1]})")
         print(f"Probabilities. Org: {probs[im,0]:.3e},  Gen: {probs[im,2]:.3e},  Pre: {probs[im,1]:.3e}.")
         print(f"Distances. Rec: {dists[im,0]:.4e},  MSE: {dists[im,1]:.4e},  L1L: {dists[im,2]:.4e}.")
         plotImage(colImgs[im].squeeze().cpu())
+    return testIndeces
+
+
 
 
 def freeGPUmem() :
@@ -1613,36 +1730,3 @@ def freeGPUmem() :
 
 
 
-
-#examplesDb[2] = [(2348095, 1684)
-#                ,(1958164,1391)
-#                ,(1429010,666)
-#                ,(1271101, 570)
-#                ,(1271426,1140)
-#                ,(4076914,1642)
-#                ,(2880692,530)
-#                ,(1333420,160)
-#                ,(102151, 418)
-#                ]
-#examplesDb[4] = [(2348095, 1684)
-#                ,(1958164,1391)
-#                ,(1429010,666)
-#                ,(1298309, 1015)
-#                ,(1907990, 1545)
-#                ,(2963058,233)
-#                ,(200279,41)
-#                ,(102151, 418)
-#                ]
-#examplesDb[8] = [(2348095, 1684)
-#                ,(1909160,333)
-#                ,(2489646, 1240)
-#                #,(5592152, 2722)
-#                ,(1429010,666)
-#                ,(152196,251)
-#                ,(1707893,914)
-#                ,(102151, 418)]
-#examplesDb[16] = [ (2348095, 1684)
-#                 , (1958164,1391)
-#                 , (1429010,666)
-#                 #, (1831107,164)
-#                 , (102151, 418)]
