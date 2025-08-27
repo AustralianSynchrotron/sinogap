@@ -491,7 +491,7 @@ class StripesFromHDFs :
                     item.index = index
                     return item
             else :
-                raise f"No set for index {index}. Should never happen."
+                raise Exception(f"No set for index {index}. Should never happen.")
 
 
     def __len__(self):
@@ -525,8 +525,30 @@ class StripesFromHDFs :
         return Sinos(self, transform)
 
 
-def createDataSet(path, exclusive=False) :
-    listOfData = [file.removesuffix(".hdf") for file in glob.glob(path+ "/*.hdf", recursive=False)]
+listOfTrainData = [
+    "18692a.ExpChicken6mGyShift",
+    "23574.8965435L.Eiger.32kev_sft",
+    "19022g.11-EggLard",
+    "18692b.MinceO",
+    "23574.8965435L.Eiger.32kev_org",
+    "19736b.09_Feb.4176862R_Eig_Threshold-4keV",
+    "20982b.04_774784R",
+    "18515.Lamb1_Eiger_7m_45keV_360Scan",
+    "19736c.8733147R_Eig_Threshold-8keV.SAMPLE_Y1",
+    "18692b_input_PhantomM",
+]
+listOfTestData = [
+    "19603a.Exposures.70keV_7m_Calf2_Threshold35keV_25ms_Take2",
+    "19603a.ROI-CTs.50keV_7m_Eiger_Sheep1",
+    "22280a_input_Day_4_40keV_7m_Threshold20keV_50ms_Y04_no_shell__0.05deg",
+    "18515.Lamb4_Eiger_5m_50keV_360Scan.SAMPLE_Y1",
+    "18692b_input_Phantom0",
+]
+
+def createDataSet(path, listOfData, exclusive=False) :
+    #listOfData = [file.removesuffix(".hdf") for file in glob.glob(path+ "/*.hdf", recursive=False)]
+    listOfData = [ '/'.join((path,file))  for file in listOfData ]
+    print(listOfData)
     sinoRoot = StripesFromHDFs(listOfData, exclusive)
     transList = []
     #transList.append(transforms.Resize(DCfg.sinoSh))
@@ -1245,7 +1267,7 @@ def train(savedCheckPoint):
             #if True:
             if time.time() - lastUpdateTime > 60  or imer == images.shape[0]:
                 IPython.display.clear_output(wait=True)
-                beforeReport(locals)
+                beforeReport(locals())
                 print(f"Epoch: {epoch} ({minGEpoch}). ", end=' ')
                 print(updAcc)
                 updAcc *= 1/updAcc.nofIm
@@ -1289,7 +1311,7 @@ def train(savedCheckPoint):
                 plt.show()
 
 
-                afterReport(locals)
+                afterReport(locals())
                 lastUpdateTime = time.time()
                 updAcc = TrainResClass()
 
@@ -1352,7 +1374,7 @@ def train(savedCheckPoint):
         saveModels()
 
         resAcc = TrainResClass()
-        afterEachEpoch(locals)
+        afterEachEpoch(locals())
 
 
 def testMe(tSet, imags=1):
