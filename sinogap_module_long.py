@@ -871,7 +871,7 @@ def restoreCheckpoint(path=None, logDir=None) :
                             " Remove it .")
         try : os.remove(TCfg.historyHDF)
         except : pass
-        return 0, 0, 0, 1, 0, TrainResClass()
+        return 0, 0, 0, None, 0, TrainResClass()
     else :
         return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D)
 
@@ -1217,7 +1217,7 @@ epoch=initIfNew('epoch', 0)
 iter = initIfNew('iter', 0)
 imer = initIfNew('iter', 0)
 minGEpoch = initIfNew('minGEpoch')
-minGLoss = initIfNew('minGdLoss', 1)
+minGLoss = initIfNew('minGdLoss')
 startFrom = initIfNew('startFrom', 0)
 
 def beforeEachEpoch(locals) :
@@ -1356,7 +1356,7 @@ def train(savedCheckPoint):
 
 
         lastGLoss = resAcc.lossG # Rec_test
-        if lastGLoss < minGLoss or minGLoss is None  :
+        if minGLoss is None or lastGLoss < minGLoss :
             minGLoss = lastGLoss
             minGEpoch = epoch
             saveCheckPoint(savedCheckPoint+"_B.pth",
