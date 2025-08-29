@@ -641,7 +641,7 @@ save_interim = None
 
 class GeneratorTemplate(nn.Module):
 
-    def __init__(self, gapW, latentChannels=0):
+    def __init__(self, gapW, latentChannels=0, batchNorm=False):
         super(GeneratorTemplate, self).__init__()
         self.gapW = gapW
         self.sinoSh = (256*self.gapW,5*self.gapW)
@@ -654,6 +654,7 @@ class GeneratorTemplate(nn.Module):
         self.baseChannels = 4
         self.amplitude = 4
         self.lowResGenerator = None
+        self.batchNorm = batchNorm
 
 
 
@@ -669,7 +670,9 @@ class GeneratorTemplate(nn.Module):
         return toRet
 
 
-    def encblock(self, chIn, chOut, kernel, stride=1, norm=False, padding=0) :
+    def encblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=0) :
+        if norm is None :
+            norm = self.batchNorm
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
@@ -682,7 +685,9 @@ class GeneratorTemplate(nn.Module):
         return torch.nn.Sequential(*layers)
 
 
-    def decblock(self, chIn, chOut, kernel, stride=1, norm=False, padding=0, outputPadding=0) :
+    def decblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=0, outputPadding=0) :
+        if norm is None :
+            norm = self.batchNorm
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
