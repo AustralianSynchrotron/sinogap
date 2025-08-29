@@ -536,6 +536,7 @@ listOfTrainData = [
     "18515.Lamb1_Eiger_7m_45keV_360Scan",
     "19736c.8733147R_Eig_Threshold-8keV.SAMPLE_Y1",
     "18692b_input_PhantomM",
+    "21836b.2024-08-15-mastectomies.4201381L.35kev.20Hz"
 ]
 listOfTestData = [
     "19603a.Exposures.70keV_7m_Calf2_Threshold35keV_25ms_Take2",
@@ -668,7 +669,7 @@ class GeneratorTemplate(nn.Module):
         return toRet
 
 
-    def encblock(self, chIn, chOut, kernel, stride=1, norm=True, padding=0) :
+    def encblock(self, chIn, chOut, kernel, stride=1, norm=False, padding=0) :
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
@@ -681,7 +682,7 @@ class GeneratorTemplate(nn.Module):
         return torch.nn.Sequential(*layers)
 
 
-    def decblock(self, chIn, chOut, kernel, stride=1, norm=True, padding=0, outputPadding=0) :
+    def decblock(self, chIn, chOut, kernel, stride=1, norm=False, padding=0, outputPadding=0) :
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
