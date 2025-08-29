@@ -56,6 +56,7 @@ class TCfgClass:
     device: torch.device = torch.device('cpu')
     batchSplit : int = 1
     nofEpochs: int = 0
+    num_workers : int = os.cpu_count()
     historyHDF : str = field(repr = True, init = False)
     logDir : str = field(repr = True, init = False)
     def __post_init__(self):
@@ -1254,6 +1255,8 @@ def train(savedCheckPoint):
     while TCfg.nofEpochs is None or epoch <= TCfg.nofEpochs :
         epoch += 1
         beforeEachEpoch(epoch)
+        dataLoader = createDataLoader(trainSet, shuffle=True, num_workers=TCfg.num_workers)
+
         generator.train()
         discriminator.train()
         resAcc = TrainResClass()
