@@ -207,7 +207,7 @@ def tensorStat(stat) :
           f"{stat.min().item():.3e}, {stat.max().item():.3e}")
 
 
-def fillWheights(seq, std=0.01) :
+def fillWheights(seq, std=0.001) :
     for wh in seq :
         if hasattr(wh, 'weight') :
             #torch.nn.init.xavier_uniform_(wh.weight)
@@ -1356,7 +1356,7 @@ def train(savedCheckPoint):
 
 
         lastGLoss = resAcc.lossG # Rec_test
-        if minGLoss is None or lastGLoss < minGLoss :
+        if minGLoss is None or minGLoss == 0 or lastGLoss < minGLoss :
             minGLoss = lastGLoss
             minGEpoch = epoch
             saveCheckPoint(savedCheckPoint+"_B.pth",
