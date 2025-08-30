@@ -54,7 +54,7 @@ class TCfgClass:
     learningRateG: float
     dataDir : str
     device: torch.device = torch.device('cpu')
-    batchSplit : int = 1
+    batchSplit : int = 1 # negative to load multiple batches at a time.
     nofEpochs: int = 0
     num_workers : int = os.cpu_count()
     historyHDF : str = field(repr = True, init = False)
@@ -64,7 +64,7 @@ class TCfgClass:
             self.device = torch.device(f"cuda:{self.exec}")
         self.historyHDF = f"train_{self.exec}.hdf"
         self.logDir = f"runs/experiment_{self.exec}"
-        if self.batchSize % self.batchSplit :
+        if self.batchSplit > 1 and self.batchSize % self.batchSplit :
             raise Exception(f"Batch size {self.batchSize} is not divisible by batch split {self.batchSplit}.")
 global TCfg
 TCfg = initIfNew('TCfg')
@@ -566,7 +566,7 @@ testSet = initIfNew('testSet')
 def createDataLoader(tSet, num_workers=os.cpu_count(), shuffle=False) :
     return torch.utils.data.DataLoader(
         dataset=tSet,
-        batch_size=TCfg.batchSize,
+        batch_size = TCfg.batchSize * max(1, -TCfg.batchSplit) ,
         shuffle=shuffle,
         num_workers=num_workers,
         drop_last=True
@@ -1025,10 +1025,11 @@ def summarizeMe(toSumm, onPrep=True):
         nofIm = images.shape[0]
         sumAcc.nofIm += nofIm
 
-        subBatchSize = nofIm // TCfg.batchSplit
+        batchSplit = TCfg.batchSplit if TCfg.batchSplit > 1 else 1
+        subBatchSize = nofIm // batchSplit
         fakeImages = images.clone()
-        for i in range(TCfg.batchSplit) :
-            subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize] if TCfg.batchSplit > 1 else np.s_[...]
+        for i in range(batchSplit) :
+            subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
             subImages = images[subRange,...]
             patchImages = generator.preProc(subImages) \
                             if onPrep else \
@@ -1172,50 +1173,57 @@ def loadCheckPoint(path, generator, discriminator,
 
 skipDis = False
 
-def train_step(images):
+def train_step(allImages):
     global skipGen, skipDis
 
-    nofIm = images.shape[0]
     trainRes = TrainResClass()
-    trainRes.nofIm = nofIm
-    images, _ = unsqeeze4dim(images.to(TCfg.device))
-    subBatchSize = nofIm // TCfg.batchSplit
+    allImages, _ = unsqeeze4dim(allImages.to(TCfg.device))
+    nofAllIm = allImages.shape(0)
 
-    # train discriminator
-    if metrices['Adv'].train :
-        optimizer_D.zero_grad()
-        for i in range(TCfg.batchSplit) :
-            subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize] if TCfg.batchSplit > 1 else np.s_[...]
-            subImages = images[subRange,...].clone().detach()
-            with torch.no_grad() : # create fake images to be descriminated
-                subFakeImages = generator.generateImages(subImages)
+    while trainRes.nofIm < nofAllIm :
+
+        images = allImages[ trainRes.nofIm : trainRes.nofIm + TCfg.batchSize , ... ]
+        nofIm = images.shape[0]
+        trainRes.nofIm = +nofIm
+        #images, _ = unsqeeze4dim(images.to(TCfg.device))
+        batchSplit = TCfg.batchSplit if TCfg.batchSplit > 1 else 1
+        subBatchSize = nofIm // batchSplit
+
+        # train discriminator
+        if metrices['Adv'].train :
+            optimizer_D.zero_grad()
+            for i in range(batchSplit) :
+                subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
+                subImages = images[subRange,...].clone().detach()
+                with torch.no_grad() : # create fake images to be descriminated
+                    subFakeImages = generator.generateImages(subImages)
+                subImages.requires_grad = True
+                subFakeImages.requires_grad = True
+                disLoss, probs = loss_Dis(subImages, subFakeImages)
+                trainRes.lossD += disLoss.item()
+                trainRes.predReal += probs[:nofIm,0].sum().item()
+                trainRes.predFake += probs[nofIm:,0].sum().item()
+                disLoss /= subBatchSize
+                disLoss.backward()
+            optimizer_D.step()
+            optimizer_D.zero_grad(set_to_none=True)
+
+
+        # train generator
+        optimizer_G.zero_grad(set_to_none=False)
+        for i in range(batchSplit) :
+            subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
+            subImages = images[subRange,...]#.clone().detach()
             subImages.requires_grad = True
-            subFakeImages.requires_grad = True
-            disLoss, probs = loss_Dis(subImages, subFakeImages)
-            trainRes.lossD += disLoss.item()
-            trainRes.predReal += probs[:nofIm,0].sum().item()
-            trainRes.predFake += probs[nofIm:,0].sum().item()
-            disLoss /= subBatchSize
-            disLoss.backward()
-        optimizer_D.step()
-        optimizer_D.zero_grad(set_to_none=True)
-
-
-    # train generator
-    optimizer_G.zero_grad(set_to_none=False)
-    for i in range(TCfg.batchSplit) :
-        subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize] if TCfg.batchSplit > 1 else np.s_[:]
-        subImages = images[subRange,...]#.clone().detach()
-        subImages.requires_grad = True
-        subFakeImages = generator.generateImages(subImages)
-        genLoss, indLosses = loss_Gen(subImages, subFakeImages)
-        trainRes.lossG += genLoss.item()
-        for key in metrices.keys() :
-            trainRes.metrices[key] += indLosses[key]
-        genLoss /= subBatchSize
-        genLoss.backward()
-    optimizer_G.step()
-    optimizer_G.zero_grad(set_to_none=True)
+            subFakeImages = generator.generateImages(subImages)
+            genLoss, indLosses = loss_Gen(subImages, subFakeImages)
+            trainRes.lossG += genLoss.item()
+            for key in metrices.keys() :
+                trainRes.metrices[key] += indLosses[key]
+            genLoss /= subBatchSize
+            genLoss.backward()
+        optimizer_G.step()
+        optimizer_G.zero_grad(set_to_none=True)
 
     return trainRes
 
