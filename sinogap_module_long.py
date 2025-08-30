@@ -73,6 +73,7 @@ TCfg = initIfNew('TCfg')
 @dataclass
 class DCfgClass:
     gapW : int
+    sinoLen : int = 256
     sinoSh : tuple = field(repr = True, init = False)
     sinoSize : int = field(repr = True, init = False)
     gapSh : tuple = field(repr = True, init = False)
@@ -82,7 +83,7 @@ class DCfgClass:
     disRng : type(np.s_[:]) = field(repr = True, init = False)
     readWidth : int = 80
     def __post_init__(self):
-        self.sinoSh = (256*self.gapW,5*self.gapW)
+        self.sinoSh = (self.sinoLen*self.gapW,5*self.gapW)
         self.sinoSize = math.prod(self.sinoSh)
         self.gapSh = (self.sinoSh[0],self.gapW)
         self.gapSize = math.prod(self.gapSh)
@@ -537,7 +538,8 @@ listOfTrainData = [
     "18515.Lamb1_Eiger_7m_45keV_360Scan",
     "19736c.8733147R_Eig_Threshold-8keV.SAMPLE_Y1",
     "18692b_input_PhantomM",
-    "21836b.2024-08-15-mastectomies.4201381L.35kev.20Hz"
+    "21836b.2024-08-15-mastectomies.4201381L.35kev.20Hz",
+    "23574h.9230799R.35kev"
 ]
 listOfTestData = [
     "19603a.Exposures.70keV_7m_Calf2_Threshold35keV_25ms_Take2",
@@ -719,9 +721,9 @@ class GeneratorTemplate(nn.Module):
         return toRet
 
 
-    def createLastTouch(self) :
+    def createLastTouch(self, chIn=1) :
         toRet = nn.Sequential(
-            nn.Conv2d(self.baseChannels+1, 1, 1),
+            nn.Conv2d(chIn*self.baseChannels+1, 1, 1),
             nn.Tanh(),
         )
         fillWheights(toRet)
@@ -1178,13 +1180,13 @@ def train_step(allImages):
 
     trainRes = TrainResClass()
     allImages, _ = unsqeeze4dim(allImages.to(TCfg.device))
-    nofAllIm = allImages.shape(0)
+    nofAllIm = allImages.shape[0]
 
     while trainRes.nofIm < nofAllIm :
 
         images = allImages[ trainRes.nofIm : trainRes.nofIm + TCfg.batchSize , ... ]
         nofIm = images.shape[0]
-        trainRes.nofIm = +nofIm
+        trainRes.nofIm += nofIm
         #images, _ = unsqeeze4dim(images.to(TCfg.device))
         batchSplit = TCfg.batchSplit if TCfg.batchSplit > 1 else 1
         subBatchSize = nofIm // batchSplit
