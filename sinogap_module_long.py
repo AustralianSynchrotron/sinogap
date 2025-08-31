@@ -539,7 +539,8 @@ listOfTrainData = [
     "19736c.8733147R_Eig_Threshold-8keV.SAMPLE_Y1",
     "18692b_input_PhantomM",
     "21836b.2024-08-15-mastectomies.4201381L.35kev.20Hz",
-    "23574h.9230799R.35kev"
+    "23574h.9230799R.35kev",
+    "18515.Lamb4_Excised_Eiger_7m_30keV_360Scan.Y1",
 ]
 listOfTestData = [
     "19603a.Exposures.70keV_7m_Calf2_Threshold35keV_25ms_Take2",
