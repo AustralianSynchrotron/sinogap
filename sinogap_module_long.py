@@ -901,7 +901,7 @@ def loss_Adv(images, truth):
     labels = torch.full((images.shape[0], 1),  (1 - TCfg.labelSmoothFac ) if truth else TCfg.labelSmoothFac,
                 dtype=torch.float, device=TCfg.device, requires_grad=False)
     predictions = discriminator(images)
-    return BCE(predictions, labels).sum(), predictions
+    return BCE(predictions, labels), predictions
 
 def loss_Adv_Gen(p_true, p_pred):
     return loss_Adv(p_pred, True)[0]
@@ -909,27 +909,28 @@ def loss_Adv_Gen(p_true, p_pred):
 def loss_Adv_Dis(p_true, p_pred):
     loss_true, predictions_true = loss_Adv(p_true, True)
     loss_pred, predictions_pred = loss_Adv(p_pred, False)
-    return loss_true + loss_pred, torch.cat((predictions_true, predictions_pred), dim=0)
+    return ( torch.cat((loss_true, loss_pred), dim=0),
+             torch.cat((predictions_true, predictions_pred), dim=0) )
 
 MSE = nn.MSELoss(reduction='none')
 def loss_MSE(p_true, p_pred):
-    return MSE(p_pred[DCfg.gapRng], p_true[DCfg.gapRng]).sum()
+    return MSE(p_pred[DCfg.gapRng], p_true[DCfg.gapRng]).sum(dim=(-1,-2,-3))
 
 L1L = nn.L1Loss(reduction='none')
 def loss_L1L(p_true, p_pred):
-    return L1L(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum()
+    return L1L(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
 
 SSIM = ssim.SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
 def loss_SSIM(p_true, p_pred):
     p_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
     p_pred, _ = unsqeeze4dim(p_pred[DCfg.gapRng])
-    return (1 - SSIM( p_true+0.5, p_pred+0.5 ) ).sum() / 2
+    return (1 - SSIM( p_true+0.5, p_pred+0.5 ) ) / 2
 
 MSSSIM = ssim.MS_SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
 def loss_MSSSIM(p_true, p_pred):
     p_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
     p_pred, _ = unsqeeze4dim(p_pred[DCfg.gapRng])
-    return (1 - MSSSIM( p_true+0.5, p_pred+0.5 ) ).sum() / 2
+    return (1 - MSSSIM( p_true+0.5, p_pred+0.5 ) ) / 2
 
 
 @dataclass
@@ -947,19 +948,59 @@ metrices = {
     'MSSSIM' : Metrics(loss_MSSSIM,  8.940e-05, 1, False),
 }
 
+
+minMetrices = None
+maxMetrices = None
+
+def trackExtremes(track=True) :
+    global minMetrices, maxMetrices
+    toRet = (minMetrices, maxMetrices)
+    if not track :
+        minMetrices = None
+        maxMetrices = None
+    else :
+        minMetrices = { key: None for key in metrices.keys() }
+        minMetrices['loss'] = None
+        maxMetrices = { key: None for key in metrices.keys() }
+        maxMetrices['loss'] = None
+    return toRet
+
+
+
+def updateExtremes(vector, key, p_true, p_pred) :
+    global minMetrices, maxMetrices
+    if maxMetrices is not None :
+        pos = vector.argmax()
+        if maxMetrices[key] is None or vector[pos] > maxMetrices[key][0] :
+            maxMetrices[key] = (vector[pos].item(),
+                                p_true[pos,...].clone().detach(),
+                                p_pred[pos,...].clone().detach() )
+    if minMetrices is not None :
+        pos = vector.argmin()
+        if minMetrices[key] is None or vector[pos] < minMetrices[key][0] :
+            minMetrices[key] = (vector[pos].item(),
+                                p_true[pos,...].clone().detach(),
+                                p_pred[pos,...].clone().detach() )
+
 def loss_Gen(p_true, p_pred):
+    global minMetrices, maxMetrices
     loss = 0
     sumweights = 0
     individualLosses = {}
     for key, metrics in metrices.items():
         with torch.set_grad_enabled(metrics.train) :
-            thisLoss = torch.zeros((1,))  if  metrics.weight <= 0  else  \
-                       metrics.calculate(p_true, p_pred) / metrics.norm
-        individualLosses[key] = thisLoss.item()
-        if metrics.train :
-            loss += metrics.weight * thisLoss
-            sumweights += metrics.weight
-    return loss / sumweights , individualLosses
+            if  metrics.weight > 0 :
+                thisLoss = metrics.calculate(p_true, p_pred) / metrics.norm
+                updateExtremes(thisLoss, key, p_true, p_pred)
+                if metrics.train :
+                    loss += metrics.weight * thisLoss
+                    sumweights += metrics.weight
+                individualLosses[key] = thisLoss.sum().item()
+            else :
+                individualLosses[key] = 0
+    loss /= sumweights
+    updateExtremes(loss, 'loss', p_true, p_pred)
+    return loss.sum() , individualLosses
 
 def loss_Dis(p_true, p_pred):
     return loss_Adv_Dis(p_true, p_pred)
@@ -1259,7 +1300,8 @@ testLoader=None
 resAcc = TrainResClass()
 
 def train(savedCheckPoint):
-    global epoch, minGLoss, minGEpoch, iter, startFrom, imer, resAcc, dataLoader, testLoader, testSet, refImages
+    global epoch, minGLoss, minGEpoch, iter, startFrom, imer, resAcc
+    global dataLoader, testLoader, testSet, refImages, minMetrices, maxMetrices
     lastGLoss = minGLoss
 
     discriminator.to(TCfg.device)
@@ -1276,6 +1318,7 @@ def train(savedCheckPoint):
         discriminator.train()
         resAcc = TrainResClass()
         updAcc = TrainResClass()
+        _ = trackExtremes()
 
         for it , data in tqdm.tqdm(enumerate(dataLoader), total=int(len(dataLoader))):
             if startFrom :
@@ -1309,10 +1352,14 @@ def train(savedCheckPoint):
 
                 refViews, genImages, _ = generateDisplay()
                 refViews = refViews.cpu().numpy()
-                rndIndeces = random.sample(range(images.shape[0]), 6)
+                rndIndeces = random.sample(range(images.shape[0]), 2)
                 rndViews = generateDisplay(images[rndIndeces,...])[0].cpu().numpy()
+                extImages = torch.stack((maxMetrices['loss'][1],minMetrices['loss'][1]))
+                extViews, extGen, _ = generateDisplay(extImages)
+                extViews = extViews.cpu().numpy()
 
                 plotImage(genImages[0,0,...].transpose(-1,-2).cpu().numpy())
+                plotImage(extGen[0,0,...].transpose(-1,-2).cpu().numpy())
                 plt.figure(frameon=False, figsize=(5,2))
                 plt.subplots_adjust(wspace=0.1)
                 def addSubplot(pos, img, sym=True) :
@@ -1323,13 +1370,13 @@ def train(savedCheckPoint):
                     plt.axis("off")
                     #print(vmm, end=' ')
                 addSubplot( 1, rndViews[0,2],False)
-                addSubplot( 2, rndViews[1,2],False)
-                addSubplot( 3, rndViews[2,2],False)
+                addSubplot( 2, extViews[0,1],False)
+                addSubplot( 3, extViews[0,0],False)
                 addSubplot( 4, refViews[3,3])
                 addSubplot( 5, refViews[2,3])
-                addSubplot( 6, rndViews[3,2],False)
-                addSubplot( 7, rndViews[4,2],False)
-                addSubplot( 8, rndViews[5,2],False)
+                addSubplot( 6, rndViews[1,2],False)
+                addSubplot( 7, extViews[0,2],False)
+                addSubplot( 8, extViews[0,3])
                 addSubplot( 9, refViews[1,3])
                 addSubplot(10, refViews[0,3])
                 plt.show()
@@ -1338,6 +1385,7 @@ def train(savedCheckPoint):
                 afterReport(locals())
                 lastUpdateTime = time.time()
                 updAcc = TrainResClass()
+                _ = trackExtremes()
 
             if time.time() - lastSaveTime > 3600 :
                 lastSaveTime = time.time()
@@ -1401,22 +1449,6 @@ def train(savedCheckPoint):
         afterEachEpoch(locals())
 
 
-def testMe(tSet, imags=1):
-    if isinstance(imags, int) :
-        testSubSet = [ tSet.__getitem__() for _ in range(imags) ]
-    else :
-        testSubSet = [ tSet.__getitem__(index) for index in imags ]
-    testImages = torch.stack( [ testItem[0] for testItem in testSubSet ] ).to(TCfg.device)
-    colImgs, probs, dists = generateDiffImages(testImages, layout=4)
-    testIndeces = []
-    for im in range(len(testSubSet)) :
-        testItem = testSubSet[im]
-        testIndeces.append(testItem[1])
-        print(f"Index: ({testItem[1]})")
-        print(f"Probabilities. Org: {probs[im,0]:.3e},  Gen: {probs[im,2]:.3e},  Pre: {probs[im,1]:.3e}.")
-        print(f"Distances. Rec: {dists[im,0]:.4e},  MSE: {dists[im,1]:.4e},  L1L: {dists[im,2]:.4e}.")
-        plotImage(colImgs[im].squeeze().cpu())
-    return testIndeces
 
 
 
