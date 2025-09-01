@@ -422,10 +422,13 @@ class StripesFromHDF :
         self.fsh = self.sh[1:3]
 
         self.mask = loadImage(maskName, self.fsh)
+        self.mask /= self.mask.max()
         if self.mask is None :
             self.mask = np.ones(self.fsh, dtype=np.uint8)
-        self.mask = self.mask.astype(bool)
-        forbidenSinos = self.mask
+        #self.mask = self.mask.astype(bool)
+        forbidenSinos = self.mask.copy()
+        for shft in range (1, DCfg.readWidth) :
+            forbidenSinos[:,:-shft] *= self.mask[:,shft:]
         forbidenSinos[:, -DCfg.readWidth:] = 0
         if exclusive : # non-overlapping sinograms
             for yCr in range(0,self.fsh[0]) :
@@ -548,10 +551,10 @@ listOfTrainData = [
 ]
 listOfTestData = [
     "19603a.Exposures.70keV_7m_Calf2_Threshold35keV_25ms_Take2",
-    "19603a.ROI-CTs.50keV_7m_Eiger_Sheep1",
     "22280a_input_Day_4_40keV_7m_Threshold20keV_50ms_Y04_no_shell__0.05deg",
     "18515.Lamb4_Eiger_5m_50keV_360Scan.SAMPLE_Y1",
     "18692b_input_Phantom0",
+    #"19603a.ROI-CTs.50keV_7m_Eiger_Sheep1",
 ]
 
 def createDataSet(path, listOfData, exclusive=False) :
@@ -581,10 +584,10 @@ def createDataLoader(tSet, num_workers=os.cpu_count(), shuffle=False) :
 
 
 examples = [
-    (64747, 2030),
-    (57346, 1200),
-    (45170, 5610),
-    (26172, 2760),
+    (38576, 2560), # (3, 476, 2855)
+    (26289, 6300), # (2, 280, 828)
+    (24299, 7160), # (2, 113, 988)
+    (3186, 2455), # (0, 119, 240)
     ]
 
 def createReferences(tSet, majorIdx = 0) :
@@ -942,11 +945,20 @@ class Metrics:
 
 metrices = {
     'Adv'    : Metrics(loss_Adv_Gen, 1.000e+00, 0, False),
-    'MSE'    : Metrics(loss_MSE,     6.185e-01, 1),
-    'L1L'    : Metrics(loss_L1L,     6.193e+00, 1, False),
-    'SSIM'   : Metrics(loss_SSIM,    2.171e-03, 1, False),
-    'MSSSIM' : Metrics(loss_MSSSIM,  8.940e-05, 1, False),
+    'MSE'    : Metrics(loss_MSE,     1.154e-01, 1),
+    'L1L'    : Metrics(loss_L1L,     2.571e+00, 1, False),
+    'SSIM'   : Metrics(loss_SSIM,    4.183e-04, 1, False),
+    'MSSSIM' : Metrics(loss_MSSSIM,  4.515e-06, 1, False),
 }
+
+metricesTrain = {
+    'Adv'    : Metrics(loss_Adv_Gen, 1.000e+00, 0, False),
+    'MSE'    : Metrics(loss_MSE,     6.270e-01, 1),
+    'L1L'    : Metrics(loss_L1L,     6.050e+00, 1, False),
+    'SSIM'   : Metrics(loss_SSIM,    7.713e-04, 1, False),
+    'MSSSIM' : Metrics(loss_MSSSIM,  2.826e-05, 1, False),
+}
+
 
 
 minMetrices = None
@@ -975,6 +987,10 @@ def updateExtremes(vector, key, p_true, p_pred) :
             maxMetrices[key] = (vector[pos].item(),
                                 p_true[pos,...].clone().detach(),
                                 p_pred[pos,...].clone().detach() )
+            #if key == 'loss' :
+            #    print(pos.item())
+            #    plotImage(maxMetrices['loss'][1][0].clone().detach().transpose(-1,-2).cpu().numpy())
+            #    print()
     if minMetrices is not None :
         pos = vector.argmin()
         if minMetrices[key] is None or vector[pos] < minMetrices[key][0] :
@@ -1333,6 +1349,11 @@ def train(savedCheckPoint):
 
             #if True:
             if time.time() - lastUpdateTime > 60  or imer == images.shape[0]:
+
+                extImages = torch.stack((maxMetrices['loss'][1],minMetrices['loss'][1]))
+                extViews, extGen, _ = generateDisplay(extImages)
+                extViews = extViews.cpu().numpy()
+
                 IPython.display.clear_output(wait=True)
                 beforeReport(locals())
                 print(f"Epoch: {epoch} ({minGEpoch}). ", end=' ')
@@ -1354,12 +1375,10 @@ def train(savedCheckPoint):
                 refViews = refViews.cpu().numpy()
                 rndIndeces = random.sample(range(images.shape[0]), 2)
                 rndViews = generateDisplay(images[rndIndeces,...])[0].cpu().numpy()
-                extImages = torch.stack((maxMetrices['loss'][1],minMetrices['loss'][1]))
-                extViews, extGen, _ = generateDisplay(extImages)
-                extViews = extViews.cpu().numpy()
 
                 plotImage(genImages[0,0,...].transpose(-1,-2).cpu().numpy())
                 plotImage(extGen[0,0,...].transpose(-1,-2).cpu().numpy())
+                plotImage(extImages[0,0,...].transpose(-1,-2).cpu().numpy())
                 plt.figure(frameon=False, figsize=(5,2))
                 plt.subplots_adjust(wspace=0.1)
                 def addSubplot(pos, img, sym=True) :
