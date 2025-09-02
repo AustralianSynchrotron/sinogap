@@ -1380,17 +1380,26 @@ def train(savedCheckPoint):
                 rndIndeces = random.sample(range(images.shape[0]), 2)
                 rndViews = generateDisplay(images[rndIndeces,...])[0].cpu().numpy()
 
-                plotImage(genImages[0,0,...].transpose(-1,-2).cpu().numpy())
-                plotImage(extGen[0,0,...].transpose(-1,-2).cpu().numpy())
-                #plotImage(extImages[0,0,...].transpose(-1,-2).cpu().numpy())
-                plt.figure(frameon=False, figsize=(5,2))
-                plt.subplots_adjust(wspace=0.1)
+                subLay = (1,1)
                 def addSubplot(pos, img, sym=True) :
-                    plt.subplot(2, 5, pos) ;
+                    nonlocal subLay
+                    plt.subplot(*subLay, pos) ;
                     vmm = max( -img.min(), img.max() )
                     plt.imshow(img, cmap='gray', vmin = -vmm if sym else None,
                                                  vmax =  vmm if sym else None)
                     plt.axis("off")
+
+                subLay = (3,1)
+                plt.figure(frameon=False, layout='compressed')
+                plt.subplots_adjust(hspace=0.5, wspace=0)
+                addSubplot(1, genImages[0,0,...].transpose(-1,-2).cpu().numpy(), False)
+                addSubplot(2, extGen[0,0,...].transpose(-1,-2).cpu().numpy(), False)
+                addSubplot(3, extImages[0,0,...].transpose(-1,-2).cpu().numpy(), False)
+                plt.show()
+
+                subLay = (2,5)
+                plt.figure(frameon=False, figsize=(5,2))
+                plt.subplots_adjust(hspace = 0.1, wspace=0.1)
                     #print(vmm, end=' ')
                 addSubplot( 1, rndViews[0,2],False)
                 addSubplot( 2, extViews[0,1],False)
