@@ -977,8 +977,6 @@ def trackExtremes(track=True) :
         maxMetrices['loss'] = None
     return toRet
 
-
-
 def updateExtremes(vector, key, p_true, p_pred) :
     global minMetrices, maxMetrices
     if maxMetrices is not None :
@@ -997,6 +995,7 @@ def updateExtremes(vector, key, p_true, p_pred) :
             minMetrices[key] = (vector[pos].item(),
                                 p_true[pos,...].clone().detach(),
                                 p_pred[pos,...].clone().detach() )
+
 
 def loss_Gen(p_true, p_pred):
     global minMetrices, maxMetrices
@@ -1377,7 +1376,7 @@ def train(savedCheckPoint):
 
                 plotImage(genImages[0,0,...].transpose(-1,-2).cpu().numpy())
                 plotImage(extGen[0,0,...].transpose(-1,-2).cpu().numpy())
-                plotImage(extImages[0,0,...].transpose(-1,-2).cpu().numpy())
+                #plotImage(extImages[0,0,...].transpose(-1,-2).cpu().numpy())
                 plt.figure(frameon=False, figsize=(5,2))
                 plt.subplots_adjust(wspace=0.1)
                 def addSubplot(pos, img, sym=True) :
