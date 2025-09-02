@@ -1085,7 +1085,7 @@ def summarizeMe(toSumm, onPrep=True):
     def summarizeImages(images) :
         nonlocal sumAcc
 
-        images = images.to(TCfg.device)
+        images = unsqeeze4dim(images.to(TCfg.device))[0]
         nofIm = images.shape[0]
         sumAcc.nofIm += nofIm
 
@@ -1098,7 +1098,7 @@ def summarizeMe(toSumm, onPrep=True):
             patchImages = generator.preProc(subImages) \
                             if onPrep else \
                           generator.generatePatches(subImages)
-            fakeImages[subRange,:,DCfg.gapRngX] = patchImages
+            fakeImages[subRange,...,DCfg.gapRngX] = patchImages
 
         genLoss, indLosses = loss_Gen(images, fakeImages)
         sumAcc.lossG += genLoss.item()
@@ -1114,8 +1114,7 @@ def summarizeMe(toSumm, onPrep=True):
     with torch.no_grad() :
         if isinstance(toSumm, torch.utils.data.DataLoader) :
             for it , data in tqdm.tqdm(enumerate(toSumm), total=int(len(toSumm))):
-                images = data['image'].squeeze(1).to(TCfg.device)
-                summarizeImages(images)
+                summarizeImages(data['image'])
         elif isinstance(toSumm, torch.Tensor) :
             summarizeImages(toSumm)
         else :
