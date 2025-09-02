@@ -1123,14 +1123,16 @@ def summarizeMe(toSumm, onPrep=True):
     return sumAcc
 
 
-def generateDisplay(inp=None) :
+def generateDisplay(inp=None, boxes=None) :
     #images = images.to(TCfg.device)
     images = refImages if inp is None else inp
     images, orgDim = unsqeeze4dim(images)
     nofIm = images.shape[0]
     sinLen = images.shape[-2]
     viewLen = DCfg.sinoSh[-1]
-    boxShifts = refBoxes if inp is None else [ random.randint(0, sinLen-viewLen) for _ in range(nofIm) ]
+    boxes =      refBoxes if inp is None \
+            else [ random.randint(0, sinLen-viewLen) for _ in range(nofIm) ] if boxes is None \
+            else boxes
     genImages = images.clone()
     preImages = images.clone()
     views = torch.empty((nofIm, 4, viewLen, viewLen ), dtype=torch.float32, device=TCfg.device)
@@ -1141,7 +1143,7 @@ def generateDisplay(inp=None) :
         genImages[DCfg.gapRng] = genPatches
     hGap = DCfg.gapW // 2
     for curim in range(nofIm) :
-        rng = np.s_[curim, 0, boxShifts[curim] : boxShifts[curim] + viewLen, : ]
+        rng = np.s_[curim, 0, boxes[curim] : boxes[curim] + viewLen, : ]
         views[curim,0,...] = images   [rng]
         views[curim,1,...] = preImages[rng]
         views[curim,2,...] = genImages[rng]
@@ -1152,8 +1154,8 @@ def generateDisplay(inp=None) :
     return views, squeezeOrg(genImages, orgDim) , squeezeOrg(preImages, orgDim)
 
 
-def displayImages(inp=None) :
-    views, genImages, _ = generateDisplay(inp)
+def displayImages(inp=None, boxes=None) :
+    views, genImages, _ = generateDisplay(inp, boxes)
     views = views.cpu().numpy()
     nofIm = views.shape[0]
     for curim in range(nofIm) :
@@ -1348,8 +1350,12 @@ def train(savedCheckPoint):
             #if True:
             if time.time() - lastUpdateTime > 60  or imer == images.shape[0]:
 
+                # find worst of the worst box
+                maxdif = torch.abs(maxMetrices['loss'][1] - maxMetrices['loss'][2])[None,...]
+                maxDifY = fn.conv2d(maxdif, torch.ones((1,1,maxdif.shape[-1],maxdif.shape[-1]), device=maxdif.device))
+                maxpos = maxDifY.squeeze().argmax().item()
                 extImages = torch.stack((maxMetrices['loss'][1],minMetrices['loss'][1]))
-                extViews, extGen, _ = generateDisplay(extImages)
+                extViews, extGen, _ = generateDisplay(extImages, (maxpos, maxpos))
                 extViews = extViews.cpu().numpy()
 
                 IPython.display.clear_output(wait=True)
