@@ -1378,7 +1378,8 @@ def train(savedCheckPoint):
                 refViews, genImages, _ = generateDisplay()
                 refViews = refViews.cpu().numpy()
                 rndIndeces = random.sample(range(images.shape[0]), 2)
-                rndViews = generateDisplay(images[rndIndeces,...])[0].cpu().numpy()
+                rndViews, rndGen, _ = generateDisplay(images[rndIndeces,...])
+                rndViews = rndViews.cpu().numpy()
 
                 subLay = (1,1)
                 def addSubplot(pos, img, sym=True) :
@@ -1392,9 +1393,9 @@ def train(savedCheckPoint):
                 subLay = (3,1)
                 plt.figure(frameon=False, layout='compressed')
                 plt.subplots_adjust(hspace=0.5, wspace=0)
-                addSubplot(1, genImages[0,0,...].transpose(-1,-2).cpu().numpy(), False)
-                addSubplot(2, extGen[0,0,...].transpose(-1,-2).cpu().numpy(), False)
-                addSubplot(3, extImages[0,0,...].transpose(-1,-2).cpu().numpy(), False)
+                addSubplot(1, rndGen[0,0,...].transpose(-1,-2).cpu().numpy(), False)
+                addSubplot(2, genImages[0,0,...].transpose(-1,-2).cpu().numpy(), False)
+                addSubplot(3, extGen[0,0,...].transpose(-1,-2).cpu().numpy(), False)
                 plt.show()
 
                 subLay = (2,5)
@@ -1406,7 +1407,7 @@ def train(savedCheckPoint):
                 addSubplot( 3, extViews[0,0],False)
                 addSubplot( 4, refViews[3,3])
                 addSubplot( 5, refViews[2,3])
-                addSubplot( 6, rndViews[1,2],False)
+                addSubplot( 6, rndViews[0,3])
                 addSubplot( 7, extViews[0,2],False)
                 addSubplot( 8, extViews[0,3])
                 addSubplot( 9, refViews[1,3])
