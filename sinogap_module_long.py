@@ -1128,11 +1128,8 @@ def generateDisplay(inp=None, boxes=None) :
     images = refImages if inp is None else inp
     images, orgDim = unsqeeze4dim(images)
     nofIm = images.shape[0]
-    sinLen = images.shape[-2]
     viewLen = DCfg.sinoSh[-1]
-    boxes =      refBoxes if inp is None \
-            else [ random.randint(0, sinLen-viewLen) for _ in range(nofIm) ] if boxes is None \
-            else boxes
+
     genImages = images.clone()
     preImages = images.clone()
     views = torch.empty((nofIm, 4, viewLen, viewLen ), dtype=torch.float32, device=TCfg.device)
@@ -1142,6 +1139,14 @@ def generateDisplay(inp=None, boxes=None) :
         genPatches = generator.generatePatches(images)
         genImages[DCfg.gapRng] = genPatches
     hGap = DCfg.gapW // 2
+
+    if inp is None :
+        boxes = refBoxes
+    elif boxes is None : # find worst boxes
+        diffImages = torch.abs(genImages - images)
+        diffY = fn.conv2d(diffImages, torch.ones((1,1,diffImages.shape[-1],diffImages.shape[-1]), device=diffImages.device))
+        boxes = diffY.squeeze().argmax(dim=-1)
+
     for curim in range(nofIm) :
         rng = np.s_[curim, 0, boxes[curim] : boxes[curim] + viewLen, : ]
         views[curim,0,...] = images   [rng]
@@ -1350,13 +1355,16 @@ def train(savedCheckPoint):
             #if True:
             if time.time() - lastUpdateTime > 60  or imer == images.shape[0]:
 
-                # find worst of the worst box
-                maxdif = torch.abs(maxMetrices['loss'][1] - maxMetrices['loss'][2])[None,...]
-                maxDifY = fn.conv2d(maxdif, torch.ones((1,1,maxdif.shape[-1],maxdif.shape[-1]), device=maxdif.device))
-                maxpos = maxDifY.squeeze().argmax().item()
+                # generate previews
                 extImages = torch.stack((maxMetrices['loss'][1],minMetrices['loss'][1]))
-                extViews, extGen, _ = generateDisplay(extImages, (maxpos, maxpos))
+                extViews, extGen, _ = generateDisplay(extImages)
                 extViews = extViews.cpu().numpy()
+                refViews, genImages, _ = generateDisplay()
+                refViews = refViews.cpu().numpy()
+                rndIndeces = random.sample(range(images.shape[0]), 2)
+                rndViews, rndGen, _ = generateDisplay(images[rndIndeces,...])
+                rndViews = rndViews.cpu().numpy()
+
 
                 IPython.display.clear_output(wait=True)
                 beforeReport(locals())
@@ -1374,12 +1382,6 @@ def train(savedCheckPoint):
                                    ,'Gen':updAcc.predFake
                                    #,'Pre':trainRes.predGen
                                    }, imer )
-
-                refViews, genImages, _ = generateDisplay()
-                refViews = refViews.cpu().numpy()
-                rndIndeces = random.sample(range(images.shape[0]), 2)
-                rndViews, rndGen, _ = generateDisplay(images[rndIndeces,...])
-                rndViews = rndViews.cpu().numpy()
 
                 subLay = (1,1)
                 def addSubplot(pos, img, sym=True) :
