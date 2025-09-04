@@ -940,23 +940,22 @@ def loss_MSSSIM(p_true, p_pred):
 class Metrics:
     calculate : callable
     norm : float # normalization factor - result of calculate on untrained model output
-    weight : float # weight in the final loss function
-    train : bool = True # whether to use this metric in training or not
+    weight : float # weight in the final loss function; zero means no loss contribution
 
 metrices = {
-    'Adv'    : Metrics(loss_Adv_Gen, 1.000e+00, 0, False),
+    'Adv'    : Metrics(loss_Adv_Gen, 1.000e+00, 0),
     'MSE'    : Metrics(loss_MSE,     1.154e-01, 1),
-    'L1L'    : Metrics(loss_L1L,     2.571e+00, 1, False),
-    'SSIM'   : Metrics(loss_SSIM,    4.183e-04, 1, False),
-    'MSSSIM' : Metrics(loss_MSSSIM,  4.515e-06, 1, False),
+    'L1L'    : Metrics(loss_L1L,     2.571e+00, 1),
+    'SSIM'   : Metrics(loss_SSIM,    4.183e-04, 1),
+    'MSSSIM' : Metrics(loss_MSSSIM,  4.515e-06, 1),
 }
 
 metricesTrain = {
-    'Adv'    : Metrics(loss_Adv_Gen, 1.000e+00, 0, False),
-    'MSE'    : Metrics(loss_MSE,     6.270e-01, 1),
-    'L1L'    : Metrics(loss_L1L,     6.050e+00, 1, False),
-    'SSIM'   : Metrics(loss_SSIM,    7.713e-04, 1, False),
-    'MSSSIM' : Metrics(loss_MSSSIM,  2.826e-05, 1, False),
+    'Adv'    : Metrics(loss_Adv_Gen, 1.000e+00, 0),
+    'MSE'    : Metrics(loss_MSE,     5.836e-01, 1),
+    'L1L'    : Metrics(loss_L1L,     9.742e+00, 1),
+    'SSIM'   : Metrics(loss_SSIM,    8.717e-04, 1),
+    'MSSSIM' : Metrics(loss_MSSSIM,  3.358e-05, 1),
 }
 
 
@@ -1003,16 +1002,16 @@ def loss_Gen(p_true, p_pred):
     sumweights = 0
     individualLosses = {}
     for key, metrics in metrices.items():
-        with torch.set_grad_enabled(metrics.train) :
-            if  metrics.weight > 0 :
+        if metrics.norm > 0 :
+            with torch.set_grad_enabled( metrics.weight > 0 ) :
                 thisLoss = metrics.calculate(p_true, p_pred) / metrics.norm
+                individualLosses[key] = thisLoss.sum().item()
                 updateExtremes(thisLoss, key, p_true, p_pred)
-                if metrics.train :
+                if  metrics.weight > 0 :
                     loss += metrics.weight * thisLoss
                     sumweights += metrics.weight
-                individualLosses[key] = thisLoss.sum().item()
-            else :
-                individualLosses[key] = 0
+        else :
+            individualLosses[key] = 1
     loss /= sumweights
     updateExtremes(loss, 'loss', p_true, p_pred)
     return loss.sum() , individualLosses
@@ -1259,7 +1258,7 @@ def train_step(allImages):
         subBatchSize = nofIm // batchSplit
 
         # train discriminator
-        if metrices['Adv'].train :
+        if metrices['Adv'].weight > 0 :
             optimizer_D.zero_grad()
             for i in range(batchSplit) :
                 subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
