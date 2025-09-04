@@ -943,7 +943,7 @@ class Metrics:
     weight : float # weight in the final loss function; zero means no loss contribution
 
 metrices = {
-    'Adv'    : Metrics(loss_Adv_Gen, 1.000e+00, 0),
+    'Adv'    : Metrics(loss_Adv_Gen, 0,         0),
     'MSE'    : Metrics(loss_MSE,     1.154e-01, 1),
     'L1L'    : Metrics(loss_L1L,     2.571e+00, 1),
     'SSIM'   : Metrics(loss_SSIM,    4.183e-04, 1),
@@ -951,7 +951,7 @@ metrices = {
 }
 
 metricesTrain = {
-    'Adv'    : Metrics(loss_Adv_Gen, 1.000e+00, 0),
+    'Adv'    : Metrics(loss_Adv_Gen, 0,         0),
     'MSE'    : Metrics(loss_MSE,     5.836e-01, 1),
     'L1L'    : Metrics(loss_L1L,     9.742e+00, 1),
     'SSIM'   : Metrics(loss_SSIM,    8.717e-04, 1),
