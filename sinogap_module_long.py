@@ -1373,9 +1373,12 @@ def train(savedCheckPoint):
                 writer.add_scalars("Losses per iter",
                                    {'Dis': updAcc.lossD
                                    ,'Gen': updAcc.lossG
-                                   ,'Adv' : updAcc.metrices['Adv']
+                                   #,'Adv' : updAcc.metrices['Adv']
                                    }, imer )
-                writer.add_scalars("Metrices per iter", updAcc.metrices, imer )
+                for key in updAcc.metrices.keys() :
+                    if metrices[key].norm > 0 :
+                        writer.add_scalars("Metrices per iter", {key : updAcc.metrices[key],}, imer )
+                #writer.add_scalars("Metrices per iter", updAcc.metrices, imer )
                 writer.add_scalars("Probs per iter",
                                    {'Ref':updAcc.predReal
                                    ,'Gen':updAcc.predFake
@@ -1436,9 +1439,12 @@ def train(savedCheckPoint):
         writer.add_scalars("Losses per epoch",
                            {'Dis': resAcc.lossD
                            ,'Gen': resAcc.lossG
-                           ,'Adv' : resAcc.metrices['Adv']
+                           #,'Adv' : resAcc.metrices['Adv']
                            }, epoch )
-        writer.add_scalars("Metrices per epoch", resAcc.metrices, epoch )
+        #writer.add_scalars("Metrices per epoch", resAcc.metrices, epoch )
+        for key in updAcc.metrices.keys() :
+            if metrices[key].norm > 0 :
+                writer.add_scalar("Metrices per epoch", key, updAcc.metrices[key], imer )
         writer.add_scalars("Probs per epoch",
                            {'Ref':resAcc.predReal
                            ,'Gen':resAcc.predFake
@@ -1451,7 +1457,7 @@ def train(savedCheckPoint):
         writer.add_scalars("Losses test",
                            {'Dis': resTest.lossD
                            ,'Gen': resTest.lossG
-                           ,'Adv' : resTest.metrices['Adv']
+                           #,'Adv' : resTest.metrices['Adv']
                            }, epoch )
         writer.add_scalars("Metrices test", resTest.metrices, epoch )
         writer.add_scalars("Probs test",
