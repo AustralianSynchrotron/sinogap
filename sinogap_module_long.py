@@ -918,23 +918,24 @@ def loss_Adv_Dis(p_true, p_pred):
     return ( torch.cat((loss_true, loss_pred), dim=0),
              torch.cat((predictions_true, predictions_pred), dim=0) )
 
-preNormLoss = False
+
 MSE = nn.MSELoss(reduction='none')
 def loss_MSE(p_true, p_pred):
-    lossToRet = MSE(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
-    if preNormLoss :
-        stds, _ = calculateNorm(p_true)
-        lossToRet = lossToRet / (stds.view([-1]) + 1e-7)**2
-    return lossToRet
+    return MSE(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
 
+def loss_MSEN(p_true, p_pred):
+    rawLoss = loss_MSE(p_true, p_pred)
+    stds = 1e-7 +  calculateNorm(p_true)[0].view([-1])
+    return rawLoss / stds**2
 
 L1L = nn.L1Loss(reduction='none')
 def loss_L1L(p_true, p_pred):
-    lossToRet = L1L(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
-    if preNormLoss :
-        stds, _ = calculateNorm(p_true)
-        lossToRet = lossToRet / (stds.view([-1]) + 1e-7)
-    return lossToRet
+    return L1L(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
+
+def loss_L1LN(p_true, p_pred):
+    rawLoss = loss_L1L(p_true, p_pred)
+    stds = 1e-7 + calculateNorm(p_true)[0].view([-1])
+    return rawLoss / stds
 
 SSIM = ssim.SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
 def loss_SSIM(p_true, p_pred):
@@ -960,7 +961,9 @@ class Metrics:
 metrices = {
     'Adv'    : Metrics(loss_Adv_Gen, 0, 0),
     'MSE'    : Metrics(loss_MSE,     1, 1),
+    'MSEN'   : Metrics(loss_MSEN,    1, 1),
     'L1L'    : Metrics(loss_L1L,     1, 1),
+    'L1LN'   : Metrics(loss_L1LN,    1, 1),
     'SSIM'   : Metrics(loss_SSIM,    1, 1),
     'MSSSIM' : Metrics(loss_MSSSIM,  1, 1),
 }
@@ -1212,7 +1215,6 @@ def calculateNorm(images) :
     return toRet[0], toRet[1]
 
 
-
 def saveCheckPoint(path, epoch, iterations, minGEpoch, minGdLoss,
                    generator, discriminator,
                    optimizerGen=None, optimizerDis=None,
@@ -1419,16 +1421,16 @@ def train(savedCheckPoint):
                     plt.axis("off")
 
                 subLay = (3,1)
-                plt.figure(frameon=False, layout='compressed')
-                plt.subplots_adjust(hspace=0.5, wspace=0)
+                plt.figure(frameon=True, layout='compressed', facecolor=(0,0.3,0.4))
+                #plt.subplots_adjust(hspace=0.5, wspace=0)
                 addSubplot(1, rndGen[0,0,...].transpose(-1,-2).cpu().numpy(), False)
                 addSubplot(2, genImages[0,0,...].transpose(-1,-2).cpu().numpy(), False)
                 addSubplot(3, extGen[0,0,...].transpose(-1,-2).cpu().numpy(), False)
                 plt.show()
 
                 subLay = (2,5)
-                plt.figure(frameon=False, figsize=(5,2))
-                plt.subplots_adjust(hspace = 0.1, wspace=0.1)
+                plt.figure(frameon=True, layout='compressed', facecolor=(0,0.3,0.4))
+                #plt.subplots_adjust(hspace = 0.1, wspace=0.1)
                     #print(vmm, end=' ')
                 addSubplot( 1, rndViews[0,2],False)
                 addSubplot( 2, extViews[0,1],False)
