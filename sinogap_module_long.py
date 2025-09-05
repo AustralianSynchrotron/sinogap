@@ -567,7 +567,7 @@ def createDataSet(path, listOfData, exclusive=False) :
     if not exclusive :
         transList.append(transforms.RandomHorizontalFlip()),
         transList.append(transforms.RandomVerticalFlip()),
-    transList.append(transforms.Normalize(mean=(0.5), std=(1)))
+    #transList.append(transforms.Normalize(mean=(0.5), std=(1)))
     mytransforms = transforms.Compose(transList)
     return sinoRoot.get_dataset(mytransforms)
 trainSet = initIfNew('trainSet')
@@ -595,7 +595,7 @@ def createReferences(tSet, majorIdx = 0) :
         examples.insert(0, examples.pop(majorIdx))
     mytransforms = transforms.Compose([
             transforms.Resize(DCfg.sinoSh),
-            transforms.Normalize(mean=(0.5), std=(1))
+            #transforms.Normalize(mean=(0.5), std=(1))
     ])
     refImages = torch.empty((len(examples), 1, *DCfg.sinoSh), dtype=torch.float32).to(TCfg.device)
     refBoxes = []
@@ -780,6 +780,8 @@ class GeneratorTemplate(nn.Module):
         modelIn = images.clone().detach()
         with torch.no_grad() :
             modelIn[self.gapRng] = self.preProc(images)
+            stds, means = torch.std_mean(modelIn, dim=(-1,-2), keepdim=True)
+            modelIn = (modelIn - means) / (stds + 1e-7) # normalize per image
         #return squeezeOrg(modelIn[self.gapRng], orgDims)
         if self.latentChannels :
             latent = self.noise2latent(noises)
@@ -797,6 +799,7 @@ class GeneratorTemplate(nn.Module):
         res = self.lastTouch(torch.cat( (upTrain[-1], modelIn ), dim=1 ))
 
         patches = modelIn[self.gapRng] + res[self.gapRng] * self.amplitude
+        patches = patches * (stds + 1e-7) + means # denormalise
         return squeezeOrg(patches, orgDims)
 
 
@@ -915,25 +918,37 @@ def loss_Adv_Dis(p_true, p_pred):
     return ( torch.cat((loss_true, loss_pred), dim=0),
              torch.cat((predictions_true, predictions_pred), dim=0) )
 
+preNormLoss = False
 MSE = nn.MSELoss(reduction='none')
 def loss_MSE(p_true, p_pred):
-    return MSE(p_pred[DCfg.gapRng], p_true[DCfg.gapRng]).sum(dim=(-1,-2,-3))
+    lossToRet = MSE(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
+    if preNormLoss :
+        stds, _ = calculateNorm(p_true)
+        lossToRet = lossToRet / (stds.view([-1]) + 1e-7)**2
+    return lossToRet
+
 
 L1L = nn.L1Loss(reduction='none')
 def loss_L1L(p_true, p_pred):
-    return L1L(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
+    lossToRet = L1L(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
+    if preNormLoss :
+        stds, _ = calculateNorm(p_true)
+        lossToRet = lossToRet / (stds.view([-1]) + 1e-7)
+    return lossToRet
 
 SSIM = ssim.SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
 def loss_SSIM(p_true, p_pred):
     p_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
     p_pred, _ = unsqeeze4dim(p_pred[DCfg.gapRng])
-    return (1 - SSIM( p_true+0.5, p_pred+0.5 ) ) / 2
+    #return (1 - SSIM( p_true+0.5, p_pred+0.5 ) ) / 2
+    return (1 - SSIM( p_true, p_pred ) ) / 2
 
 MSSSIM = ssim.MS_SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
 def loss_MSSSIM(p_true, p_pred):
     p_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
     p_pred, _ = unsqeeze4dim(p_pred[DCfg.gapRng])
-    return (1 - MSSSIM( p_true+0.5, p_pred+0.5 ) ) / 2
+    #return (1 - MSSSIM( p_true+0.5, p_pred+0.5 ) ) / 2
+    return (1 - MSSSIM( p_true, p_pred ) ) / 2
 
 
 @dataclass
@@ -943,21 +958,30 @@ class Metrics:
     weight : float # weight in the final loss function; zero means no loss contribution
 
 metrices = {
-    'Adv'    : Metrics(loss_Adv_Gen, 0,         0),
-    'MSE'    : Metrics(loss_MSE,     1.154e-01, 1),
-    'L1L'    : Metrics(loss_L1L,     2.571e+00, 1),
-    'SSIM'   : Metrics(loss_SSIM,    4.183e-04, 1),
-    'MSSSIM' : Metrics(loss_MSSSIM,  4.515e-06, 1),
+    'Adv'    : Metrics(loss_Adv_Gen, 0, 0),
+    'MSE'    : Metrics(loss_MSE,     1, 1),
+    'L1L'    : Metrics(loss_L1L,     1, 1),
+    'SSIM'   : Metrics(loss_SSIM,    1, 1),
+    'MSSSIM' : Metrics(loss_MSSSIM,  1, 1),
 }
 
-metricesTrain = {
-    'Adv'    : Metrics(loss_Adv_Gen, 0,         0),
-    'MSE'    : Metrics(loss_MSE,     5.836e-01, 1),
-    'L1L'    : Metrics(loss_L1L,     9.742e+00, 1),
-    'SSIM'   : Metrics(loss_SSIM,    8.717e-04, 1),
-    'MSSSIM' : Metrics(loss_MSSSIM,  3.358e-05, 1),
+# Gap 2 metrices
+{
+#metrices = {
+#    'Adv'    : Metrics(loss_Adv_Gen, 0,         0),
+#    'MSE'    : Metrics(loss_MSE,     1.154e-01, 1),
+#    'L1L'    : Metrics(loss_L1L,     2.571e+00, 1),
+#    'SSIM'   : Metrics(loss_SSIM,    4.183e-04, 1),
+#    'MSSSIM' : Metrics(loss_MSSSIM,  4.515e-06, 1),
+#}
+#metricesTrain = {
+#    'Adv'    : Metrics(loss_Adv_Gen, 0,         0),
+#    'MSE'    : Metrics(loss_MSE,     5.836e-01, 1),
+#    'L1L'    : Metrics(loss_L1L,     9.742e+00, 1),
+#    'SSIM'   : Metrics(loss_SSIM,    8.717e-04, 1),
+#    'MSSSIM' : Metrics(loss_MSSSIM,  3.358e-05, 1),
+#}
 }
-
 
 
 minMetrices = None
@@ -1011,7 +1035,7 @@ def loss_Gen(p_true, p_pred):
                     loss += metrics.weight * thisLoss
                     sumweights += metrics.weight
         else :
-            individualLosses[key] = 1
+            individualLosses[key] = p_true.shape[0]
     loss /= sumweights
     updateExtremes(loss, 'loss', p_true, p_pred)
     return loss.sum() , individualLosses
@@ -1183,9 +1207,9 @@ def calculateWeights(images) :
     return None
 
 def calculateNorm(images) :
-    mean2 = images[...,:DCfg.gapRngX.start].mean(dim=(-1,-2)) \
-          + images[...,DCfg.gapRngX.stop:].mean(dim=(-1,-2))
-    return 2 / ( 1 + mean2 + 1e-5 ) # to denorm and adjust for mean
+    noGapImages = torch.cat( (images[...,:DCfg.gapRngX.start], images[...,DCfg.gapRngX.stop:]), dim=-1)
+    toRet = torch.std_mean( noGapImages, dim=(-1,-2), keepdim=True )
+    return toRet[0], toRet[1]
 
 
 
@@ -1442,9 +1466,9 @@ def train(savedCheckPoint):
                            #,'Adv' : resAcc.metrices['Adv']
                            }, epoch )
         #writer.add_scalars("Metrices per epoch", resAcc.metrices, epoch )
-        for key in updAcc.metrices.keys() :
+        for key in resAcc.metrices.keys() :
             if metrices[key].norm > 0 :
-                writer.add_scalar("Metrices per epoch", key, updAcc.metrices[key], imer )
+                writer.add_scalars("Metrices per epoch", {key : resAcc.metrices[key],}, epoch )
         writer.add_scalars("Probs per epoch",
                            {'Ref':resAcc.predReal
                            ,'Gen':resAcc.predFake
@@ -1454,17 +1478,19 @@ def train(savedCheckPoint):
         displayImages()
         resTest = summarizeMe(testLoader, False)
         resTest *= 1/resTest.nofIm
-        writer.add_scalars("Losses test",
-                           {'Dis': resTest.lossD
-                           ,'Gen': resTest.lossG
-                           #,'Adv' : resTest.metrices['Adv']
-                           }, epoch )
-        writer.add_scalars("Metrices test", resTest.metrices, epoch )
-        writer.add_scalars("Probs test",
-                           {'Ref':resTest.predReal
-                           ,'Gen':resTest.predFake
-                           #,'Pre':trainRes.predGen
-                           }, epoch )
+        writer.add_scalars("Losses epoch test",
+            {'Dis': resTest.lossD
+            ,'Gen': resTest.lossG
+            #,'Adv' : resTest.metrices['Adv']
+            }, epoch )
+        for key in resTest.metrices.keys() :
+            if metrices[key].norm > 0 :
+                writer.add_scalars("Metrices epoch test", {key : resTest.metrices[key],}, epoch )
+        writer.add_scalars("Probs epoch test",
+            {'Ref':resTest.predReal
+            ,'Gen':resTest.predFake
+            #,'Pre':trainRes.predGen
+            }, epoch )
 
 
         lastGLoss = resAcc.lossG # Rec_test
