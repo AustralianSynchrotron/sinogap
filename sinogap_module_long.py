@@ -1431,7 +1431,6 @@ def train(savedCheckPoint):
                 subLay = (2,5)
                 plt.figure(frameon=True, layout='compressed', facecolor=(0,0.3,0.5))
                 #plt.subplots_adjust(hspace = 0.1, wspace=0.1)
-                    #print(vmm, end=' ')
                 addSubplot( 1, extViews[0,2],False)
                 addSubplot( 2, rndViews[0,1],False)
                 addSubplot( 3, rndViews[0,0],False)
