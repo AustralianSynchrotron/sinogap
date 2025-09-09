@@ -584,6 +584,7 @@ def createDataLoader(tSet, num_workers=os.cpu_count(), shuffle=False) :
 
 
 examples = [
+    (11142, 3128), # (0, 417, 1877)
     (38576, 2560), # (3, 476, 2855)
     (26289, 6300), # (2, 280, 828)
     (24299, 7160), # (2, 113, 988)
@@ -879,7 +880,7 @@ def adjustScheduler(scheduler, iniLr, target) :
     if gamma < 1 and curLR > target \
     or gamma > 1 and curLR < target :
         scheduler.step()
-    return f"LR : {scheduler.get_last_lr()[0]:.3e} ({curLR:.3f}). "
+    return f"LR : {scheduler.get_last_lr()[0]:.3e} ({curLR:.3e}). "
 
 
 def restoreCheckpoint(path=None, logDir=None) :
@@ -1171,7 +1172,7 @@ def generateDisplay(inp=None, boxes=None) :
     elif boxes is None : # find worst boxes
         diffImages = torch.abs(genImages - images)
         diffY = fn.conv2d(diffImages, torch.ones((1,1,diffImages.shape[-1],diffImages.shape[-1]), device=diffImages.device))
-        boxes = diffY.squeeze().argmax(dim=-1)
+        boxes = diffY.squeeze(1,-1).argmax(dim=-1)
 
     for curim in range(nofIm) :
         rng = np.s_[curim, 0, boxes[curim] : boxes[curim] + viewLen, : ]
@@ -1187,6 +1188,7 @@ def generateDisplay(inp=None, boxes=None) :
 
 def displayImages(inp=None, boxes=None) :
     views, genImages, _ = generateDisplay(inp, boxes)
+    genImages = unsqeeze4dim(genImages)[0]
     views = views.cpu().numpy()
     nofIm = views.shape[0]
     for curim in range(nofIm) :
