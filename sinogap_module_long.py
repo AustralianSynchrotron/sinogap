@@ -584,7 +584,7 @@ def createDataLoader(tSet, num_workers=os.cpu_count(), shuffle=False) :
 
 
 examples = [
-    (11142, 3128), # (0, 417, 1877)
+    (11142, 3150), # (0, 417, 1877)
     (38576, 2560), # (3, 476, 2855)
     (26289, 6300), # (2, 280, 828)
     (24299, 7160), # (2, 113, 988)
@@ -779,10 +779,10 @@ class GeneratorTemplate(nn.Module):
         images, noises = input
         images, orgDims = unsqeeze4dim(images)
         modelIn = images.clone().detach()
-        with torch.no_grad() :
-            modelIn[self.gapRng] = self.preProc(images)
-            stds, means = torch.std_mean(modelIn, dim=(-1,-2), keepdim=True)
-            modelIn = (modelIn - means) / (stds + 1e-7) # normalize per image
+        #with torch.no_grad() :
+        modelIn[self.gapRng] = self.preProc(images)
+        stds, means = torch.std_mean(modelIn, dim=(-1,-2), keepdim=True)
+        modelIn = (modelIn - means) / (stds + 1e-7) # normalize per image
         #return squeezeOrg(modelIn[self.gapRng], orgDims)
         if self.latentChannels :
             latent = self.noise2latent(noises)
@@ -1284,6 +1284,7 @@ def train_step(allImages):
     while trainRes.nofIm < nofAllIm :
 
         images = allImages[ trainRes.nofIm : trainRes.nofIm + TCfg.batchSize , ... ]
+        #fakeImages = images.clone().detach()
         nofIm = images.shape[0]
         trainRes.nofIm += nofIm
         #images, _ = unsqeeze4dim(images.to(TCfg.device))
@@ -1317,6 +1318,8 @@ def train_step(allImages):
             subImages = images[subRange,...]#.clone().detach()
             subImages.requires_grad = True
             subFakeImages = generator.generateImages(subImages)
+            #subFakeImages = fakeImages[subRange,...]
+            #subFakeImages[DCfg.gapRng] = generator.generatePatches(subImages)
             genLoss, indLosses = loss_Gen(subImages, subFakeImages)
             trainRes.lossG += genLoss.item()
             for key in metrices.keys() :
@@ -1388,6 +1391,7 @@ def train(savedCheckPoint):
             if time.time() - lastUpdateTime > 60  or imer == images.shape[0]:
 
                 # generate previews
+                generator.eval()
                 extImages = torch.stack((maxMetrices['loss'][1],minMetrices['loss'][1]))
                 extViews, extGen, _ = generateDisplay(extImages)
                 extViews = extViews.cpu().numpy()
@@ -1396,6 +1400,7 @@ def train(savedCheckPoint):
                 rndIndeces = random.sample(range(images.shape[0]), 2)
                 rndViews, rndGen, _ = generateDisplay(images[rndIndeces,...])
                 rndViews = rndViews.cpu().numpy()
+                generator.train()
 
 
                 IPython.display.clear_output(wait=True)
@@ -1483,6 +1488,7 @@ def train(savedCheckPoint):
                            #,'Pre':trainRes.predGen
                            }, epoch )
 
+        generator.eval()
         displayImages()
         resTest = summarizeMe(testLoader, False)
         resTest *= 1/resTest.nofIm
@@ -1499,6 +1505,7 @@ def train(savedCheckPoint):
             ,'Gen':resTest.predFake
             #,'Pre':trainRes.predGen
             }, epoch )
+        generator.train()
 
 
         lastGLoss = resAcc.lossG # Rec_test
