@@ -929,6 +929,10 @@ def loss_MSEN(p_true, p_pred):
     stds = 1e-7 +  calculateNorm(p_true)[0].view([-1])
     return rawLoss / stds**2
 
+def loss_SMSE(p_true, p_pred):
+    mseLoss = MSE(p_true[DCfg.gapRng], p_pred[DCfg.gapRng])
+    return (torch.square(mseLoss)).sum(dim=(-1,-2,-3))
+
 L1L = nn.L1Loss(reduction='none')
 def loss_L1L(p_true, p_pred):
     return L1L(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
@@ -962,6 +966,7 @@ class Metrics:
 metrices = {
     'Adv'    : Metrics(loss_Adv_Gen, 0, 0),
     'MSE'    : Metrics(loss_MSE,     1, 1),
+    'SMSE'   : Metrics(loss_SMSE,    1, 1),
     'MSEN'   : Metrics(loss_MSEN,    1, 1),
     'L1L'    : Metrics(loss_L1L,     1, 1),
     'L1LN'   : Metrics(loss_L1LN,    1, 1),
