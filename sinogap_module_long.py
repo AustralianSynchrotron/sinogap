@@ -779,10 +779,10 @@ class GeneratorTemplate(nn.Module):
         images, noises = input
         images, orgDims = unsqeeze4dim(images)
         modelIn = images.clone().detach()
-        #with torch.no_grad() :
-        modelIn[self.gapRng] = self.preProc(images)
-        stds, means = torch.std_mean(modelIn, dim=(-1,-2), keepdim=True)
-        modelIn = (modelIn - means) / (stds + 1e-7) # normalize per image
+        with torch.no_grad() :
+            modelIn[self.gapRng] = self.preProc(images)
+            stds, means = torch.std_mean(modelIn, dim=(-1,-2), keepdim=True)
+            modelIn = (modelIn - means) / (stds + 1e-7) # normalize per image
         #return squeezeOrg(modelIn[self.gapRng], orgDims)
         if self.latentChannels :
             latent = self.noise2latent(noises)
@@ -792,7 +792,9 @@ class GeneratorTemplate(nn.Module):
 
         for encoder in self.encoders :
             dwTrain.append(encoder(dwTrain[-1]))
+        #return dwTrain[-1]
         mid = self.fcLink(dwTrain[-1])
+        self.bottleNeck = mid.clone().detach() # for higher resolution generators
         #return mid
         upTrain = [mid]
         for level, decoder in enumerate(self.decoders) :
@@ -1528,6 +1530,7 @@ def train(savedCheckPoint):
 
         resAcc = TrainResClass()
         afterEachEpoch(locals())
+        print("Epoch completed.\n")
 
 
 
