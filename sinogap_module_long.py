@@ -968,7 +968,7 @@ class Metrics:
 metrices = {
     'Adv'    : Metrics(loss_Adv_Gen, 0, 0),
     'MSE'    : Metrics(loss_MSE,     1, 1),
-    'SMSE'   : Metrics(loss_SMSE,    1, 1),
+    #'SMSE'   : Metrics(loss_SMSE,    1, 1),
     'MSEN'   : Metrics(loss_MSEN,    1, 1),
     'L1L'    : Metrics(loss_L1L,     1, 1),
     'L1LN'   : Metrics(loss_L1LN,    1, 1),
