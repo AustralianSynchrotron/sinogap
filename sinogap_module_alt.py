@@ -1,4 +1,6 @@
 
+from re import sub
+from weakref import ref
 import IPython
 
 import sys
@@ -9,16 +11,18 @@ import gc
 import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum
+import glob
 
 import math
 import statistics
 from cv2 import norm
 import numpy as np
+import test
 import torch
 import torch.nn as nn
 import torch.nn.functional as fn
 import torchvision
-from torch import optim
+from torch import optim, rand
 from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
 
@@ -48,9 +52,11 @@ class TCfgClass:
     labelSmoothFac: float
     learningRateD: float
     learningRateG: float
+    dataDir : str
     device: torch.device = torch.device('cpu')
-    batchSplit : int = 1
+    batchSplit : int = 1 # negative to load multiple batches at a time.
     nofEpochs: int = 0
+    num_workers : int = os.cpu_count()
     historyHDF : str = field(repr = True, init = False)
     logDir : str = field(repr = True, init = False)
     def __post_init__(self):
@@ -58,7 +64,7 @@ class TCfgClass:
             self.device = torch.device(f"cuda:{self.exec}")
         self.historyHDF = f"train_{self.exec}.hdf"
         self.logDir = f"runs/experiment_{self.exec}"
-        if self.batchSize % self.batchSplit :
+        if self.batchSplit > 1 and self.batchSize % self.batchSplit :
             raise Exception(f"Batch size {self.batchSize} is not divisible by batch split {self.batchSplit}.")
 global TCfg
 TCfg = initIfNew('TCfg')
@@ -67,6 +73,7 @@ TCfg = initIfNew('TCfg')
 @dataclass
 class DCfgClass:
     gapW : int
+    sinoLen : int = 250
     sinoSh : tuple = field(repr = True, init = False)
     sinoSize : int = field(repr = True, init = False)
     gapSh : tuple = field(repr = True, init = False)
@@ -74,8 +81,9 @@ class DCfgClass:
     gapRngX : type(np.s_[:]) = field(repr = True, init = False)
     gapRng : type(np.s_[:]) = field(repr = True, init = False)
     disRng : type(np.s_[:]) = field(repr = True, init = False)
+    readWidth : int = 80
     def __post_init__(self):
-        self.sinoSh = (256*self.gapW,5*self.gapW)
+        self.sinoSh = (self.sinoLen*self.gapW,5*self.gapW)
         self.sinoSize = math.prod(self.sinoSh)
         self.gapSh = (self.sinoSh[0],self.gapW)
         self.gapSize = math.prod(self.gapSh)
@@ -162,13 +170,15 @@ def plotData(dataY, rangeY=None, dataYR=None, rangeYR=None,
         plt.close(fig)
 
 
-def plotImage(image) :
+def plotImage(image, frameon=False) :
+    plt.figure(frameon=frameon)
     plt.imshow(image, cmap='gray')
     plt.axis("off")
     plt.show()
 
 
-def plotImages(images) :
+def plotImages(images, frameon=False) :
+    plt.figure(frameon=frameon)
     for i, img in enumerate(images) :
         ax = plt.subplot(1, len(images), i + 1)
         plt.imshow(img.squeeze(), cmap='gray')
@@ -199,16 +209,16 @@ def tensorStat(stat) :
           f"{stat.min().item():.3e}, {stat.max().item():.3e}")
 
 
-def fillWheights(seq) :
+def fillWheights(seq, std=0.001) :
     for wh in seq :
         if hasattr(wh, 'weight') :
             #torch.nn.init.xavier_uniform_(wh.weight)
             #torch.nn.init.zeros_(wh.weight)
             #torch.nn.init.constant_(wh.weight, 0)
             #torch.nn.init.uniform_(wh.weight, a=0.0, b=1.0, generator=None)
-            torch.nn.init.normal_(wh.weight, mean=0.0, std=0.01)
-        if hasattr(wh, 'bias') :
-            torch.nn.init.normal_(wh.bias, mean=0.0, std=0.01)
+            torch.nn.init.normal_(wh.weight, mean=0.0, std=std)
+        if hasattr(wh, 'bias') and wh.bias is not None :
+            torch.nn.init.normal_(wh.bias, mean=0.0, std=0)
 
 
 def unsqeeze4dim(tens):
@@ -301,8 +311,37 @@ def loadImage(imageName, expectedShape=None) :
     return imdata
 
 
+
+def residesInMemory(hdfName) :
+    mmapPrefixes = ["/dev/shm",]
+    if "CTAS_MMAP_PATH" in os.environ :
+        mmapPrefixes.extend(os.environ["CTAS_MMAP_PATH"].split(':'))
+    hdfName = os.path.realpath(hdfName)
+    for mmapPrefix in mmapPrefixes :
+        if hdfName.startswith(mmapPrefix) :
+            return True
+    return False
+
+def goodForMmap(trgH5F, data) :
+    fileSize = trgH5F.id.get_filesize()
+    offset = data.id.get_offset()
+    plist = data.id.get_create_plist()
+    if offset < 0 \
+    or not plist.get_layout() in (h5d.CONTIGUOUS, h5d.COMPACT) \
+    or plist.get_external_count() \
+    or plist.get_nfilters() \
+    or fileSize - offset < math.prod(data.shape) * data.dtype.itemsize :
+        return None, None
+    else :
+        return offset, data.id.dtype
+
+
 def getInData(inputString, verbose=False, preread=False):
     nameSplit = inputString.split(':')
+    if len(nameSplit) == 1 : # tiff image
+        data = loadImage(nameSplit[0])
+        data = np.expand_dims(data, 1)
+        return data
     if len(nameSplit) != 2 :
         raise Exception(f"String \"{inputString}\" does not represent an HDF5 format \"fileName:container\".")
     hdfName = nameSplit[0]
@@ -320,26 +359,19 @@ def getInData(inputString, verbose=False, preread=False):
     if len(sh) != 3 :
         raise Exception(f"Dimensions of the container \"{inputString}\" is not 3: {sh}.")
     try : # try to mmap hdf5 if it is in memory
-        mmapPrefixes = os.environ["CTAS_MMAP_PATH"].split(':')
-        mmapPrefixes.append["/dev/shm"]
-        residesInMemory = False
-        for mmapPrefix in mmapPrefixes :
-            if hdfName.startswith(mmapPrefix) :
-                residesInMemory = True
-        if not residesInMemory :
+        if not residesInMemory(hdfName) :
             raise Exception()
         fileSize = trgH5F.id.get_filesize()
         offset = data.id.get_offset()
         dtype = data.id.dtype
         plist = data.id.get_create_plist()
         if offset < 0 \
-        or not plist.get_layout() in (h5d.CONTIGUOUS, h5d.CONTIGUOUS) \
+        or not plist.get_layout() in (h5d.CONTIGUOUS, h5d.COMPACT) \
         or plist.get_external_count() \
         or plist.get_nfilters() \
-        or fileSize - offset < math.prod(sh) * data.dtype().itemsize() :
+        or fileSize - offset < math.prod(sh) * data.dtype.itemsize :
             raise Exception()
         # now all is ready
-        hdfName = os.path.realpath(hdfName)
         dataN = np.memmap(hdfName, shape=sh, dtype=dtype, mode='r', offset=offset)
         data = dataN
         trgH5F.close()
@@ -359,6 +391,7 @@ def getInData(inputString, verbose=False, preread=False):
     return data
 
 
+
 def createWriter(logDir, addToExisting=False) :
     if not addToExisting and os.path.exists(logDir) :
         raise Exception(f"Log directory \"{logDir}\" for the experiment already exists."
@@ -371,106 +404,99 @@ class DevicePlace:
     def __call__(self, x):
         return x.to(TCfg.device)
 
+
+@dataclass
+class Item:
+    image : any = field(repr = False)
+    orgSh : tuple
+    coord : tuple
+    index : int | None = None
+
+
 class StripesFromHDF :
 
-    def __init__(self, sampleName, maskName, loadToMem=True):
+    def __init__(self, sampleName, maskName, exclusive=False):
 
         self.volume = getInData(sampleName, False, False)
         self.sh = self.volume.shape
         self.fsh = self.sh[1:3]
 
-        self.mask = loadImage(maskName)
+        self.mask = loadImage(maskName, self.fsh)
+        self.mask /= self.mask.max()
         if self.mask is None :
             self.mask = np.ones(self.fsh, dtype=np.uint8)
-        self.mask = self.mask.astype(bool)
-        #self.bg = loadImage(bgName)
-        #self.df = loadImage(dfName)
-        #if self.bg is not None :
-        #    if self.df is not None:
-        #        self.bg -= self.df
-        #    self.mask  &=  self.bg > 0.0
-        self.forbidenSinos = self.mask
-        self.forbidenSinos[:, -DCfg.sinoSh[-1]:] = 0
-        for yCr in range(0,self.fsh[0]) :
-            for xCr in range(0,self.fsh[1]) :
-                idx = np.s_[yCr,xCr]
-                if not self.mask[idx] :
-                    self.forbidenSinos[ yCr, max(0, xCr-DCfg.sinoSh[-1]) : xCr ] = 0
-        self.availableSinos = np.count_nonzero(self.forbidenSinos)
+        #self.mask = self.mask.astype(bool)
+        forbidenSinos = self.mask.copy()
+        for shft in range (1, DCfg.readWidth) :
+            forbidenSinos[:,:-shft] *= self.mask[:,shft:]
+        forbidenSinos[:, -DCfg.readWidth:] = 0
+        if exclusive : # non-overlapping sinograms
+            for yCr in range(0,self.fsh[0]) :
+                xCr = 0
+                while xCr < self.fsh[1]-DCfg.readWidth :
+                    if np.all(forbidenSinos[yCr, xCr:xCr+DCfg.readWidth] > 0) :
+                        forbidenSinos[ yCr, xCr+1 : xCr+DCfg.readWidth ] = 0
+                        xCr += DCfg.readWidth
+                    else :
+                        forbidenSinos[ yCr, xCr ] = 0
+                        xCr += 1
+        self.availableSinos = np.argwhere(forbidenSinos)
 
 
     def __len__(self):
-        return self.availableSinos
+        return self.availableSinos.shape[0]
 
 
     def __getitem__(self, index=None):
 
-        if type(index) is tuple and len(index) == 3 :
-            ydx, xdx, sinoHeight = index
-        else :
-            while True:
-                ydx = random.randint(0,self.fsh[0]-1)
-                xdx = random.randint(0,self.fsh[1]-DCfg.sinoSh[-1]-1)
-                if self.forbidenSinos[ydx,xdx] :
-                    break
-        idx = np.s_[ ydx , xdx : xdx + DCfg.sinoSh[-1] ]
-        data = self.volume[..., *idx ]
-        return (data, (ydx, xdx, data.shape[0]) )
+        if type(index) is tuple and len(index) == 2 :
+            ydx, xdx = index
+            index = None
+        if type(index) is None :
+            index = random.randint(0, len(self)-1)
+        ydx, xdx = tuple( int(dx) for dx in self.availableSinos[index,:] )
+        idx = np.s_[ ydx , xdx : xdx + DCfg.readWidth ]
+        data = self.volume[..., *idx ].copy()
+        return Item(data, data.shape, (ydx, xdx), index)
         #data = torch.from_numpy(data).clone().unsqueeze(0).to(TCfg.device)
         #if sinoHeight != DCfg.sinoSh[0] :
         #    data = torch.nn.functional.interpolate(data.unsqueeze(0), size=DCfg.sinoSh,mode='bilinear').squeeze(0)
 
 
-
-    def get_dataset(self, transform=None) :
-
-        class Sinos(torch.utils.data.Dataset) :
-            def __init__(self, root, transform=None):
-                self.container = root
-                self.oblTransform = transforms.Compose( [transforms.ToTensor(),
-                                                         DevicePlace(),
-                                                         transforms.Resize(DCfg.sinoSh)] )
-                self.transform = transform
-            def __len__(self):
-                return self.container.__len__()
-            def __getitem__(self, index=None, doTransform=True):
-                data, index = self.container.__getitem__(index)
-                data = self.oblTransform(data)
-                if doTransform and self.transform :
-                    data = self.transform(data)
-                return (data, index)
-
-        return Sinos(self, transform)
-
-
 class StripesFromHDFs :
 
-    def __init__(self, bases):
+    def __init__(self, bases, exclusive=False):
         self.collection = []
         for base in bases :
             print(f"Loading train set {len(self.collection)+1} of {len(bases)}: " + base + " ... ", end="")
             self.collection.append(
-                StripesFromHDF(f"storage/{base}.hdf:/data", f"storage/{base}.mask++.tif") )
+                StripesFromHDF(f"{base}.hdf:/data", f"{base}.mask++.tif", exclusive) )
             print("Done")
 
 
     def __getitem__(self, index=None):
 
-        if type(index) is tuple and len(index) == 4 :
-            setdx, ydx, xdx, sinoHeight = index
-            return self.collection[setdx].__getitem__((setdx, ydx, xdx, sinoHeight))
+        if type(index) is tuple and len(index) == 3 :
+            setdx, ydx, xdx = index
+            item = self.collection[setdx].__getitem__((ydx, xdx))
+            item.coord = (setdx, *item.coord)
+            item.index = None
+            return item
         else :
-            cindex = random.randint(0,len(self)-1)
-            leftover = cindex
+            if index is None:
+                index = random.randint(0,len(self)-1)
+            leftover = index
             for setdx in range(len(self.collection)) :
                 setLen = len(self.collection[setdx])
                 if leftover >= setLen :
                     leftover -= setLen
                 else :
-                    data, insetdx = self.collection[setdx].__getitem__()
-                    return (data, (setdx, *insetdx) )
+                    item = self.collection[setdx].__getitem__(leftover)
+                    item.coord = (setdx, *item.coord)
+                    item.index = index
+                    return item
             else :
-                raise f"No set for index {cindex}. Should never happen."
+                raise Exception(f"No set for index {index}. Should never happen.")
 
 
     def __len__(self):
@@ -483,243 +509,164 @@ class StripesFromHDFs :
             def __init__(self, root, transform=None):
                 self.container = root
                 self.oblTransform = transforms.Compose( [transforms.ToTensor(),
-                                                         DevicePlace(),
+                                                         #DevicePlace(),
                                                          transforms.Resize(DCfg.sinoSh)] )
                 self.transform = transform
             def __len__(self):
                 return self.container.__len__()
             def __getitem__(self, index=None, doTransform=True):
-                data, index = self.container.__getitem__(index)
-                data = self.oblTransform(data)
+                item = self.container.__getitem__(index)
+                data = self.oblTransform(item.image)
                 if doTransform and self.transform :
                     data = self.transform(data)
-                return (data, index)
+                item.image = data
+                toRet = {}
+                toRet['image'] = item.image
+                toRet['coord'] = item.coord
+                toRet['index'] = item.index
+                toRet['orgSh'] = item.orgSh
+                return toRet
 
         return Sinos(self, transform)
 
 
-examplesDb = {}
-examplesDb[2] = [
-                  263185,
-                  173496,
-                  213234,
-                  241201,
-                  264646,
-                  195114,
-                  195999,
-                  863528,
-                  755484,
-                  222701,
-                  818392,
-                  952538,
-                  801601,
-                  944579,
-                  1082431,
-                  842400,
-                ]
-examplesDb[4] = [
-                  263185,
-                  173496,
-                  213234,
-                  241201,
-                  264646,
-                  195114,
-                  195999,
-                  863528,
-                  755484,
-                  222701,
-                  818392,
-                  #952538,
-                  #801601,
-                  #944579,
-                  #1082431,
-                  842400,
-                ]
-examplesDb[8] = [
-                  263185,
-                  173496,
-                  213234,
-                  241201,
-                  264646,
-                  195114,
-                  195999,
-                  #863528,
-                  #755484,
-                  #222701,
-                  #818392,
-                  #952538,
-                  #801601,
-                  #944579,
-                  #1082431,
-                  842400,
-                ]
-examplesDb[16] = [
-                  263185,
-                  173496,
-                  213234,
-                  #241201,
-                  #264646,
-                  #195114,
-                  #195999,
-                  #863528,
-                  #755484,
-                  #222701,
-                  #818392,
-                  #952538,
-                  #801601,
-                  #944579,
-                  #1082431,
-                  842400,
-                ]
+listOfTrainData = [
+    "18692a.ExpChicken6mGyShift",
+    "23574.8965435L.Eiger.32kev_sft",
+    "19022g.11-EggLard",
+    "18692b.MinceO",
+    "23574.8965435L.Eiger.32kev_org",
+    "19736b.09_Feb.4176862R_Eig_Threshold-4keV",
+    "20982b.04_774784R",
+    "18515.Lamb1_Eiger_7m_45keV_360Scan",
+    "19736c.8733147R_Eig_Threshold-8keV.SAMPLE_Y1",
+    "18692b_input_PhantomM",
+    "21836b.2024-08-15-mastectomies.4201381L.35kev.20Hz",
+    "23574h.9230799R.35kev",
+    "18515.Lamb4_Excised_Eiger_7m_30keV_360Scan.Y1",
+    "18648.B_Edist.80keV_0m_Eig_Neoprene.Y2",
+    "19932.10_8093920_35keV",
+    "19932.14_2442231_23keV",
+    "19932.16_4193759_60keV",
+]
+listOfTestData = [
+    "19603a.Exposures.70keV_7m_Calf2_Threshold35keV_25ms_Take2",
+    "22280a_input_Day_4_40keV_7m_Threshold20keV_50ms_Y04_no_shell__0.05deg",
+    "18515.Lamb4_Eiger_5m_50keV_360Scan.SAMPLE_Y1",
+    "18692b_input_Phantom0",
+    #"19603a.ROI-CTs.50keV_7m_Eiger_Sheep1",
+]
 
-
-examples = initIfNew('examples')
-
-
-listOfTrainData = [ "18515.Lamb1_Eiger_7m_45keV_360Scan"#, ]
-                  , "18692a.ExpChicken6mGyShift"
-                  , "18692b_input_PhantomM"
-                  , "18692b.MinceO"
-                  , "19022g.11-EggLard"
-                  , "19736b.09_Feb.4176862R_Eig_Threshold-4keV"
-                  , "19736c.8733147R_Eig_Threshold-8keV.SAMPLE_Y1"
-                  , "20982b.04_774784R"
-                  , "23574.8965435L.Eiger.32kev_org"
-                  ]
-def createTrainSet() :
-    sinoRoot = StripesFromHDFs(listOfTrainData)
-    mytransforms = transforms.Compose([
-            transforms.Resize(DCfg.sinoSh),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
-            transforms.Normalize(mean=(0.5), std=(1))
-    ])
+def createDataSet(path, listOfData, exclusive=False) :
+    #listOfData = [file.removesuffix(".hdf") for file in glob.glob(path+ "/*.hdf", recursive=False)]
+    listOfData = [ '/'.join((path,file))  for file in listOfData ]
+    print(listOfData)
+    sinoRoot = StripesFromHDFs(listOfData, exclusive)
+    transList = []
+    #transList.append(transforms.Resize(DCfg.sinoSh))
+    if not exclusive :
+        transList.append(transforms.RandomHorizontalFlip()),
+        transList.append(transforms.RandomVerticalFlip()),
+    #transList.append(transforms.Normalize(mean=(0.5), std=(1)))
+    mytransforms = transforms.Compose(transList)
     return sinoRoot.get_dataset(mytransforms)
+trainSet = initIfNew('trainSet')
+testSet = initIfNew('testSet')
 
-
-def createDataLoader(tSet, num_workers=os.cpu_count()) :
+def createDataLoader(tSet, num_workers=os.cpu_count(), shuffle=False) :
     return torch.utils.data.DataLoader(
         dataset=tSet,
-        batch_size=TCfg.batchSize,
-        shuffle=False,
+        batch_size = TCfg.batchSize * max(1, -TCfg.batchSplit) ,
+        shuffle=shuffle,
         num_workers=num_workers,
         drop_last=True
     )
 
 
-class PrepackedHDF :
+examples = [
+    (11142, 3150), # (0, 417, 1877)
+    (38576, 2560), # (3, 476, 2855)
+    (26289, 6300), # (2, 280, 828)
+    (24299, 7160), # (2, 113, 988)
+    (3186, 2455), # (0, 119, 240)
+    ]
 
-    def __init__(self, sampleName):
-        sampleHDF = sampleName.split(':')
-        if len(sampleHDF) != 2 :
-            raise Exception(f"String \"{sampleName}\" does not represent an HDF5 format.")
-        with h5py.File(sampleHDF[0],'r') as trgH5F:
-            if  sampleHDF[1] not in trgH5F.keys():
-                raise Exception(f"No dataset '{sampleHDF[1]}' in input file {sampleHDF[0]}.")
-            self.data = trgH5F[sampleHDF[1]]
-            if not self.data.size :
-                raise Exception(f"Container \"{sampleName}\" is zero size.")
-            self.sh = self.data.shape
-            if len(self.sh) != 3 :
-                raise Exception(f"Dimensions of the container \"{sampleName}\" is not 3 {self.sh}.")
-            self.fsh = self.sh[1:3]
-            if self.fsh != (80,80) :
-                raise Exception(f"Dimensions of the container \"{sampleName}\" is not 80,80 {self.fsh}.")
-            self.volume = None
-            self.volume = np.empty(self.sh, dtype=np.float32)
-            self.data.read_direct(self.volume)
-            trgH5F.close()
-
-    def get_dataset(self, transform=None) :
-
-        class Sinos(torch.utils.data.Dataset) :
-
-            def __init__(self, root, transform=None):
-                self.container = root
-                self.transform = transform
-
-            def __len__(self):
-                return self.container.sh[0]
-
-            def __getitem__(self, index=None, doTransform=True):
-                if index is None :
-                    index = random.randint(0,self.container.volume.shape[0]-1)
-                data=self.container.volume[index,...]
-                data = torch.from_numpy(data).clone().unsqueeze(0)
-                if doTransform :
-                    data = self.transform(data)
-                return (data, index)
-
-        return Sinos(self, transform)
-
-def createTestSet() :
-    print("Loading test set ... ", end="")
-    sinoRoot = PrepackedHDF("storage/test/testSetSmall.hdf:/data")
-    print("Done")
+def createReferences(tSet, majorIdx = 0) :
+    if majorIdx :
+        examples.insert(0, examples.pop(majorIdx))
     mytransforms = transforms.Compose([
             transforms.Resize(DCfg.sinoSh),
-            transforms.Normalize(mean=(0.5), std=(1))
+            #transforms.Normalize(mean=(0.5), std=(1))
     ])
-    return sinoRoot.get_dataset(mytransforms)
-
-
-
-def createReferences(tSet, toShow = 0) :
-    global examples
-    examples = examplesDb[DCfg.gapW].copy()
-    if toShow :
-        examples.insert(0, examples.pop(toShow))
-    mytransforms = transforms.Compose([
-            transforms.Resize(DCfg.sinoSh),
-            transforms.Normalize(mean=(0.5), std=(1))
-    ])
-    refImages = torch.stack( [ mytransforms(tSet.__getitem__(ex, doTransform=False)[0])
-                               for ex in examples ] ).to(TCfg.device)
-    #refImages = torch.stack( [ tSet.__getitem__(ex, doTransform=False)[0] for ex in examples ] ).to(TCfg.device)
+    refImages = torch.empty((len(examples), 1, *DCfg.sinoSh), dtype=torch.float32).to(TCfg.device)
+    refBoxes = []
+    for idx, ex in enumerate(examples) :
+        item = tSet.__getitem__(ex[0], doTransform=False)
+        refImages[idx,0,...] = mytransforms(item['image'])
+        refBoxes.append( (ex[1] * DCfg.sinoSh[-2]) // item['orgSh'][0]  )
+        #if toShow :
+        #    print(f"Reference {idx}: {item['coord']}, {item['index']}, {item['orgSh']}")
+        #    tensorStat(refImages[idx,...])
+        #    plotImage(refImages[idx,...].cpu())
     refNoises = torch.randn((refImages.shape[0],TCfg.latentDim)).to(TCfg.device)
-    return refImages, refNoises
+    return refImages, refNoises, refBoxes
 refImages = initIfNew('refImages')
 refNoises = initIfNew('refNoises')
+refBoxes = initIfNew('refBoxes')
 
 
-def showMe(tSet, item=None) :
+def showMe(tSet, index=None) :
     global refImages, refNoises
     image = None
-    if item is None :
+    if index is None :
         while True:
-            image, index = tSet[random.randint(0,len(tSet)-1)]
-            if image.mean() > 0 and image.min() < -0.1 :
-                print (f"{index}")
-                break
-    elif isinstance(item, int) :
-        image = refImages[0,...]
+            item = tSet[random.randint(0,len(tSet)-1)]
+            break
+            #if image.mean() > 0 and image.min() < -0.1 :
+            #    break
+    #elif isinstance(item, int) :
+    #    image = refImages[0,...]
     else :
-        image, _,_ = tSet.__getitem__(*item)
-    image = image.squeeze()
+        item = tSet.__getitem__(index)
+    image = item['image'].squeeze().transpose(0,1)
+    print(item['coord'], item['index'], item['orgSh'])
     tensorStat(image)
     plotImage(image.cpu())
-    image = image.to(TCfg.device)
-
 
 save_interim = None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 class GeneratorTemplate(nn.Module):
 
     def __init__(self, gapW, latentChannels=0):
         super(GeneratorTemplate, self).__init__()
-
         self.gapW = gapW
-        self.sinoSh = (256*self.gapW,5*self.gapW) # 10,10
+        self.sinoSh = (5*self.gapW,5*self.gapW)
         self.sinoSize = math.prod(self.sinoSh)
         self.gapSh = (self.sinoSh[0],self.gapW)
         self.gapSize = math.prod(self.gapSh)
         self.gapRngX = np.s_[ self.sinoSh[1]//2 - self.gapW//2 : self.sinoSh[1]//2 + self.gapW//2 ]
         self.gapRng = np.s_[...,self.gapRngX]
         self.latentChannels = latentChannels
-        self.baseChannels = 4
+        self.baseChannels = 64
         self.amplitude = 4
         self.lowResGenerator = None
+
 
 
     def createLatent(self) :
@@ -734,7 +681,9 @@ class GeneratorTemplate(nn.Module):
         return toRet
 
 
-    def encblock(self, chIn, chOut, kernel, stride=1, norm=False, padding=0) :
+    def encblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=0) :
+        #if norm is None :
+        #    norm = self.batchNorm
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
@@ -747,7 +696,9 @@ class GeneratorTemplate(nn.Module):
         return torch.nn.Sequential(*layers)
 
 
-    def decblock(self, chIn, chOut, kernel, stride=1, norm=False, padding=0, outputPadding=0) :
+    def decblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=0, outputPadding=0) :
+        #if norm is None :
+        #    norm = self.batchNorm
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
@@ -778,9 +729,9 @@ class GeneratorTemplate(nn.Module):
         return toRet
 
 
-    def createLastTouch(self) :
+    def createLastTouch(self, chIn=1) :
         toRet = nn.Sequential(
-            nn.Conv2d(self.baseChannels+1, 1, 1),
+            nn.Conv2d(chIn*self.baseChannels+1, 1, 1),
             nn.Tanh(),
         )
         fillWheights(toRet)
@@ -824,17 +775,10 @@ class GeneratorTemplate(nn.Module):
 
     def forward(self, input):
 
-        if not save_interim is None :
-            save_interim[self.gapW] = {}
-
         images, noises = input
-        if not save_interim is None :
-            save_interim[self.gapW]['input'] = images.clone().detach()
         images, orgDims = unsqeeze4dim(images)
         modelIn = images.clone()
         modelIn[self.gapRng] = self.preProc(images)
-        if not save_interim is None :
-            save_interim[self.gapW]['preproc'] = modelIn.clone().detach()
         stDev = modelIn.std(dim=(-1,-2))[...,None,None]
 
         if self.latentChannels :
@@ -845,16 +789,12 @@ class GeneratorTemplate(nn.Module):
         for encoder in self.encoders :
             dwTrain.append(encoder(dwTrain[-1]))
         mid = self.fcLink(dwTrain[-1])
-        #return mid
         upTrain = [mid]
         for level, decoder in enumerate(self.decoders) :
             upTrain.append( decoder( torch.cat( (upTrain[-1], dwTrain[-1-level]), dim=1 ) ) )
         res = self.lastTouch(torch.cat( (upTrain[-1], modelIn ), dim=1 ))
 
         patches = modelIn[self.gapRng] + self.amplitude * stDev * res[self.gapRng]
-        if not save_interim is None :
-            save_interim[self.gapW]['output'] = save_interim[self.gapW]['input'].clone()
-            save_interim[self.gapW]['output'][self.gapRng] = patches.clone().detach()
         return squeezeOrg(patches, orgDims)
 
 
@@ -913,7 +853,6 @@ class DiscriminatorTemplate(nn.Module):
         return res
 
 discriminator = initIfNew('discriminator')
-noAdv=False
 
 
 def createOptimizer(model, lr) :
@@ -924,6 +863,18 @@ def createOptimizer(model, lr) :
     )
 optimizer_G = initIfNew('optimizer_G')
 optimizer_D = initIfNew('optimizer_D')
+scheduler_G = initIfNew('scheduler_G')
+scheduler_D = initIfNew('scheduler_D')
+
+def adjustScheduler(scheduler, iniLr, target) :
+    if scheduler is None :
+        return ""
+    gamma = scheduler.gamma
+    curLR = scheduler.get_last_lr()[0] / iniLr
+    if gamma < 1 and curLR > target \
+    or gamma > 1 and curLR < target :
+        scheduler.step()
+    return f"LR : {scheduler.get_last_lr()[0]:.3e} ({curLR:.3e}). "
 
 
 def restoreCheckpoint(path=None, logDir=None) :
@@ -935,7 +886,7 @@ def restoreCheckpoint(path=None, logDir=None) :
                             " Remove it .")
         try : os.remove(TCfg.historyHDF)
         except : pass
-        return 0, 0, 0, 1, 0, TrainResClass()
+        return 0, 0, 0, None, 0, TrainResClass()
     else :
         return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D)
 
@@ -945,348 +896,324 @@ def saveModels(path="") :
     save_model(discriminator, model_path = ( path if path else f"model_{TCfg.exec}" ) + "_dis.pt"  )
 
 
+
 BCE = nn.BCELoss(reduction='none')
+def loss_Adv(images, truth):
+    labels = torch.full((images.shape[0], 1),  (1 - TCfg.labelSmoothFac ) if truth else TCfg.labelSmoothFac,
+                dtype=torch.float, device=TCfg.device, requires_grad=False)
+    predictions = discriminator(images)
+    return BCE(predictions, labels), predictions
+
+def loss_Adv_Gen(p_true, p_pred):
+    return loss_Adv(p_pred, True)[0]
+
+def loss_Adv_Dis(p_true, p_pred):
+    loss_true, predictions_true = loss_Adv(p_true, True)
+    loss_pred, predictions_pred = loss_Adv(p_pred, False)
+    return ( torch.cat((loss_true, loss_pred), dim=0),
+             torch.cat((predictions_true, predictions_pred), dim=0) )
+
+
 MSE = nn.MSELoss(reduction='none')
+def loss_MSE(p_true, p_pred):
+    return MSE(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
+
+def loss_MSEN(p_true, p_pred):
+    rawLoss = loss_MSE(p_true, p_pred)
+    stds = 1e-7 +  calculateNorm(p_true)[0].view([-1])
+    return rawLoss / stds**2
+
+def loss_SMSE(p_true, p_pred):
+    mseLoss = MSE(p_true[DCfg.gapRng], p_pred[DCfg.gapRng])
+    return (torch.square(mseLoss)).sum(dim=(-1,-2,-3))
+
 L1L = nn.L1Loss(reduction='none')
-SSIM = ssim.SSIM(data_range=2.0, size_average=False, channel=1, win_size=3)
-lossDifCoef = 0
-lossAdvCoef = 1.0
-ADV_DIF = 0
+def loss_L1L(p_true, p_pred):
+    return L1L(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
 
-def applyWeights(inp, weights, storePerIm=None):
-    inp = inp.squeeze()
-    if not inp.dim() :
-        inp = inp.unsqueeze(0)
-    sum = len(inp)
-    if not weights is None :
-        inp *= weights
-        sum = weights.sum()
-    if storePerIm is not None : # must be list
-        storePerIm.extend(inp.tolist())
-    return inp.sum()/sum
+def loss_L1LN(p_true, p_pred):
+    rawLoss = loss_L1L(p_true, p_pred)
+    stds = 1e-7 + calculateNorm(p_true)[0].view([-1])
+    return rawLoss / stds
 
-def loss_Adv(y_true, y_pred, weights=None, storePerIm=None):
-    loss = BCE(y_pred, y_true)
-    return applyWeights(loss, weights, storePerIm=storePerIm)
+SSIM = ssim.SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
+def loss_SSIM(p_true, p_pred):
+    p_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
+    p_pred, _ = unsqeeze4dim(p_pred[DCfg.gapRng])
+    #return (1 - SSIM( p_true+0.5, p_pred+0.5 ) ) / 2
+    return (1 - SSIM( p_true, p_pred ) ) / 2
 
-def loss_MSE(p_true, p_pred, weights=None, storePerIm=None):
-    loss = MSE(p_pred, p_true).mean(dim=(-1,-2))
-    return applyWeights(loss, weights, storePerIm=storePerIm)
-
-def loss_SSIM(p_true, p_pred, weights=None):
-    p_true, _ = unsqeeze4dim(p_true)
-    p_pred, _ = unsqeeze4dim(p_pred)
-    loss = (1 - SSIM( p_true+0.5, p_pred+0.5 ) ) / 2
-    return applyWeights(loss, weights)
-
-def loss_L1L(p_true, p_pred, weights=None, storePerIm=None):
-    return loss_SSIM(p_true, p_pred, weights)
-    #loss = L1L(p_pred, p_true).mean(dim=(-1,-2))
-    #return applyWeights(loss, weights, storePerIm=storePerIm)
+MSSSIM = ssim.MS_SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
+def loss_MSSSIM(p_true, p_pred):
+    p_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
+    p_pred, _ = unsqeeze4dim(p_pred[DCfg.gapRng])
+    #return (1 - MSSSIM( p_true+0.5, p_pred+0.5 ) ) / 2
+    return (1 - MSSSIM( p_true, p_pred ) ) / 2
 
 
-eDinfo = None
-SSIM_MSE = 0
-def loss_Rec(p_true, p_pred, weights=None, storePerIm=None, normalizeRec=None):
-    global eDinfo
-    mse = MSE(p_pred, p_true).mean(dim=(-1,-2))
-    ssim = (1 - SSIM( unsqeeze4dim(p_true)[0]+0.5, unsqeeze4dim(p_pred)[0]+0.5 ) ) / 2
-    loss = ( 1 - SSIM_MSE ) * mse.view(-1) + \
-           SSIM_MSE * ssim.view(-1) #* (normTestMSE/normTestSSIM)
-    if normalizeRec is not None :
-        loss *= normalizeRec.view(-1)
-    if loss.dim() :
-        hDindex = loss.argmax()
-        lDindex = loss.argmin()
-        eDinfo = (hDindex, loss[hDindex].item(), lDindex, loss[lDindex].item() )
-    return applyWeights(loss, weights, storePerIm=storePerIm)
+@dataclass
+class Metrics:
+    calculate : callable
+    norm : float # normalization factor - result of calculate on untrained model output
+    weight : float # weight in the final loss function; zero means no loss contribution
+
+metrices = {
+    'Adv'    : Metrics(loss_Adv_Gen, 0, 0),
+    'MSE'    : Metrics(loss_MSE,     1, 1),
+    #'SMSE'   : Metrics(loss_SMSE,    1, 1),
+    'MSEN'   : Metrics(loss_MSEN,    1, 1),
+    'L1L'    : Metrics(loss_L1L,     1, 1),
+    'L1LN'   : Metrics(loss_L1LN,    1, 1),
+    'SSIM'   : Metrics(loss_SSIM,    1, 1),
+    'MSSSIM' : Metrics(loss_MSSSIM,  1, 1),
+}
+
+# Gap 2 metrices
+{
+#metrices = {
+#    'Adv'    : Metrics(loss_Adv_Gen, 0,         0),
+#    'MSE'    : Metrics(loss_MSE,     1.154e-01, 1),
+#    'L1L'    : Metrics(loss_L1L,     2.571e+00, 1),
+#    'SSIM'   : Metrics(loss_SSIM,    4.183e-04, 1),
+#    'MSSSIM' : Metrics(loss_MSSSIM,  4.515e-06, 1),
+#}
+#metricesTrain = {
+#    'Adv'    : Metrics(loss_Adv_Gen, 0,         0),
+#    'MSE'    : Metrics(loss_MSE,     5.836e-01, 1),
+#    'L1L'    : Metrics(loss_L1L,     9.742e+00, 1),
+#    'SSIM'   : Metrics(loss_SSIM,    8.717e-04, 1),
+#    'MSSSIM' : Metrics(loss_MSSSIM,  3.358e-05, 1),
+#}
+}
 
 
-def loss_Gen(y_true, y_pred, p_true, p_pred, weights=None, normalizeRec=None):
-    lossAdv = loss_Adv(y_true, y_pred, weights)
-    lossDif = loss_Rec(p_pred, p_true, weights, normalizeRec=normalizeRec)
-    return lossAdv, lossDif
+minMetrices = None
+maxMetrices = None
+
+def trackExtremes(track=True) :
+    global minMetrices, maxMetrices
+    toRet = (minMetrices, maxMetrices)
+    if not track :
+        minMetrices = None
+        maxMetrices = None
+    else :
+        minMetrices = { key: None for key in metrices.keys() }
+        minMetrices['loss'] = None
+        maxMetrices = { key: None for key in metrices.keys() }
+        maxMetrices['loss'] = None
+    return toRet
+
+def updateExtremes(vector, key, p_true, p_pred) :
+    global minMetrices, maxMetrices
+    if maxMetrices is not None :
+        pos = vector.argmax()
+        if maxMetrices[key] is None or vector[pos] > maxMetrices[key][0] :
+            maxMetrices[key] = (vector[pos].item(),
+                                p_true[pos,...].clone().detach(),
+                                p_pred[pos,...].clone().detach() )
+            #if key == 'loss' :
+            #    print(pos.item())
+            #    plotImage(maxMetrices['loss'][1][0].clone().detach().transpose(-1,-2).cpu().numpy())
+            #    print()
+    if minMetrices is not None :
+        pos = vector.argmin()
+        if minMetrices[key] is None or vector[pos] < minMetrices[key][0] :
+            minMetrices[key] = (vector[pos].item(),
+                                p_true[pos,...].clone().detach(),
+                                p_pred[pos,...].clone().detach() )
 
 
-def summarizeSet(dataloader, onPrep=True, storesPerIm=None):
+def loss_Gen(p_true, p_pred):
+    global minMetrices, maxMetrices
+    loss = 0
+    sumweights = 0
+    individualLosses = {}
+    for key, metrics in metrices.items():
+        if metrics.norm > 0 :
+            with torch.set_grad_enabled( metrics.weight > 0 ) :
+                thisLoss = metrics.calculate(p_true, p_pred) / metrics.norm
+                individualLosses[key] = thisLoss.sum().item()
+                updateExtremes(thisLoss, key, p_true, p_pred)
+                if  metrics.weight > 0 :
+                    loss += metrics.weight * thisLoss
+                    sumweights += metrics.weight
+        else :
+            individualLosses[key] = p_true.shape[0]
+    loss /= sumweights
+    updateExtremes(loss, 'loss', p_true, p_pred)
+    return loss.sum() , individualLosses
 
-    MSE_diffs, L1L_diffs, Rec_diffs = [], [], []
-    Real_probs, Fake_probs, GA_losses, GD_losses, D_losses = [], [], [], [], []
-    totalNofIm = 0
-    generator.to(TCfg.device)
+def loss_Dis(p_true, p_pred):
+    return loss_Adv_Dis(p_true, p_pred)
+
+
+
+
+@dataclass(repr = False)
+class TrainResClass:
+    lossD : float = 0
+    lossG : float = 0
+    metrices : dict = field(default_factory=lambda: { key: 0 for key in metrices.keys() })
+    predReal : float = 0
+    #predPre : float = 0
+    predFake : float = 0
+    predGen : float = 0
+    nofIm : int = 0
+
+    def __repr__(self):
+        if self.nofIm == 0 :
+            return "No train results yet accumulated."
+        return f"Images: {self.nofIm}. DIS: {self.lossD/self.nofIm:.3e}, GEN: {self.lossG/self.nofIm:.3e}. " + \
+               f"Probs: True {self.predReal/self.nofIm:.3e}, Fake {self.predFake/self.nofIm:.3e}.\n" + \
+               f"Individual losses: " + ' '.join([ f"{key}: {self.metrices[key]/self.nofIm:.3e} "
+                                                   for key in self.metrices.keys()  ] ) +\
+                "\n"
+
+    def __add__(self, other):
+        toRet = TrainResClass()
+        for field in dataclasses.fields(TrainResClass):
+            fn = field.name
+            if fn == 'metrices' :
+                for key in self.metrices.keys() :
+                    toRet.metrices[key] = self.metrices[key] + other.metrices[key]
+            else :
+                setattr(toRet, fn, getattr(self, fn) + getattr(other, fn) )
+        return toRet
+
+    def __mul__(self, other):
+        toRet = TrainResClass()
+        for field in dataclasses.fields(TrainResClass):
+            fn = field.name
+            if fn == 'metrices' :
+                for key in self.metrices.keys() :
+                    toRet.metrices[key] = self.metrices[key] * other
+            else :
+                setattr(toRet, fn, getattr(self, fn) * other)
+        return toRet
+
+    __rmul__ = __mul__
+
+
+def summarizeMe(toSumm, onPrep=True):
+    global generator, discriminator, metrices
+
+    if isinstance(toSumm, torch.utils.data.Dataset) :
+        loader = createDataLoader(toSumm)
+        return summarizeMe(loader, onPrep)
+
+    sumAcc = TrainResClass()
+
     #generator.train()
     generator.eval()
     #discriminator.eval()
-    if storesPerIm is not None : # must be list of five lists
-        for lst in storesPerIm :
-            lst.clear()
-    else :
-        storesPerIm = [None, None, None, None, None]
+
+    def summarizeImages(images) :
+        nonlocal sumAcc
+
+        images = unsqeeze4dim(images.to(TCfg.device))[0]
+        nofIm = images.shape[0]
+        sumAcc.nofIm += nofIm
+
+        batchSplit = TCfg.batchSplit if TCfg.batchSplit > 1 else 1
+        subBatchSize = nofIm // batchSplit
+        fakeImages = images.clone()
+        for i in range(batchSplit) :
+            subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
+            subImages = images[subRange,...]
+            patchImages = generator.preProc(subImages) \
+                            if onPrep else \
+                          generator.generatePatches(subImages)
+            fakeImages[subRange,...,DCfg.gapRngX] = patchImages
+
+        genLoss, indLosses = loss_Gen(images, fakeImages)
+        sumAcc.lossG += genLoss.item()
+        for key in metrices.keys() :
+            sumAcc.metrices[key] += indLosses[key]
+
+        if metrices['Adv'].weight > 0 : # discriminator
+            disLoss, probs = loss_Dis(images, fakeImages)
+            sumAcc.lossD += disLoss.item()
+            sumAcc.predReal += probs[:nofIm,0].sum()
+            sumAcc.predFake += probs[nofIm:,0].sum()
+
     with torch.no_grad() :
-        for it , data in tqdm.tqdm(enumerate(dataloader), total=int(len(dataloader))):
-            images = data[0].squeeze(1).to(TCfg.device)
-            nofIm = images.shape[0]
-            subBatchSize = nofIm // TCfg.batchSplit
-            totalNofIm += nofIm
-            procImages, procData = imagesPreProc(images)
-            genImages = procImages.clone()
-            fprobs = torch.zeros((nofIm,1), device=TCfg.device)
-            rprobs = torch.zeros((nofIm,1), device=TCfg.device)
+        if isinstance(toSumm, torch.utils.data.DataLoader) :
+            for it , data in tqdm.tqdm(enumerate(toSumm), total=int(len(toSumm))):
+                summarizeImages(data['image'])
+        elif isinstance(toSumm, torch.Tensor) :
+            summarizeImages(toSumm)
+        else :
+            raise Exception(f"Unknown type of input to summarizeMe: {type(toSumm)}.")
 
-            rprob = fprob = 0
-            for i in range(TCfg.batchSplit) :
-                subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize] if TCfg.batchSplit > 1 else np.s_[...]
-                subProcImages = procImages[subRange,...]
-                patchImages = generator.preProc(subProcImages) \
-                              if onPrep else \
-                              generator.generatePatches(subProcImages)
-                genImages[subRange,:,DCfg.gapRngX] = patchImages
-                if not noAdv :
-                    subRprobs = discriminator(subProcImages)
-                    #if storesPerIm[3] is not None :
-                    #    storesPerIm[3].extend(rprobs.tolist())
-                    rprobs[subRange,...] = subRprobs
-                    rprob += subRprobs.sum().item()
-                    subFprobs = discriminator(genImages[subRange,...])
-                    #if storesPerIm[4] is not None :
-                    #    storesPerIm[4].extend(fprobs.tolist())
-                    fprobs[subRange,...] = subFprobs
-                    fprob += subFprobs.sum().item()
-            procImages = imagesPostProc(genImages, procData)
-            MSE_diffs.append( nofIm * loss_MSE(images[DCfg.gapRng], procImages[DCfg.gapRng]
-                                              ,storePerIm = storesPerIm[2]))
-            L1L_diffs.append( nofIm * loss_L1L(images[DCfg.gapRng], procImages[DCfg.gapRng]
-                                              ,storePerIm = storesPerIm[1]))
-            Rec_diffs.append( nofIm * loss_Rec(images[DCfg.gapRng], procImages[DCfg.gapRng]
-                                              ,storePerIm = storesPerIm[0]
-                                              ,normalizeRec=calculateNorm(images)))
-            if not noAdv :
-                labelsTrue = torch.full((nofIm, 1),  1 - TCfg.labelSmoothFac,
-                            dtype=torch.float, device=TCfg.device, requires_grad=False)
-                labelsFalse = torch.full((nofIm, 1),  TCfg.labelSmoothFac,
-                            dtype=torch.float, device=TCfg.device, requires_grad=False)
-                labelsDis = torch.cat( (labelsTrue, labelsFalse), dim=0).to(TCfg.device).requires_grad_(False)
-                subD_loss = loss_Adv(labelsDis, torch.cat((rprobs, fprobs), dim=0))
-                subGA_loss, subGD_loss = loss_Gen(labelsTrue, fprobs,
-                                                  images[DCfg.gapRng], procImages[DCfg.gapRng],
-                                                  normalizeRec=calculateNorm(images))
-                D_losses.append( nofIm * subD_loss )
-                GA_losses.append( nofIm * subGA_loss )
-                GD_losses.append( nofIm * subGD_loss )
-                Real_probs.append(rprob)
-                Fake_probs.append(fprob)
-
-    MSE_diff = sum(MSE_diffs).item() / totalNofIm
-    L1L_diff = sum(L1L_diffs).item() / totalNofIm
-    Rec_diff = sum(Rec_diffs).item() / totalNofIm
-    Real_prob = sum(Real_probs) / totalNofIm if not noAdv else 0
-    Fake_prob = sum(Fake_probs) / totalNofIm if not noAdv else 0
-    D_loss = sum(D_losses) / totalNofIm if not noAdv else 0
-    GA_loss = sum(GA_losses) / totalNofIm if not noAdv else 0
-    GD_loss = sum(GD_losses) / totalNofIm if not noAdv else 0
-
-    print (f"Summary. Rec: {Rec_diff:.3e}, MSE: {MSE_diff:.3e}, L1L: {L1L_diff:.3e}, Dis: {Real_prob:.3e}, Gen: {Fake_prob:.3e}.")
-    return Rec_diff, MSE_diff, L1L_diff, Real_prob, Fake_prob, D_loss, GA_loss, GD_loss
+    print(sumAcc)
+    return sumAcc
 
 
-def generateDiffImages(images, layout=None) :
+def generateDisplay(inp=None, boxes=None) :
+    #images = images.to(TCfg.device)
+    images = refImages if inp is None else inp
     images, orgDim = unsqeeze4dim(images)
-    dif = torch.zeros((images.shape[0], 1, *DCfg.sinoSh))
-    hGap = DCfg.gapW // 2
-    pre = images.clone()
-    gen = images.clone()
+    nofIm = images.shape[0]
+    viewLen = DCfg.sinoSh[-1]
+
+    genImages = images.clone()
+    preImages = images.clone()
+    views = torch.empty((nofIm, 4, viewLen, viewLen ), dtype=torch.float32, device=TCfg.device)
     with torch.no_grad() :
-        wghts = calculateWeights(images)
-        generator.eval()
-        pre[DCfg.gapRng] = generator.preProc(images)
-        gen[DCfg.gapRng] = generator.generatePatches(images)
-        dif[DCfg.gapRng] = (gen - pre)[DCfg.gapRng]
-        dif[...,hGap:hGap+DCfg.gapW] = (images - pre)[DCfg.gapRng]
-        dif[...,-DCfg.gapW-hGap:-hGap] = (images - gen)[DCfg.gapRng]
-        for curim in range(images.shape[0]) :
-            if ( cof := max(-dif[curim,...].min(),dif[curim,...].max()) ) != 0 :
-                dif[curim,...] /= cof
-            else :
-                dif[curim,...] = 0
-        probs = torch.empty(images.shape[0],3)
-        dists = torch.empty(images.shape[0],3)
-        #discriminator.eval()
-        probs[:,0] = discriminator(images)[:,0]
-        probs[:,1] = discriminator(pre)[:,0]
-        probs[:,2] = discriminator(gen)[:,0]
-        dists[:,0] = loss_Rec(images[DCfg.gapRng], gen[DCfg.gapRng], wghts, normalizeRec=calculateNorm(images))
-        dists[:,1] = loss_MSE(images[DCfg.gapRng], gen[DCfg.gapRng], wghts)
-        dists[:,2] = loss_L1L(images[DCfg.gapRng], gen[DCfg.gapRng], wghts)
+        prePatches = generator.preProc(images)
+        preImages[DCfg.gapRng] = prePatches
+        genPatches = generator.generatePatches(images)
+        genImages[DCfg.gapRng] = genPatches
+    hGap = DCfg.gapW // 2
 
-    simages = None
-    if not layout is None :
-        def stretch(stretchme, mm, aa) :
-            return ( stretchme - mm ) * 2 / aa - 1 if ampl > 0 else stretchme * 0
-        simages = images.clone()
-        for curim in range(images.shape[0]) :
-            rng = np.s_[curim,...]
-            minv = min(images[rng].min(), pre[rng].min(), gen[rng].min()).item()
-            ampl = max(images[rng].max(), pre[rng].max(), gen[rng].max()).item() - minv
-            simages[rng] = stretch(simages[rng], minv, ampl)
-            pre[rng] = stretch(pre[rng], minv, ampl)
-            gen[rng] = stretch(gen[rng], minv, ampl)
+    if inp is None :
+        boxes = refBoxes
+    elif boxes is None : # find worst boxes
+        diffImages = torch.abs(genImages - images)
+        diffY = fn.conv2d(diffImages, torch.ones((1,1,diffImages.shape[-1],diffImages.shape[-1]), device=diffImages.device))
+        boxes = diffY.squeeze(1,-1).argmax(dim=-1)
 
-    cGap = DCfg.gapW
-    if layout == 0 :
-        collage = torch.empty(images.shape[0], 4, *DCfg.sinoSh)
-        collage[:,0,...] = simages[:,0,...]
-        collage[:,1,...] = pre[:,0,...]
-        collage[:,2,...] = gen[:,0,...]
-        collage[:,3,...] = dif[:,0,...]
-    elif layout == 2 :
-        collage = torch.zeros((images.shape[0], 1, DCfg.sinoSh[0]*2 + cGap, DCfg.sinoSh[1]*2 + cGap ))
-        collage[..., :DCfg.sinoSh[0], :DCfg.sinoSh[1]] = gen
-        collage[..., :DCfg.sinoSh[0], DCfg.sinoSh[1]+cGap:] = pre
-        collage[..., DCfg.sinoSh[0]+cGap:, :DCfg.sinoSh[1]] = simages
-        collage[..., DCfg.sinoSh[0]+cGap:, DCfg.sinoSh[1]+cGap:] = dif
-    elif layout == 4 :
-        collage = torch.zeros((images.shape[0], 1, DCfg.sinoSh[0], 4*DCfg.sinoSh[1] + 3*cGap))
-        collage[..., :DCfg.sinoSh[1]] = simages
-        collage[..., DCfg.sinoSh[1]+cGap:2*DCfg.sinoSh[1]+cGap] = gen
-        collage[..., 2*DCfg.sinoSh[1]+2*cGap:3*DCfg.sinoSh[1]+2*cGap] = dif
-        collage[..., 3*DCfg.sinoSh[1]+3*cGap:4*DCfg.sinoSh[1]+4*cGap] = pre
-    elif layout == -4 :
-        collage = torch.zeros( (images.shape[0], 1, 4*DCfg.sinoSh[0] + 3*cGap, DCfg.sinoSh[1]))
-        collage[... , :DCfg.sinoSh[0] , : ] = simages
-        collage[... , DCfg.sinoSh[0]+cGap:2*DCfg.sinoSh[0]+cGap , :] = gen
-        collage[... , 2*DCfg.sinoSh[0]+2*cGap:3*DCfg.sinoSh[0]+2*cGap , : ] = dif
-        collage[... , 3*DCfg.sinoSh[0]+3*cGap:4*DCfg.sinoSh[0]+4*cGap , : ] = pre
-    else :
-        collage = dif
-    collage = squeezeOrg(collage,orgDim)
-
-    return collage, probs, dists
+    for curim in range(nofIm) :
+        rng = np.s_[curim, 0, boxes[curim] : boxes[curim] + viewLen, : ]
+        views[curim,0,...] = images   [rng]
+        views[curim,1,...] = preImages[rng]
+        views[curim,2,...] = genImages[rng]
+        views[curim,3,...] = 0
+        views[curim,3,*DCfg.gapRng] = (genPatches - prePatches)[rng]
+        views[curim,3,:,hGap:hGap+DCfg.gapW] = (images[DCfg.gapRng] - prePatches)[rng]
+        views[curim,3,:,-DCfg.gapW-hGap:-hGap] = (images[DCfg.gapRng] - genPatches)[rng]
+    return views, squeezeOrg(genImages, orgDim) , squeezeOrg(preImages, orgDim)
 
 
-def logStep(iter, write=True) :
-    colImgs, probs, dists = generateDiffImages(refImages, layout=-4)
-    probs = probs.mean(dim=0)
-    dists = dists.mean(dim=0)
-    colImgs = colImgs.squeeze()
-    cSh = colImgs.shape
-    gapH = DCfg.gapW
-    collage = np.zeros( ( cSh[-2], cSh[0]*cSh[-1] + (cSh[0]-1)*gapH ), dtype=np.float32  )
-    for curI in range(cSh[0]) :
-        collage[ : , curI * (cSh[-1]+gapH) : curI * (cSh[-1]+gapH) + cSh[-1]] = colImgs[curI,...]
-    #writer.add_scalars("Probs of ref images",
-    #                   {'Ref':probs[0]
-    #                   ,'Gen':probs[2]
-    #                   ,'Pre':probs[1]
-    #                   }, iter )
-    #writer.add_scalars("Dist of ref images",
-    #                   { 'REC' : dists[0]
-    #                   , 'MSE' : dists[1]
-    #                   , 'L1L' : dists[2]
-    #                   }, iter )
-    try :
-        addToHDF(TCfg.historyHDF, "data", collage)
-    except :
-        eprint("Failed to save.")
-    return collage, probs, dists
+def displayImages(inp=None, boxes=None) :
+    views, genImages, _ = generateDisplay(inp, boxes)
+    genImages = unsqeeze4dim(genImages)[0]
+    views = views.cpu().numpy()
+    nofIm = views.shape[0]
+    for curim in range(nofIm) :
+        plotImage(genImages[curim,0,...].transpose(-1,-2).cpu().numpy())
+        vmin = views[curim,0:3,...].min()
+        vmax = views[curim,0:3,...].max()
+        plt.figure(frameon=False)
+        for id in range(3) :
+            plt.subplot(1, 4, id + 1)
+            plt.imshow(views[curim,id,...], cmap='gray', vmin=vmin, vmax=vmax)
+            plt.axis("off")
+        vmm = max( -views[curim,3,...].min(), views[curim,3,...].max() )
+        plt.subplot(1, 4, 4)
+        plt.imshow(views[curim,3,...], cmap='gray', vmin=-vmm, vmax=vmm)
+        plt.axis("off")
+        plt.show()
 
-
-def initialTest() :
-    with torch.inference_mode() :
-        collage, probs, _ = logStep(iter, not iter)
-        print("Probabilities of reference images: "
-              f'Ref: {probs[0]:.3e}, '
-              f'Gen: {probs[2]:.3e}, '
-              f'Pre: {probs[1]:.3e}.')
-        #generator.eval()
-        pre = generator.preProc(refImages)
-        wghts = calculateWeights(refImages)
-        ref_loss_Rec = loss_Rec(refImages[DCfg.gapRng], pre, wghts, normalizeRec=calculateNorm(refImages))
-        ref_loss_MSE = loss_MSE(refImages[DCfg.gapRng], pre, wghts)
-        ref_loss_L1L = loss_L1L(refImages[DCfg.gapRng], pre, wghts)
-        print("Distances of reference images: "
-              f"REC: {ref_loss_Rec:.3e}, "
-              f"MSE: {ref_loss_MSE:.3e}, "
-              f"L1L: {ref_loss_L1L:.3e}.")
-        #if not epoch :
-        #    writer.add_scalars("Dist of ref images",
-        #                          { 'REC' : ref_loss_Rec
-        #                          , 'MSE' : ref_loss_MSE
-        #                          , 'L1L' : ref_loss_L1L
-        #                          }, 0 )
-        plotImage(collage)
 
 
 def calculateWeights(images) :
     return None
 
 def calculateNorm(images) :
-    mean2 = images[...,:DCfg.gapRngX.start].mean(dim=(-1,-2)) \
-          + images[...,DCfg.gapRngX.stop:].mean(dim=(-1,-2))
-    return 2 / ( 1 + mean2 + 1e-5 ) # to denorm and adjust for mean
-
-
-
-def imagesPreProc(images) :
-    return images, None
-
-def imagesPostProc(images, procData=None) :
-    return images
-
-
-@dataclass
-class TrainInfoClass:
-    bestRealIndex = 0
-    worstRealIndex = 0
-    bestFakeIndex = 0
-    worstFakeIndex = 0
-    bestRealProb = 0
-    worstRealProb = 0
-    bestFakeProb = 0
-    worstFakeProb = 0
-    bestRealImage = None
-    worstRealImage = None
-    bestFakeImage = None
-    worstFakeImage = None
-    highestDifIndex = 0
-    lowestDifIndex = 0
-    highestDif = 0
-    lowestDif = 0
-    highestDifImageOrg = None
-    highestDifImageGen = None
-    ratReal = 0.0
-    ratFake = 0.0
-    totalImages = 0
-    iterations = 0
-    disPerformed = 0
-    genPerformed = 0
-    totPerformed = 0
-
-@dataclass
-class TrainResClass:
-    lossD : any = 0
-    lossGA : any = 0
-    lossGD : any = 0
-    lossMSE : any = 0
-    lossL1L : any = 0
-    predReal : any = 0
-    predPre : any = 0
-    predFake : any = 0
-    nofIm : int = 0
-    def __add__(self, other):
-        toRet = TrainResClass()
-        for field in dataclasses.fields(TrainResClass):
-            fn = field.name
-            setattr(toRet, fn, getattr(self, fn) + getattr(other, fn) )
-        return toRet
-    def __mul__(self, other):
-        toRet = TrainResClass()
-        for field in dataclasses.fields(TrainResClass):
-            fn = field.name
-            setattr(toRet, fn, getattr(self, fn) * other )
-        return toRet
-    __rmul__ = __mul__
-
-
+    noGapImages = torch.cat( (images[...,:DCfg.gapRngX.start], images[...,DCfg.gapRngX.stop:]), dim=-1)
+    toRet = torch.std_mean( noGapImages, dim=(-1,-2), keepdim=True )
+    return toRet[0], toRet[1]
 
 
 def saveCheckPoint(path, epoch, iterations, minGEpoch, minGdLoss,
@@ -1339,158 +1266,62 @@ def loadCheckPoint(path, generator, discriminator,
 
 
 
-trainInfo = TrainInfoClass()
-normMSE=1
-normSSIM=1
-normL1L=1
-normRec=1
 skipDis = False
 
-def train_step(images):
-    global trainDis, trainGen, eDinfo, noAdv, withNoGrad, skipGen, skipDis
-    trainInfo.iterations += 1
-    trainInfo.totPerformed += 1
+def train_step(allImages):
+    global skipGen, skipDis
+
     trainRes = TrainResClass()
+    allImages, _ = unsqeeze4dim(allImages.to(TCfg.device))
+    nofAllIm = allImages.shape[0]
 
-    nofIm = images.shape[0]
-    images = images.squeeze(1).to(TCfg.device)
-    procImages, procReverseData = imagesPreProc(images)
-    fakeImages = procImages.clone().detach().requires_grad_(False)
-    subBatchSize = nofIm // TCfg.batchSplit
-    imWeights = calculateWeights(images)
-    normDiff = calculateNorm(images)
+    while trainRes.nofIm < nofAllIm :
 
-    labelsTrue = torch.full((subBatchSize, 1),  1 - TCfg.labelSmoothFac,
-                        dtype=torch.float, device=TCfg.device, requires_grad=False)
-    labelsFalse = torch.full((subBatchSize, 1),  TCfg.labelSmoothFac,
-                        dtype=torch.float, device=TCfg.device, requires_grad=False)
-    labelsDis = torch.cat( (labelsTrue, labelsFalse), dim=0).to(TCfg.device).requires_grad_(False)
+        images = allImages[ trainRes.nofIm : trainRes.nofIm + TCfg.batchSize , ... ]
+        #fakeImages = images.clone().detach()
+        nofIm = images.shape[0]
+        trainRes.nofIm += nofIm
+        #images, _ = unsqeeze4dim(images.to(TCfg.device))
+        batchSplit = TCfg.batchSplit if TCfg.batchSplit > 1 else 1
+        subBatchSize = nofIm // batchSplit
 
-    # train discriminator
-    if not noAdv :
-
-        # calculate predictions of prefilled images - purely for metrics purposes
-        #discriminator.eval()
-        #generator.eval()
-        trainRes.predPre = 0
-        with torch.no_grad() :
-            for i in range(TCfg.batchSplit) :
-                subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize] if TCfg.batchSplit > 1 else np.s_[...]
-                fakeImages[subRange,:,DCfg.gapRngX] = generator.preProc(procImages[subRange,...])
-                trainRes.predPre += discriminator(fakeImages[subRange,...]).mean().item()
-            trainRes.predPre /= TCfg.batchSplit
-
-        pred_real = torch.empty((nofIm,1), requires_grad=False)
-        pred_fake = torch.empty((nofIm,1), requires_grad=False)
-        #discriminator.train()
-        for param in discriminator.parameters() :
-            param.requires_grad = True
-        optimizer_D.zero_grad()
-        for i in range(TCfg.batchSplit) :
-            subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize] if TCfg.batchSplit > 1 else np.s_[...]
-            subFakeImages = fakeImages[subRange,...]
-            with torch.no_grad() :
-                subFakeImages[DCfg.gapRng] = generator.generatePatches(procImages[subRange,...])
-            with torch.set_grad_enabled(not skipDis) :
-                subPred_realD = discriminator(procImages[subRange,...])
-                subPred_fakeD = discriminator(subFakeImages)
-                pred_both = torch.cat((subPred_realD, subPred_fakeD), dim=0)
-                wghts = None if imWeights is None else \
-                    torch.cat( (imWeights[subRange], imWeights[subRange]) )
-                subD_loss = loss_Adv(labelsDis, pred_both, wghts)
-            # train discriminator only if it is not too good :
-            if not skipDis and ( subPred_fakeD.mean() > 0.2 or subPred_realD.mean() < 0.8 ) :
-                trainInfo.disPerformed += 1/TCfg.batchSplit
-                subD_loss.backward()
-            trainRes.lossD += subD_loss.item()
-            pred_real[subRange] = subPred_realD.clone().detach()
-            pred_fake[subRange] = subPred_fakeD.clone().detach()
-        optimizer_D.step()
-        optimizer_D.zero_grad(set_to_none=True)
-        trainRes.lossD /= TCfg.batchSplit
-        trainRes.predReal = pred_real.mean().item()
-        trainRes.predFake = pred_fake.mean().item()
-
-    else :
-        pred_real = torch.zeros((1,), requires_grad=False)
-        pred_fake = torch.zeros((1,), requires_grad=False)
-
-    # train generator
-    #discriminator.eval()
-    for param in discriminator.parameters() :
-        param.requires_grad = False
-    #generator.train()
-    optimizer_G.zero_grad()
-    for i in range(TCfg.batchSplit) :
-        subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize] if TCfg.batchSplit > 1 else np.s_[:]
-        wghts = None if imWeights is None else \
-                torch.cat( (imWeights[subRange], imWeights[subRange]) )
-        subFakeImages = generator.generateImages(procImages[subRange,...])
-        if noAdv :
-            subG_loss = loss_Rec( procImages[subRange,:,DCfg.gapRngX], subFakeImages[DCfg.gapRng]
-                                , wghts, normalizeRec=normDiff[subRange,...])
-            subGD_loss = subGA_loss = subG_loss
-        else :
-            subPred_fakeG = discriminator(subFakeImages)
-            subGA_loss, subGD_loss = loss_Gen(labelsTrue, subPred_fakeG,
-                                              procImages[subRange,:,DCfg.gapRngX], subFakeImages[DCfg.gapRng],
-                                              wghts, normalizeRec=normDiff[subRange,...])
-            subG_loss = ADV_DIF * subGA_loss + (1-ADV_DIF) * subGD_loss
-            pred_fake[subRange] = subPred_fakeG.clone().detach()
-        # train generator only if it is not too good :
-        #if noAdv  or  subPred_fakeD.mean() < pred_real[subRange].mean() :
-        if True:
-            trainInfo.genPerformed += 1/TCfg.batchSplit
-            subG_loss.backward()
-        trainRes.lossGA += subGA_loss.item()
-        trainRes.lossGD += subGD_loss.item()
-        fakeImages[subRange,:,DCfg.gapRngX] = subFakeImages[DCfg.gapRng].detach()
-    optimizer_G.step()
-    optimizer_G.zero_grad(set_to_none=True)
-    trainRes.lossGA /= TCfg.batchSplit
-    trainRes.lossGD /= TCfg.batchSplit
-    trainRes.predFake = pred_fake.mean().item()
+        # train discriminator
+        if metrices['Adv'].weight > 0 :
+            optimizer_D.zero_grad()
+            for i in range(batchSplit) :
+                subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
+                subImages = images[subRange,...].clone().detach()
+                with torch.no_grad() : # create fake images to be descriminated
+                    subFakeImages = generator.generateImages(subImages)
+                subImages.requires_grad = True
+                subFakeImages.requires_grad = True
+                disLoss, probs = loss_Dis(subImages, subFakeImages)
+                trainRes.lossD += disLoss.item()
+                trainRes.predReal += probs[:nofIm,0].sum().item()
+                trainRes.predFake += probs[nofIm:,0].sum().item()
+                disLoss /= subBatchSize
+                disLoss.backward()
+            optimizer_D.step()
+            optimizer_D.zero_grad(set_to_none=True)
 
 
-    # prepare report
-    with torch.no_grad() :
-
-        trainRes.lossMSE = loss_MSE(images[DCfg.gapRng], fakeImages[DCfg.gapRng]).item() / normMSE
-        trainRes.lossL1L = loss_L1L(images[DCfg.gapRng], fakeImages[DCfg.gapRng]).item() / normL1L
-        trainRes.lossGD /= normRec
-
-        idx = random.randint(0, nofIm-1) if noAdv else pred_real.argmax()
-        trainInfo.bestRealImage = fakeImages[idx,...].clone().detach() if noAdv \
-                                  else images[idx,...].clone().detach()
-        trainInfo.bestRealProb = 0 if noAdv else pred_real[idx].item()
-        trainInfo.bestRealIndex = idx
-
-        idx = random.randint(0, nofIm-1) if noAdv else pred_real.argmin()
-        trainInfo.worstRealImage = fakeImages[idx,...].clone().detach() if noAdv \
-                                   else images[idx,...].clone().detach()
-        trainInfo.worstRealProb = 0 if noAdv else pred_real[idx].item()
-        trainInfo.worstRealIndex = idx
-
-        idx = random.randint(0, nofIm-1) if noAdv else pred_fake.argmax()
-        trainInfo.bestFakeImage = fakeImages[idx,...].clone().detach()
-        trainInfo.bestFakeProb = 0 if noAdv else pred_fake[idx].item()
-        trainInfo.bestFakeIndex = idx
-
-        idx = random.randint(0, nofIm-1) if noAdv else pred_fake.argmin()
-        trainInfo.worstFakeImage = fakeImages[idx,...].clone().detach()
-        trainInfo.worstFakeProb = 0 if noAdv else pred_fake[idx].item()
-        trainInfo.worstFakeIndex = idx
-
-        trainInfo.highestDifIndex = eDinfo[0]
-        trainInfo.highestDif = eDinfo[1]
-        trainInfo.highestDifImageOrg = images[trainInfo.highestDifIndex,...].clone().detach()
-        trainInfo.highestDifImageGen = fakeImages[trainInfo.highestDifIndex,...].clone().detach()
-        trainInfo.lowestDifIndex = eDinfo[2]
-        trainInfo.lowestDif = eDinfo[3]
-
-        trainInfo.ratReal += nofIm * torch.count_nonzero(pred_real > 0.5)/nofIm
-        trainInfo.ratFake += nofIm * torch.count_nonzero(pred_fake > 0.5)/nofIm
-        trainInfo.totalImages += nofIm
+        # train generator
+        optimizer_G.zero_grad(set_to_none=False)
+        for i in range(batchSplit) :
+            subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
+            subImages = images[subRange,...]#.clone().detach()
+            subImages.requires_grad = True
+            subFakeImages = generator.generateImages(subImages)
+            #subFakeImages = fakeImages[subRange,...]
+            #subFakeImages[DCfg.gapRng] = generator.generatePatches(subImages)
+            genLoss, indLosses = loss_Gen(subImages, subFakeImages)
+            trainRes.lossG += genLoss.item()
+            for key in metrices.keys() :
+                trainRes.metrices[key] += indLosses[key]
+            genLoss /= subBatchSize
+            genLoss.backward()
+        optimizer_G.step()
+        optimizer_G.zero_grad(set_to_none=True)
 
     return trainRes
 
@@ -1499,38 +1330,29 @@ epoch=initIfNew('epoch', 0)
 iter = initIfNew('iter', 0)
 imer = initIfNew('iter', 0)
 minGEpoch = initIfNew('minGEpoch')
-minGdLoss = initIfNew('minGdLoss', 1)
+minGLoss = initIfNew('minGdLoss')
 startFrom = initIfNew('startFrom', 0)
 
-def beforeEachEpoch(epoch) :
+def beforeEachEpoch(locals) :
     return
 
-def afterEachEpoch(epoch) :
+def afterEachEpoch(locals) :
     return
 
-def beforeReport() :
+def beforeReport(locals) :
     return
 
-def afterReport() :
+def afterReport(locals) :
     return
 
 dataLoader=None
 testLoader=None
-normTestMSE=1
-normTestSSIM=1
-normTestL1L=1
-normTestRec=1
-normTestDis=1
-normTestGen=1
-normTestGDloss=1
-normTestGAloss=1
-normTestDloss=1
 resAcc = TrainResClass()
 
 def train(savedCheckPoint):
-    global epoch, minGdLoss, minGEpoch, iter, trainInfo, startFrom, imer, resAcc
-    lastGdLoss = minGdLoss
-    lastGdLossTrain = 1
+    global epoch, minGLoss, minGEpoch, iter, startFrom, imer, resAcc
+    global dataLoader, testLoader, testSet, refImages, minMetrices, maxMetrices
+    lastGLoss = minGLoss
 
     discriminator.to(TCfg.device)
     generator.to(TCfg.device)
@@ -1540,150 +1362,152 @@ def train(savedCheckPoint):
     while TCfg.nofEpochs is None or epoch <= TCfg.nofEpochs :
         epoch += 1
         beforeEachEpoch(epoch)
+        dataLoader = createDataLoader(trainSet, shuffle=True, num_workers=TCfg.num_workers)
+
         generator.train()
         discriminator.train()
         resAcc = TrainResClass()
-        totalIm = 0
+        updAcc = TrainResClass()
+        _ = trackExtremes()
 
         for it , data in tqdm.tqdm(enumerate(dataLoader), total=int(len(dataLoader))):
             if startFrom :
                 startFrom -= 1
                 continue
             iter += 1
-            images = data[0].to(TCfg.device)
-            nofIm = images.shape[0]
-            imer += nofIm
-            totalIm += nofIm
+            images = data['image'].to(TCfg.device)
+            imer += images.shape[0]
             trainRes = train_step(images)
-            resAcc += trainRes * nofIm
-            resAcc.nofIm += nofIm
+            resAcc += trainRes
+            updAcc += trainRes
 
             #if True:
-            #if False :
-            #if not it or it > len(dataloader)-2 or time.time() - lastUpdateTime > 60 :
-            if time.time() - lastUpdateTime > 60 :
+            if time.time() - lastUpdateTime > 60  or imer == images.shape[0]:
 
-                lastUpdateTime = time.time()
+                # generate previews
+                generator.eval()
+                extImages = torch.stack((maxMetrices['loss'][1],minMetrices['loss'][1]))
+                extViews, extGen, _ = generateDisplay(extImages)
+                extViews = extViews.cpu().numpy()
+                refViews, genImages, _ = generateDisplay()
+                refViews = refViews.cpu().numpy()
+                rndIndeces = random.sample(range(images.shape[0]), 2)
+                rndViews, rndGen, _ = generateDisplay(images[rndIndeces,...])
+                rndViews = rndViews.cpu().numpy()
+                generator.train()
 
-                #_,_,_ =  logStep(iter)
-                #collageR, probsR, _ = generateDiffImages(refImages[[0],...], layout=0)
-                #showMe = np.zeros( (2*DCfg.sinoSh[1] + DCfg.gapW ,
-                #                    5*DCfg.sinoSh[0] + 4*DCfg.gapW), dtype=np.float32  )
-                #for clmn in range (5) : # mark gaps
-                #    showMe[ DCfg.sinoSh[0] : DCfg.sinoSh[0] + DCfg.gapW ,
-                #            clmn*(DCfg.sinoSh[1]+DCfg.gapW) + 2*DCfg.gapW : clmn*(DCfg.sinoSh[1]+DCfg.gapW) + 3*DCfg.gapW ] = -1
-                #def addImage(clmn, row, img, stretch=True) :
-                #    imgToAdd = img.clone().detach().squeeze()
-                #    if stretch :
-                #        minv = imgToAdd.min()
-                #        ampl = imgToAdd.max() - minv
-                #        imgToAdd[()] = 2 * ( imgToAdd - minv ) / ampl - 1  if ampl!=0.0 else 0
-                #    showMe[ row * ( DCfg.sinoSh[1]+DCfg.gapW) : (row+1) * DCfg.sinoSh[1] + row*DCfg.gapW ,
-                #            clmn * ( DCfg.sinoSh[0]+DCfg.gapW) : (clmn+1) * DCfg.sinoSh[0] + clmn*DCfg.gapW ] = \
-                #        imgToAdd.cpu().numpy()
-                #addImage(0,0,trainInfo.bestRealImage)
-                #addImage(0,1,trainInfo.worstRealImage)
-                #addImage(1,0,trainInfo.bestFakeImage)
-                #addImage(1,1,trainInfo.worstFakeImage)
-                #addImage(2,0,trainInfo.highestDifImageGen)
-                #addImage(2,1,trainInfo.highestDifImageOrg)
-                #addImage(3,0,collageR[0,2])
-                #addImage(3,1,collageR[0,0])
-                #addImage(4,0,collageR[0,1])
-                #addImage(4,1,collageR[0,3], stretch=False)
-                writer.add_scalars("Losses per iter",
-                                   {'Dis': trainRes.lossD
-                                   ,'Gen': trainRes.lossGA
-                                   ,'Rec': ADV_DIF * trainRes.lossGA \
-                                           + (1-ADV_DIF) * trainRes.lossGD * normRec
-                                   }, imer )
-                writer.add_scalars("Distances per iter",
-                                   {'MSE': trainRes.lossMSE
-                                   ,'L1L': trainRes.lossL1L
-                                   ,'REC': trainRes.lossGD
-                                   }, imer )
-                writer.add_scalars("Probs per iter",
-                                   {'Ref':trainRes.predReal
-                                   ,'Gen':trainRes.predFake
-                                   ,'Pre':trainRes.predPre
-                                   }, imer )
 
                 IPython.display.clear_output(wait=True)
-                beforeReport()
-                print(f"Epoch: {epoch} ({minGEpoch}). " +
-                      ( f" L1L: {trainRes.lossL1L:.3f} " if noAdv \
-                          else \
-                        f" Dis[{trainInfo.disPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossD:.3f} ({trainInfo.ratReal/trainInfo.totalImages:.3f})," ) +
-                      ( f" MSE: {trainRes.lossMSE:.3f} " if noAdv \
-                          else \
-                        f" Gen[{trainInfo.genPerformed/trainInfo.totPerformed:.2f}]: {trainRes.lossGA:.3f} ({trainInfo.ratFake/trainInfo.totalImages:.3f})," ) +
-                      f" Rec: {trainRes.lossGD:.3f} (Train: {lastGdLossTrain:.3f}, Test: {lastGdLoss/normTestRec:.3f} | {minGdLoss/normTestRec:.3f})."
-                      )
-                print (f"TT: {trainInfo.bestRealProb:.2f},  "
-                       f"FT: {trainInfo.bestFakeProb:.2f},  "
-                       f"HD: {trainInfo.highestDif/normMSE:.3e},  "
-                       ) #f"GP: {probsR[0,2].item():.3f}, {probsR[0,1].item():.3f} " )
-                print (f"TF: {trainInfo.worstRealProb:.2f},  "
-                       f"FF: {trainInfo.worstFakeProb:.2f},  "
-                       f"LD: {trainInfo.lowestDif/normMSE:.3e},  "
-                       ) #f"R : {probsR[0,0].item():.3f}." )
-                #plotImage(showMe)
-                afterReport()
-                trainInfo = TrainInfoClass() # reset for the next iteration
+                beforeReport(locals())
+                print(f"Epoch: {epoch} ({minGEpoch}). ", end=' ')
+                print(updAcc)
+                updAcc *= 1/updAcc.nofIm
+                writer.add_scalars("Losses per iter",
+                                   {'Dis': updAcc.lossD
+                                   ,'Gen': updAcc.lossG
+                                   #,'Adv' : updAcc.metrices['Adv']
+                                   }, imer )
+                for key in updAcc.metrices.keys() :
+                    if metrices[key].norm > 0 :
+                        writer.add_scalars("Metrices per iter", {key : updAcc.metrices[key],}, imer )
+                #writer.add_scalars("Metrices per iter", updAcc.metrices, imer )
+                writer.add_scalars("Probs per iter",
+                                   {'Ref':updAcc.predReal
+                                   ,'Gen':updAcc.predFake
+                                   #,'Pre':trainRes.predGen
+                                   }, imer )
+
+                subLay = (1,1)
+                def addSubplot(pos, img, sym=True) :
+                    nonlocal subLay
+                    plt.subplot(*subLay, pos) ;
+                    vmm = max( -img.min(), img.max() )
+                    plt.imshow(img, cmap='gray', vmin = -vmm if sym else None,
+                                                 vmax =  vmm if sym else None)
+                    plt.axis("off")
+
+                subLay = (3,1)
+                plt.figure(frameon=True, layout='compressed', facecolor=(0,0.3,0.5))
+                #plt.subplots_adjust(hspace=0.5, wspace=0)
+                addSubplot(1, rndGen[0,0,...].transpose(-1,-2).cpu().numpy(), False)
+                addSubplot(2, genImages[0,0,...].transpose(-1,-2).cpu().numpy(), False)
+                addSubplot(3, extGen[0,0,...].transpose(-1,-2).cpu().numpy(), False)
+                plt.show()
+
+                subLay = (2,5)
+                plt.figure(frameon=True, layout='compressed', facecolor=(0,0.3,0.5))
+                #plt.subplots_adjust(hspace = 0.1, wspace=0.1)
+                addSubplot( 1, extViews[0,2],False)
+                addSubplot( 2, rndViews[0,1],False)
+                addSubplot( 3, rndViews[0,0],False)
+                addSubplot( 4, refViews[3,3])
+                addSubplot( 5, refViews[2,3])
+                addSubplot( 6, extViews[0,3])
+                addSubplot( 7, rndViews[0,2],False)
+                addSubplot( 8, rndViews[0,3])
+                addSubplot( 9, refViews[1,3])
+                addSubplot(10, refViews[0,3])
+                plt.show()
+
+
+                afterReport(locals())
+                lastUpdateTime = time.time()
+                updAcc = TrainResClass()
+                _ = trackExtremes()
 
             if time.time() - lastSaveTime > 3600 :
                 lastSaveTime = time.time()
                 saveCheckPoint(savedCheckPoint+"_hourly.pth",
-                               epoch-1, imer, minGEpoch, minGdLoss/normRec,
+                               epoch-1, imer, minGEpoch, minGLoss,
                                generator, discriminator,
                                optimizer_G, optimizer_D,
                                startFrom=it, interimRes=resAcc)
                 saveModels(f"model_{TCfg.exec}_hourly")
 
 
-        resAcc *= 1.0/totalIm
+        print(resAcc)
+        resAcc *= 1/resAcc.nofIm
         writer.add_scalars("Losses per epoch",
                            {'Dis': resAcc.lossD
-                           ,'Adv': resAcc.lossGA
-                           ,'Gen': ADV_DIF * resAcc.lossGA + (1-ADV_DIF) * resAcc.lossGD
+                           ,'Gen': resAcc.lossG
+                           #,'Adv' : resAcc.metrices['Adv']
                            }, epoch )
-        writer.add_scalars("Distances per epoch",
-                           {'MSE': resAcc.lossMSE
-                           ,'L1L': resAcc.lossL1L
-                           ,'REC': resAcc.lossGD
-                           }, epoch )
+        #writer.add_scalars("Metrices per epoch", resAcc.metrices, epoch )
+        for key in resAcc.metrices.keys() :
+            if metrices[key].norm > 0 :
+                writer.add_scalars("Metrices per epoch", {key : resAcc.metrices[key],}, epoch )
         writer.add_scalars("Probs per epoch",
-                           {'Ref': resAcc.predReal
-                           ,'Gen': resAcc.predFake
-                           ,'Pre': resAcc.predPre
+                           {'Ref':resAcc.predReal
+                           ,'Gen':resAcc.predFake
+                           #,'Pre':trainRes.predGen
                            }, epoch )
-        lastGdLossTrain = resAcc.lossGD
 
-        #Rec_test, MSE_test, L1L_test, Rprob_test, Fprob_test, Dloss_test, GAloss_test, GDloss_test \
-        #    = summarizeSet(testLoader, False)
-        #writer.add_scalars("Test per epoch",
-        #                   {'MSE': MSE_test / normTestMSE
-        #                   ,'L1L': L1L_test / normTestL1L
-        #                   ,'REC': Rec_test / normTestRec
-        #                   #,'Dis': Dis_test
-        #                   #,'Gen': Gen_test
-        #                   }, epoch )
-        #writer.add_scalars("Test losses per epoch",
-        #                   { 'Dis': Dloss_test
-        #                   , 'Adv': GAloss_test
-        #                   , 'Gen': ADV_DIF * GAloss_test + (1-ADV_DIF) * GDloss_test
-        #                   }, epoch )
-        #writer.add_scalars("Test probs per epoch",
-        #                   {'Ref': Rprob_test
-        #                   ,'Gen': Fprob_test
-        #                   }, epoch )
+        generator.eval()
+        displayImages()
+        resTest = summarizeMe(testLoader, False)
+        resTest *= 1/resTest.nofIm
+        writer.add_scalars("Losses epoch test",
+            {'Dis': resTest.lossD
+            ,'Gen': resTest.lossG
+            #,'Adv' : resTest.metrices['Adv']
+            }, epoch )
+        for key in resTest.metrices.keys() :
+            if metrices[key].norm > 0 :
+                writer.add_scalars("Metrices epoch test", {key : resTest.metrices[key],}, epoch )
+        writer.add_scalars("Probs epoch test",
+            {'Ref':resTest.predReal
+            ,'Gen':resTest.predFake
+            #,'Pre':trainRes.predGen
+            }, epoch )
+        generator.train()
 
-        lastGdLoss = resAcc.lossGD # Rec_test
-        if lastGdLoss < minGdLoss  :
-            minGdLoss = lastGdLoss
+
+        lastGLoss = resAcc.lossG # Rec_test
+        if minGLoss is None or minGLoss == 0 or lastGLoss < minGLoss :
+            minGLoss = lastGLoss
             minGEpoch = epoch
             saveCheckPoint(savedCheckPoint+"_B.pth",
-                           epoch, imer, minGEpoch, minGdLoss,
+                           epoch, imer, minGEpoch, minGLoss,
                            generator, discriminator,
                            optimizer_G, optimizer_D)
             os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_BB.pth") # BB: before best
@@ -1691,31 +1515,16 @@ def train(savedCheckPoint):
             saveModels(f"model_{TCfg.exec}_B")
         else :
             saveCheckPoint(savedCheckPoint+".pth",
-                           epoch, imer, minGEpoch, minGdLoss,
+                           epoch, imer, minGEpoch, minGLoss,
                            generator, discriminator,
                            optimizer_G, optimizer_D)
         saveModels()
 
         resAcc = TrainResClass()
-        afterEachEpoch(epoch)
+        afterEachEpoch(locals())
+        print("Epoch completed.\n")
 
 
-def testMe(tSet, imags=1):
-    if isinstance(imags, int) :
-        testSubSet = [ tSet.__getitem__() for _ in range(imags) ]
-    else :
-        testSubSet = [ tSet.__getitem__(index) for index in imags ]
-    testImages = torch.stack( [ testItem[0] for testItem in testSubSet ] ).to(TCfg.device)
-    colImgs, probs, dists = generateDiffImages(testImages, layout=4)
-    testIndeces = []
-    for im in range(len(testSubSet)) :
-        testItem = testSubSet[im]
-        testIndeces.append(testItem[1])
-        print(f"Index: ({testItem[1]})")
-        print(f"Probabilities. Org: {probs[im,0]:.3e},  Gen: {probs[im,2]:.3e},  Pre: {probs[im,1]:.3e}.")
-        print(f"Distances. Rec: {dists[im,0]:.4e},  MSE: {dists[im,1]:.4e},  L1L: {dists[im,2]:.4e}.")
-        plotImage(colImgs[im].squeeze().cpu())
-    return testIndeces
 
 
 
