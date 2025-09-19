@@ -59,7 +59,6 @@ class TCfgClass:
     num_workers : int = os.cpu_count()
     historyHDF : str = field(repr = True, init = False)
     logDir : str = field(repr = True, init = False)
-    useBricks : bool = True
     def __post_init__(self):
         if self.device == torch.device('cpu')  :
             self.device = torch.device(f"cuda:{self.exec}")
@@ -74,23 +73,18 @@ TCfg = initIfNew('TCfg')
 @dataclass
 class DCfgClass:
     gapW : int
-    sinoLen : int
+    brick : bool = field(repr = False)
     sinoSh : tuple = field(repr = True, init = False)
-    sinoSize : int = field(repr = True, init = False)
     gapSh : tuple = field(repr = True, init = False)
-    gapSize : int = field(repr = True, init = False)
     gapRngX : type(np.s_[:]) = field(repr = True, init = False)
     gapRng : type(np.s_[:]) = field(repr = True, init = False)
-    disRng : type(np.s_[:]) = field(repr = True, init = False)
-    readSh : tuple = (None,128) # None for whole image
+    readSh : tuple = field(repr = True, init = False)
     def __post_init__(self):
-        self.sinoSh = ( self.sinoLen*self.gapW , 8*self.gapW )
-        self.sinoSize = math.prod(self.sinoSh)
+        self.readSh : tuple = (128 if self.brick else None ,128)
+        self.sinoSh = ( (8 if self.brick else 256) * self.gapW , 8*self.gapW )
         self.gapSh = (self.sinoSh[0],self.gapW)
-        self.gapSize = math.prod(self.gapSh)
         self.gapRngX = np.s_[ self.sinoSh[1]//2 - self.gapW//2 : self.sinoSh[1]//2 + self.gapW//2 ]
         self.gapRng = np.s_[...,self.gapRngX]
-        self.disRng = np.s_[ self.gapW:-self.gapW , self.gapRngX ]
 DCfg = initIfNew('DCfg')
 
 
@@ -454,7 +448,7 @@ class StripesFromHDF :
             ydx, xdx = tuple( int(dx) for dx in self.availableSinos[fdx,:] )
             return self.__getitem__((zdx, ydx, xdx))
         elif isinstance(index, tuple)  and len(index) == 3 :
-            zdx = index[0] * ( 0 if DCfg.readSh[0] is None else DCfg.readSh[0] if self.exclusive else 1 )
+            zdx = 0 if DCfg.readSh[0] is None else index[0]
             data = self.volume[ zdx : -1 if DCfg.readSh[0] is None else (zdx+DCfg.readSh[0]),
                                 index[1],
                                 index[2]:index[2]+DCfg.readSh[1]
@@ -472,7 +466,6 @@ class StripesFromHDFs :
             self.collection.append(
                 StripesFromHDF(f"{base}.hdf:/data", f"{base}.mask++.tif", exclusive) )
             print("Done")
-
 
     def __getitem__(self, index=None):
         if index is None:
@@ -512,6 +505,8 @@ class StripesFromHDFs :
                 if doTransform and self.transform :
                     data = self.transform(data)
                 return data, rIndex
+            def originalSinoLen(self,setdx) :
+                return self.container.collection[setdx].sh[0]
 
         return Sinos(self, transform)
 
@@ -587,9 +582,16 @@ def createReferences(tSet, majorIdx = 0) :
     refImages = torch.empty((len(examples), 1, *DCfg.sinoSh), dtype=torch.float32).to(TCfg.device)
     refBoxes = []
     for idx, ex in enumerate(examples) :
-        data = tSet.__getitem__(ex[0], doTransform=False)[0]
+        if DCfg.readSh[0] is None :
+            index = (ex[0][0], 0, ex[0][1], ex[0][2])
+            refBoxes.append( int(ex[1] * refImages.shape[-2]) )
+        else :
+            index = (ex[0][0], int(ex[1]*tSet.originalSinoLen(ex[0][0])) , ex[0][1], ex[0][2])
+            refBoxes.append(0)
+        data = tSet.__getitem__(index, doTransform=False)[0]
         refImages[idx,0,...] = mytransforms(data)
-        refBoxes.append( int(ex[1] * refImages.shape[-2]) )
+
+
     refNoises = torch.randn((refImages.shape[0],TCfg.latentDim)).to(TCfg.device)
     return refImages, refNoises, refBoxes
 refImages = initIfNew('refImages')
@@ -615,10 +617,10 @@ def showMe(tSet, index=None) :
 
 class SubGeneratorTemplate(nn.Module):
 
-    def __init__(self, gapW, sinoLen, batchNorm=True, inChannels=1):
+    def __init__(self, gapW, brick, batchNorm=True, inChannels=1):
         super(SubGeneratorTemplate, self).__init__()
-        self.cfg = DCfgClass(gapW, sinoLen)
-        self.baseChannels = 4
+        self.cfg = DCfgClass(gapW, brick)
+        self.baseChannels = None
         self.inChannels = inChannels
         self.amplitude = 4
         self.batchNorm = batchNorm
@@ -673,7 +675,6 @@ class SubGeneratorTemplate(nn.Module):
         fillWheights(toRet)
         return toRet
 
-
     def createLastTouch(self, chIn=1) :
         toRet = nn.Sequential(
             nn.Conv2d(chIn*self.baseChannels+self.inChannels, 1, 1),
@@ -683,8 +684,35 @@ class SubGeneratorTemplate(nn.Module):
         return toRet
 
 
+    def generateImages(self, images, noises=None) :
+        res = images.clone()
+        res[self.cfg.gapRng] = self.forward(images)[self.cfg.gapRng]
+        return res
+
+
+    def preProc(self, images) :
+        images, orgDims = unsqeeze4dim(images)
+        if self.cfg.gapW == 2:
+            res = torch.zeros(images[self.cfg.gapRng].shape, device=images.device)
+            res[...,0] += 2*images[...,self.cfg.gapRngX.start-1] + images[...,self.cfg.gapRngX.stop]
+            res[...,1] += 2*images[...,self.cfg.gapRngX.stop] + images[...,self.cfg.gapRngX.start-1]
+            res /= 3
+        else :
+            preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
+            #with torch.set_grad_enabled(not self.lowResGenerator is None) :
+            res = self.lowResGenerator.generatePatches(preImages)
+            res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
+        return squeezeOrg(res, orgDims)
+
+
     def forward(self, images):
         images, orgDims = unsqeeze4dim(images)
+        images = images.clone()
+        images[self.cfg.gapRng] = self.preProc(images)
+        with torch.no_grad():
+            stds, means = torch.std_mean(images, dim=(-1,-2), keepdim=True)
+            stds += 1e-7
+        images = (images - means) / stds # normalize per image
         dwTrain = [images,]
         for encoder in self.encoders :
             dwTrain.append(encoder(dwTrain[-1]))
@@ -698,6 +726,7 @@ class SubGeneratorTemplate(nn.Module):
             #print(f"{upTrain[-2].shape} -> {upTrain[-1].shape} ({dwTrain[-2-level].shape})")
         res = self.lastTouch(torch.cat( (upTrain[-1], images ), dim=1 ))
         res = res * self.amplitude + images[:,[0],...]
+        res = res * stds + means # denormalise
         return squeezeOrg(res, orgDims)
 
 
@@ -755,10 +784,6 @@ class GeneratorTemplate(SubGeneratorTemplate):
         images, noises = input
         images, orgDims = unsqeeze4dim(images)
         modelIn = images.clone().detach()
-        with torch.no_grad() :
-            modelIn[self.cfg.gapRng] = self.preProc(images)
-            stds, means = torch.std_mean(modelIn, dim=(-1,-2), keepdim=True)
-            modelIn = (modelIn - means) / (stds + 1e-7) # normalize per image
 
         if TCfg.useBricks :
             bricksM = modelIn.view(-1,1, *self.brickGenerator.cfg.sinoSh)
@@ -1109,7 +1134,7 @@ def summarizeMe(toSumm, onPrep=True):
             subImages = images[subRange,...]
             patchImages = generator.preProc(subImages) \
                             if onPrep else \
-                          generator.generatePatches(subImages)
+                          generator.forward(subImages)[DCfg.gapRng]
             fakeImages[subRange,...,DCfg.gapRngX] = patchImages
 
         genLoss, indLosses = loss_Gen(images, fakeImages)
@@ -1149,7 +1174,7 @@ def generateDisplay(inp=None, boxes=None) :
     with torch.no_grad() :
         prePatches = generator.preProc(images)
         preImages[DCfg.gapRng] = prePatches
-        genPatches = generator.generatePatches(images)
+        genPatches = generator.forward(images)[DCfg.gapRng]
         genImages[DCfg.gapRng] = genPatches
     hGap = DCfg.gapW // 2
 
@@ -1178,7 +1203,8 @@ def displayImages(inp=None, boxes=None) :
     views = views.cpu().numpy()
     nofIm = views.shape[0]
     for curim in range(nofIm) :
-        plotImage(genImages[curim,0,...].transpose(-1,-2).cpu().numpy())
+        if not DCfg.brick :
+            plotImage(genImages[curim,0,...].transpose(-1,-2).cpu().numpy())
         vmin = views[curim,0:3,...].min()
         vmax = views[curim,0:3,...].max()
         plt.figure(frameon=False)
@@ -1413,13 +1439,14 @@ def train(savedCheckPoint):
                                                  vmax =  vmm if sym else None)
                     plt.axis("off")
 
-                subLay = (3,1)
-                plt.figure(frameon=True, layout='compressed', facecolor=(0,0.3,0.5))
-                #plt.subplots_adjust(hspace=0.5, wspace=0)
-                addSubplot(1, rndGen[0,0,...].transpose(-1,-2).cpu().numpy(), False)
-                addSubplot(2, genImages[0,0,...].transpose(-1,-2).cpu().numpy(), False)
-                addSubplot(3, extGen[0,0,...].transpose(-1,-2).cpu().numpy(), False)
-                plt.show()
+                if not DCfg.brick :
+                    subLay = (3,1)
+                    plt.figure(frameon=True, layout='compressed', facecolor=(0,0.3,0.5))
+                    #plt.subplots_adjust(hspace=0.5, wspace=0)
+                    addSubplot(1, rndGen[0,0,...].transpose(-1,-2).cpu().numpy(), False)
+                    addSubplot(2, genImages[0,0,...].transpose(-1,-2).cpu().numpy(), False)
+                    addSubplot(3, extGen[0,0,...].transpose(-1,-2).cpu().numpy(), False)
+                    plt.show()
 
                 subLay = (2,5)
                 plt.figure(frameon=True, layout='compressed', facecolor=(0,0.3,0.5))
