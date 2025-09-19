@@ -642,31 +642,19 @@ save_interim = None
 
 
 
+class BrickGeneratorTemplate(nn.Module):
 
-
-
-
-
-
-
-
-
-class GeneratorTemplate(nn.Module):
-
-    def __init__(self, gapW, latentChannels=0, batchNorm=False):
-        super(GeneratorTemplate, self).__init__()
+    def __init__(self, gapW, latentChannels=0):
+        super(BrickGeneratorTemplate, self).__init__()
         self.gapW = gapW
-        self.sinoSh = (256*self.gapW,5*self.gapW)
-        self.sinoSize = math.prod(self.sinoSh)
+        self.sinoSh = (5*self.gapW,5*self.gapW)
         self.gapSh = (self.sinoSh[0],self.gapW)
-        self.gapSize = math.prod(self.gapSh)
         self.gapRngX = np.s_[ self.sinoSh[1]//2 - self.gapW//2 : self.sinoSh[1]//2 + self.gapW//2 ]
         self.gapRng = np.s_[...,self.gapRngX]
         self.latentChannels = latentChannels
-        self.baseChannels = 4
+        self.baseChannels = 64
         self.amplitude = 4
         self.lowResGenerator = None
-        self.batchNorm = batchNorm
 
 
 
@@ -674,7 +662,7 @@ class GeneratorTemplate(nn.Module):
         if self.latentChannels == 0 :
             return None
         toRet =  nn.Sequential(
-            nn.Linear(TCfg.latentDim, self.sinoSize*self.latentChannels),
+            nn.Linear(TCfg.latentDim, math.prod(self.sinoSh) * self.latentChannels),
             nn.ReLU(),
             nn.Unflatten( 1, (self.latentChannels,) + self.sinoSh )
         )
@@ -683,8 +671,8 @@ class GeneratorTemplate(nn.Module):
 
 
     def encblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=0) :
-        if norm is None :
-            norm = self.batchNorm
+        #if norm is None :
+        #    norm = self.batchNorm
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
@@ -698,8 +686,8 @@ class GeneratorTemplate(nn.Module):
 
 
     def decblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=0, outputPadding=0) :
-        if norm is None :
-            norm = self.batchNorm
+        #if norm is None :
+        #    norm = self.batchNorm
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
@@ -778,6 +766,158 @@ class GeneratorTemplate(nn.Module):
 
         images, noises = input
         images, orgDims = unsqeeze4dim(images)
+        modelIn = images.clone()
+        modelIn[self.gapRng] = self.preProc(images)
+        stDev = modelIn.std(dim=(-1,-2))[...,None,None]
+
+        if self.latentChannels :
+            latent = self.noise2latent(noises)
+            dwTrain = [torch.cat((modelIn, latent), dim=1),]
+        else :
+            dwTrain = [modelIn,]
+        for encoder in self.encoders :
+            dwTrain.append(encoder(dwTrain[-1]))
+        mid = self.fcLink(dwTrain[-1])
+        upTrain = [mid]
+        for level, decoder in enumerate(self.decoders) :
+            upTrain.append( decoder( torch.cat( (upTrain[-1], dwTrain[-1-level]), dim=1 ) ) )
+        res = self.lastTouch(torch.cat( (upTrain[-1], modelIn ), dim=1 ))
+
+        patches = modelIn[self.gapRng] + self.amplitude * stDev * res[self.gapRng]
+        return squeezeOrg(patches, orgDims)
+
+
+lowResBrickGenerators = initIfNew('lowResBrickGenerators', {})
+
+
+class GeneratorTemplate(nn.Module):
+
+    def __init__(self, gapW, latentChannels=0, inChannels=1, batchNorm=False):
+        super(GeneratorTemplate, self).__init__()
+        self.gapW = gapW
+        self.sinoSh = (DCfg.sinoLen*self.gapW,5*self.gapW)
+        self.sinoSize = math.prod(self.sinoSh)
+        self.gapSh = (self.sinoSh[0],self.gapW)
+        self.gapSize = math.prod(self.gapSh)
+        self.gapRngX = np.s_[ self.sinoSh[1]//2 - self.gapW//2 : self.sinoSh[1]//2 + self.gapW//2 ]
+        self.gapRng = np.s_[...,self.gapRngX]
+        self.latentChannels = latentChannels
+        self.inChannels = inChannels
+        self.baseChannels = 4
+        self.amplitude = 4
+        self.lowResGenerator = None
+        self.batchNorm = batchNorm
+
+
+
+    def createLatent(self) :
+        if self.latentChannels == 0 :
+            return None
+        toRet =  nn.Sequential(
+            nn.Linear(TCfg.latentDim, self.sinoSize*self.latentChannels),
+            nn.ReLU(),
+            nn.Unflatten( 1, (self.latentChannels,) + self.sinoSh )
+        )
+        fillWheights(toRet)
+        return toRet
+
+
+    def encblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=0) :
+        if norm is None :
+            norm = self.batchNorm
+        chIn = int(chIn*self.baseChannels)
+        chOut = int(chOut*self.baseChannels)
+        layers = []
+        layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias = not norm,
+                                padding=padding, padding_mode='reflect')  )
+        if norm :
+            layers.append(nn.BatchNorm2d(chOut))
+        layers.append(nn.LeakyReLU(0.2))
+        fillWheights(layers)
+        return torch.nn.Sequential(*layers)
+
+
+    def decblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=0, outputPadding=0) :
+        if norm is None :
+            norm = self.batchNorm
+        chIn = int(chIn*self.baseChannels)
+        chOut = int(chOut*self.baseChannels)
+        layers = []
+        layers.append( nn.ConvTranspose2d(chIn, chOut, kernel, stride=stride, bias = not norm,
+                                          padding=padding, padding_mode='zeros', output_padding=outputPadding) )
+        if norm :
+            layers.append(nn.BatchNorm2d(chOut))
+        layers.append(nn.LeakyReLU(0.2))
+        fillWheights(layers)
+        return torch.nn.Sequential(*layers)
+
+
+    def createFClink(self) :
+        smpl = torch.zeros((1, self.inChannels+self.latentChannels, *self.sinoSh))
+        for encoder in self.encoders :
+            smpl = encoder(smpl)
+        encSh = smpl.shape
+        linChannels = math.prod(encSh)
+        toRet = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(linChannels, linChannels),
+            nn.LeakyReLU(0.2),
+            nn.Linear(linChannels, linChannels),
+            nn.LeakyReLU(0.2),
+            nn.Unflatten(1, encSh[1:]),
+        )
+        fillWheights(toRet)
+        return toRet
+
+
+    def createLastTouch(self, chIn=1) :
+        toRet = nn.Sequential(
+            nn.Conv2d(chIn*self.baseChannels+self.inChannels, 1, 1),
+            nn.Tanh(),
+        )
+        fillWheights(toRet)
+        return toRet
+
+
+    def generatePatches(self, images, noises=None) :
+        if noises is None :
+            noises = torch.randn( 1 if images.dim() < 3 else images.shape[0], TCfg.latentDim).to(TCfg.device)
+        return self.forward((images,noises))
+
+
+    def fillImages(self, images, noises=None) :
+        images[self.gapRng] = self.generatePatches(images, noises)
+        return images
+
+
+    def generateImages(self, images, noises=None) :
+        clone = images.clone()
+        return self.fillImages(clone, noises)
+
+
+    def preProc(self, images) :
+        images, orgDims = unsqeeze4dim(images)
+        if self.gapW == 2:
+            res = torch.zeros(images[self.gapRng].shape, device=images.device)
+            res[...,0] += 2*images[...,self.gapRngX.start-1] + images[...,self.gapRngX.stop]
+            res[...,1] += 2*images[...,self.gapRngX.stop] + images[...,self.gapRngX.start-1]
+            res /= 3
+        elif self.lowResGenerator is None and not self.gapW//2 in lowResGenerators :
+            res = torch.zeros(images[self.gapRng].shape, device=images.device, requires_grad=False)
+        else :
+            preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
+            # lowRes generator to be trained if they are a part of the generator
+            lrGen = lowResGenerators[self.gapW//2] if self.lowResGenerator is None else self.lowResGenerator
+            with torch.set_grad_enabled(not self.lowResGenerator is None) :
+                res = lrGen.generatePatches(preImages)
+                res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
+        return squeezeOrg(res, orgDims)
+
+
+    def forward(self, input):
+
+        images, noises = input
+        images, orgDims = unsqeeze4dim(images)
         modelIn = images.clone().detach()
         with torch.no_grad() :
             modelIn[self.gapRng] = self.preProc(images)
@@ -792,6 +932,7 @@ class GeneratorTemplate(nn.Module):
 
         for encoder in self.encoders :
             dwTrain.append(encoder(dwTrain[-1]))
+            #print(f"{dwTrain[-2].shape} -> {dwTrain[-1].shape}")
         #return dwTrain[-1]
         mid = self.fcLink(dwTrain[-1])
         self.bottleNeck = mid.clone().detach() # for higher resolution generators
@@ -799,6 +940,7 @@ class GeneratorTemplate(nn.Module):
         upTrain = [mid]
         for level, decoder in enumerate(self.decoders) :
             upTrain.append( decoder( torch.cat( (upTrain[-1], dwTrain[-1-level]), dim=1 ) ) )
+            #print(f"{upTrain[-2].shape} -> {upTrain[-1].shape} ({dwTrain[-2-level].shape})")
         res = self.lastTouch(torch.cat( (upTrain[-1], modelIn ), dim=1 ))
 
         patches = modelIn[self.gapRng] + res[self.gapRng] * self.amplitude
@@ -1446,8 +1588,8 @@ def train(savedCheckPoint):
                 plt.figure(frameon=True, layout='compressed', facecolor=(0,0.3,0.5))
                 #plt.subplots_adjust(hspace = 0.1, wspace=0.1)
                 addSubplot( 1, extViews[0,2],False)
-                addSubplot( 2, rndViews[0,1],False)
-                addSubplot( 3, rndViews[0,0],False)
+                addSubplot( 2, rndViews[0,0],False)
+                addSubplot( 3, rndViews[0,1],False)
                 addSubplot( 4, refViews[3,3])
                 addSubplot( 5, refViews[2,3])
                 addSubplot( 6, extViews[0,3])
