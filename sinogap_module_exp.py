@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as fn
 import torchvision
-from torch import optim, rand
+from torch import optim, rand, randint
 from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
 
@@ -403,13 +403,11 @@ class DevicePlace:
 
 class StripesFromHDF :
 
+    # Setting exclusize to True makes dataset consisting only out of non-overlapping sinograms
     def __init__(self, sampleName, maskName, exclusive=False):
-
-        self.exclusive = exclusive
         self.volume = getInData(sampleName, False, False)
         self.sh = self.volume.shape
         self.fsh = self.sh[1:3]
-
         self.mask = loadImage(maskName, self.fsh)
         self.mask /= self.mask.max()
         if self.mask is None :
@@ -429,13 +427,13 @@ class StripesFromHDF :
                     else :
                         forbidenSinos[ yCr, xCr ] = 0
                         xCr += 1
-        self.availableSinos = np.argwhere(forbidenSinos)
+        self.allAvailableSinos = np.argwhere(forbidenSinos)
         self.availableFragments = 1 if DCfg.readSh[0] is None else \
             ( (self.sh[0] - DCfg.readSh[0] + 1) // ( DCfg.readSh[0] if exclusive else 1 ) )
 
 
     def __len__(self):
-        return self.availableSinos.shape[0] * self.availableFragments
+        return self.allAvailableSinos.shape[0] * self.availableFragments
 
 
     def __getitem__(self, index=None):
@@ -445,7 +443,8 @@ class StripesFromHDF :
         elif isinstance(index, int) :
             fdx, zdx = divmod(index, self.availableFragments)
             #ydx, xdx = tuple(self.availableSinos[fdx])
-            ydx, xdx = tuple( int(dx) for dx in self.availableSinos[fdx,:] )
+            ydx, xdx = tuple( int(dx) for dx in self.allAvailableSinos[fdx,:] )
+            #ydx, xdx = tuple( int(dx) for dx in self.exposedSinos[fdx,:] )
             return self.__getitem__((zdx, ydx, xdx))
         elif isinstance(index, tuple)  and len(index) == 3 :
             zdx = 0 if DCfg.readSh[0] is None else index[0]
@@ -488,18 +487,24 @@ class StripesFromHDFs :
         return sum( [ len(set) for set in self.collection ] )
 
 
-    def get_dataset(self, transform=None) :
+    def get_dataset(self, transform=None, expose=1, shuffle=False) :
 
         class Sinos(torch.utils.data.Dataset) :
-            def __init__(self, root, transform=None):
+            def __init__(self, root, transform=None, expose=1, shuffle=False):
                 self.container = root
+                if not ( 0 < expose <= 1 ) :
+                    raise f"Provided exposure {expose} is outside (0,1] range."
+                self.expose = expose
+                self.shuffle = shuffle
+                self.transform = transform
                 self.oblTransform = transforms.Compose( [transforms.ToTensor(),
                                                          #DevicePlace(),
                                                          transforms.Resize(DCfg.sinoSh)] )
-                self.transform = transform
             def __len__(self):
-                return self.container.__len__()
+                return int(self.container.__len__() * self.expose)
             def __getitem__(self, index=None, doTransform=True):
+                if self.shuffle and isinstance(index, int) : # randomize dataset
+                    index = random.randint(0,self.container.__len__()-1)
                 data, rIndex = self.container.__getitem__(index)
                 data = self.oblTransform(data)
                 if doTransform and self.transform :
@@ -508,7 +513,7 @@ class StripesFromHDFs :
             def originalSinoLen(self,setdx) :
                 return self.container.collection[setdx].sh[0]
 
-        return Sinos(self, transform)
+        return Sinos(self, transform, expose, shuffle)
 
 
 listOfTrainData = [
@@ -538,7 +543,7 @@ listOfTestData = [
     #"19603a.ROI-CTs.50keV_7m_Eiger_Sheep1",
 ]
 
-def createDataSet(path, listOfData, exclusive=False) :
+def createDataSet(path, listOfData, exclusive=False, expose=1) :
     #listOfData = [file.removesuffix(".hdf") for file in glob.glob(path+ "/*.hdf", recursive=False)]
     listOfData = [ '/'.join((path,file))  for file in listOfData ]
     print(listOfData)
@@ -550,15 +555,16 @@ def createDataSet(path, listOfData, exclusive=False) :
         transList.append(transforms.RandomVerticalFlip()),
     #transList.append(transforms.Normalize(mean=(0.5), std=(1)))
     mytransforms = transforms.Compose(transList)
-    return sinoRoot.get_dataset(mytransforms)
+    return sinoRoot.get_dataset( transform=mytransforms, expose=expose, shuffle = not exclusive )
 trainSet = initIfNew('trainSet')
 testSet = initIfNew('testSet')
 
-def createDataLoader(tSet, num_workers=os.cpu_count(), shuffle=False) :
+
+def createDataLoader(tSet, num_workers=os.cpu_count()) :
     return torch.utils.data.DataLoader(
         dataset=tSet,
         batch_size = TCfg.batchSize * max(1, -TCfg.batchSplit) ,
-        shuffle=shuffle,
+        shuffle=False, # randomize dataset instead of the dataloader because it takes enormous amount of time otherwise
         num_workers=num_workers,
         drop_last=True
     )
@@ -620,6 +626,7 @@ class SubGeneratorTemplate(nn.Module):
     def __init__(self, gapW, brick, batchNorm=True, inChannels=1):
         super(SubGeneratorTemplate, self).__init__()
         self.cfg = DCfgClass(gapW, brick)
+        self.lowResGenerator = None
         self.baseChannels = None
         self.inChannels = inChannels
         self.amplitude = 4
@@ -700,19 +707,26 @@ class SubGeneratorTemplate(nn.Module):
         else :
             preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
             #with torch.set_grad_enabled(not self.lowResGenerator is None) :
-            res = self.lowResGenerator.generatePatches(preImages)
+            res = self.lowResGenerator.forward(preImages)[self.lowResGenerator.cfg.gapRng]
             res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
         return squeezeOrg(res, orgDims)
 
 
-    def forward(self, images):
+    def normalizeImages(self, images) :
         images, orgDims = unsqeeze4dim(images)
-        images = images.clone()
+        images = images.clone().detach()
         images[self.cfg.gapRng] = self.preProc(images)
-        with torch.no_grad():
-            stds, means = torch.std_mean(images, dim=(-1,-2), keepdim=True)
-            stds += 1e-7
+        stds, means = torch.std_mean(images, dim=(-1,-2), keepdim=True)
+        stds += 1e-7
         images = (images - means) / stds # normalize per image
+        return images, (orgDims, stds, means)
+
+    def reNormalizeImages(self, images, norms) :
+        images = images * norms[1] + norms[2] # renormalise
+        images = squeezeOrg(images, norms[0])
+        return images
+
+    def dropIN(self,images) :
         dwTrain = [images,]
         for encoder in self.encoders :
             dwTrain.append(encoder(dwTrain[-1]))
@@ -725,9 +739,13 @@ class SubGeneratorTemplate(nn.Module):
             upTrain.append( decoder( torch.cat( (upTrain[-1], dwTrain[-1-level]), dim=1 ) ) )
             #print(f"{upTrain[-2].shape} -> {upTrain[-1].shape} ({dwTrain[-2-level].shape})")
         res = self.lastTouch(torch.cat( (upTrain[-1], images ), dim=1 ))
-        res = res * self.amplitude + images[:,[0],...]
-        res = res * stds + means # denormalise
-        return squeezeOrg(res, orgDims)
+        return res * self.amplitude + images[:,[0],...]
+
+    def forward(self, images):
+        with torch.no_grad():
+            images, norms = self.normalizeImages(images)
+        results = self.dropIN(images)
+        return self.reNormalizeImages(results, norms)
 
 
 
@@ -738,71 +756,58 @@ class SubGeneratorTemplate(nn.Module):
 
 class GeneratorTemplate(SubGeneratorTemplate):
 
-    def __init__(self, gapW, sinoLen, batchNorm=True, inChannels=1):
-        super(GeneratorTemplate, self).__init__(gapW, sinoLen, batchNorm, inChannels)
-        self.lowResGenerator = None
+    def __init__(self, gapW, batchNorm=True):
+        super(GeneratorTemplate, self).__init__(gapW, False, batchNorm, inChannels=3)
         self.brickGenerator = None
 
 
-    def generatePatches(self, images, noises=None) :
+    def __generatePatches(self, images, noises=None) :
         if noises is None :
             noises = torch.randn( 1 if images.dim() < 3 else images.shape[0], TCfg.latentDim).to(TCfg.device)
         return self.forward((images,noises))
 
 
-    def fillImages(self, images, noises=None) :
+    def __fillImages(self, images, noises=None) :
         images[self.cfg.gapRng] = self.generatePatches(images, noises)
         return images
 
 
-    def generateImages(self, images, noises=None) :
+    def __generateImages(self, images, noises=None) :
         clone = images.clone()
         return self.fillImages(clone, noises)
 
 
-    def preProc(self, images) :
-        images, orgDims = unsqeeze4dim(images)
-        if self.cfg.gapW == 2:
-            res = torch.zeros(images[self.cfg.gapRng].shape, device=images.device)
-            res[...,0] += 2*images[...,self.cfg.gapRngX.start-1] + images[...,self.cfg.gapRngX.stop]
-            res[...,1] += 2*images[...,self.cfg.gapRngX.stop] + images[...,self.cfg.gapRngX.start-1]
-            res /= 3
-        elif self.lowResGenerator is None and not self.cfg.gapW//2 in lowResGenerators :
-            res = torch.zeros(images[self.cfg.gapRng].shape, device=images.device, requires_grad=False)
-        else :
-            preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
-            # lowRes generator to be trained if they are a part of the generator
-            lrGen = lowResGenerators[self.cfg.gapW//2] if self.lowResGenerator is None else self.lowResGenerator
-            with torch.set_grad_enabled(not self.lowResGenerator is None) :
-                res = lrGen.generatePatches(preImages)
-                res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
-        return squeezeOrg(res, orgDims)
+    def forward(self, images):
+        with torch.no_grad():
+            images, norms = self.normalizeImages(images)
+        bricksM = images.view(-1,1, *self.brickGenerator.cfg.sinoSh)
+        bricksM = self.brickGenerator.forward(bricksM)
+        bricksM = bricksM.view(-1,1, *self.cfg.sinoSh)
+        edge = self.brickGenerator.cfg.sinoSh[-2]//2
+        bricks_ = images[:,:,edge:-edge,:].clone().view(-1,1, *self.brickGenerator.cfg.sinoSh)
+        bricks_ = self.brickGenerator.forward(bricks_)
+        bricks_ = bricks_.view(-1,1, self.cfg.sinoSh[-2]-2*edge, self.cfg.sinoSh[-1])
+        bricksS = images.clone()
+        bricksS[:,:,edge:-edge,:] = bricks_
+        modelIn = torch.cat((images, bricksM, bricksS), dim=1)
+        results = self.dropIN(modelIn)
+        return self.reNormalizeImages(results, norms)
 
-
-    def forward(self, input):
-
-        images, noises = input
-        images, orgDims = unsqeeze4dim(images)
-        modelIn = images.clone().detach()
-
-        if TCfg.useBricks :
-            bricksM = modelIn.view(-1,1, *self.brickGenerator.cfg.sinoSh)
-            bricksM = self.brickGenerator.forward(bricksM)
-            bricksM = bricksM.view(-1,1, *self.cfg.sinoSh)
-            edge = self.brickGenerator.cfg.sinoSh[-2]//2
-            bricks_ = modelIn[:,:,edge:-edge,:].clone().view(-1,1, *self.brickGenerator.cfg.sinoSh)
-            bricks_ = self.brickGenerator.forward(bricks_)
-            bricks_ = bricks_.view(-1,1, self.cfg.sinoSh[-2]-2*edge, self.cfg.sinoSh[-1])
-            bricksS = modelIn.clone()
-            bricksS[:,:,edge:-edge,:] = bricks_
-            modelIn = torch.cat((modelIn, bricksM, bricksS), dim=1)
-        else :
-            modelIn = torch.cat((modelIn, torch.zeros_like(modelIn) , torch.zeros_like(modelIn)), dim=1)
-
-        patches = super(GeneratorTemplate, self).forward(modelIn)[self.cfg.gapRng]
-        patches = patches * (stds + 1e-7) + means # denormalise
-        return squeezeOrg(patches, orgDims)
-
+    ### this version of forward is only to calculate what bricks generator do with no main generator.
+    #def forward(self,images) :
+    #    with torch.no_grad():
+    #        images, norms = self.normalizeImages(images)
+    #    bricksM = images.view(-1,1, *self.brickGenerator.cfg.sinoSh)
+    #    bricksM = self.brickGenerator.forward(bricksM)
+    #    bricksM = bricksM.view(-1,1, *self.cfg.sinoSh)
+    #    edge = self.brickGenerator.cfg.sinoSh[-2]//2
+    #    bricks_ = images[:,:,edge:-edge,:].clone().view(-1,1, *self.brickGenerator.cfg.sinoSh)
+    #    bricks_ = self.brickGenerator.forward(bricks_)
+    #    bricks_ = bricks_.view(-1,1, self.cfg.sinoSh[-2]-2*edge, self.cfg.sinoSh[-1])
+    #    bricksS = images.clone()
+    #    bricksS[:,:,edge:-edge,:] = bricks_
+    #    results = ( bricksM + bricksS ) / 2
+    #    return self.reNormalizeImages(results, norms)
 
 
 
@@ -1036,7 +1041,7 @@ def updateExtremes(vector, key, p_true, p_pred) :
 
 
 def loss_Gen(p_true, p_pred):
-    global minMetrices, maxMetrices
+    global metrices, minMetrices, maxMetrices
     loss = 0
     sumweights = 0
     individualLosses = {}
@@ -1139,7 +1144,7 @@ def summarizeMe(toSumm, onPrep=True):
 
         genLoss, indLosses = loss_Gen(images, fakeImages)
         sumAcc.lossG += genLoss.item()
-        for key in metrices.keys() :
+        for key in indLosses.keys() :
             sumAcc.metrices[key] += indLosses[key]
 
         if metrices['Adv'].weight > 0 : # discriminator
@@ -1329,7 +1334,7 @@ def train_step(allImages):
             #subFakeImages[DCfg.gapRng] = generator.generatePatches(subImages)
             genLoss, indLosses = loss_Gen(subImages, subFakeImages)
             trainRes.lossG += genLoss.item()
-            for key in metrices.keys() :
+            for key in indLosses.keys() :
                 trainRes.metrices[key] += indLosses[key]
             genLoss /= subBatchSize
             genLoss.backward()
@@ -1358,13 +1363,13 @@ def beforeReport(locals) :
 def afterReport(locals) :
     return
 
-dataLoader=None
+trainLoader=None
 testLoader=None
 resAcc = TrainResClass()
 
 def train(savedCheckPoint):
     global epoch, minGLoss, minGEpoch, iter, startFrom, imer, resAcc
-    global dataLoader, testLoader, testSet, refImages, minMetrices, maxMetrices
+    global trainLoader, testLoader, testSet, refImages, minMetrices, maxMetrices
     lastGLoss = minGLoss
 
     discriminator.to(TCfg.device)
@@ -1375,7 +1380,6 @@ def train(savedCheckPoint):
     while TCfg.nofEpochs is None or epoch <= TCfg.nofEpochs :
         epoch += 1
         beforeEachEpoch(epoch)
-        dataLoader = createDataLoader(trainSet, shuffle=True, num_workers=TCfg.num_workers)
 
         generator.train()
         discriminator.train()
@@ -1383,7 +1387,7 @@ def train(savedCheckPoint):
         updAcc = TrainResClass()
         _ = trackExtremes()
 
-        for it , data in tqdm.tqdm(enumerate(dataLoader), total=int(len(dataLoader))):
+        for it , data in tqdm.tqdm(enumerate(trainLoader), total=int(len(trainLoader))):
             if startFrom :
                 startFrom -= 1
                 continue
@@ -1496,6 +1500,12 @@ def train(savedCheckPoint):
                            #,'Pre':trainRes.predGen
                            }, epoch )
 
+        os.system(f"mv {savedCheckPoint}.pth {savedCheckPoint}_previous.pth")
+        saveCheckPoint(savedCheckPoint+".pth",
+                       epoch, imer, minGEpoch, minGLoss,
+                       generator, discriminator,
+                       optimizer_G, optimizer_D)
+
         generator.eval()
         displayImages()
         resTest = summarizeMe(testLoader, False)
@@ -1516,22 +1526,13 @@ def train(savedCheckPoint):
         generator.train()
 
 
-        lastGLoss = resAcc.lossG # Rec_test
+        lastGLoss = resTest.lossG # Rec_test
         if minGLoss is None or minGLoss == 0 or lastGLoss < minGLoss :
             minGLoss = lastGLoss
             minGEpoch = epoch
-            saveCheckPoint(savedCheckPoint+"_B.pth",
-                           epoch, imer, minGEpoch, minGLoss,
-                           generator, discriminator,
-                           optimizer_G, optimizer_D)
-            os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_BB.pth") # BB: before best
-            os.system(f"cp {savedCheckPoint}_B.pth {savedCheckPoint}.pth") # B: best
+            os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_best.pth")
+            os.system(f"cp {savedCheckPoint}_previous.pth {savedCheckPoint}_beforebest.pth")
             saveModels(f"model_{TCfg.exec}_B")
-        else :
-            saveCheckPoint(savedCheckPoint+".pth",
-                           epoch, imer, minGEpoch, minGLoss,
-                           generator, discriminator,
-                           optimizer_G, optimizer_D)
         saveModels()
 
         resAcc = TrainResClass()
