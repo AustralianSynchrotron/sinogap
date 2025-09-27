@@ -1381,11 +1381,13 @@ def train(savedCheckPoint):
         epoch += 1
         beforeEachEpoch(epoch)
 
+        trainLoader = createDataLoader(trainSet, num_workers=TCfg.num_workers)
         generator.train()
         discriminator.train()
         resAcc = TrainResClass()
         updAcc = TrainResClass()
         _ = trackExtremes()
+
 
         for it , data in tqdm.tqdm(enumerate(trainLoader), total=int(len(trainLoader))):
             if startFrom :
