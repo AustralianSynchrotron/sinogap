@@ -613,6 +613,7 @@ def showMe(tSet, index=None) :
     print(index, rindex)
     tensorStat(image)
     plotImage(image.cpu())
+    return rindex
 
 
 
