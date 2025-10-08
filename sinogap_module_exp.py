@@ -887,7 +887,7 @@ discriminator = initIfNew('discriminator')
 
 def createOptimizer(model, lr) :
     return optim.Adam(
-        model.parameters(),
+        filter(lambda p: p.requires_grad, model.parameters()),
         lr=lr,
         betas=(0.5, 0.999)
     )
@@ -1402,6 +1402,7 @@ def train(savedCheckPoint):
         beforeEachEpoch(epoch)
 
         trainLoader = createDataLoader(trainSet, num_workers=TCfg.num_workers)
+        testLoader = createDataLoader(testSet, num_workers=TCfg.num_workers)
         generator.train()
         discriminator.train()
         resAcc = TrainResClass()
@@ -1430,6 +1431,8 @@ def train(savedCheckPoint):
                 extViews = extViews.cpu().numpy()
                 refViews, genImages, _ = generateDisplay()
                 refViews = refViews.cpu().numpy()
+                genLoss, indLosses = loss_Gen(images, fakeImages)
+
                 rndIndeces = random.sample(range(images.shape[0]), 2)
                 rndViews, rndGen, _ = generateDisplay(images[rndIndeces,...])
                 rndViews = rndViews.cpu().numpy()
