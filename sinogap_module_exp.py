@@ -822,7 +822,20 @@ class GeneratorTemplate(SubGeneratorTemplate):
         results = ( bricksM + bricksM ) / 2
         return self.reNormalizeImages(results, norms)
 
+    ### this version of forward is to train only stripe generator with no main generator.
+    ### to be used with specific transformGTforStripe - see it below
+    def __forward(self, images):
+        with torch.no_grad():
+            images, norms = self.normalizeImages(images)
+        stripeImages = self.stripeGenerator.forward(images)
+        return self.reNormalizeImages(stripeImages, norms)
 
+def transformGT_forStripeTraining(images):
+    with torch.no_grad():
+        images, orgdims = unsqeeze4dim(images)
+        images = torch.nn.functional.interpolate(images, scale_factor=(1/DCfg.gapW,1), mode='bilinear')
+        images = torch.nn.functional.interpolate(images, scale_factor=(  DCfg.gapW,1), mode='bilinear')
+    return squeezeOrg(images, orgdims)
 
 
 
