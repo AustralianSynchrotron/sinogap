@@ -968,17 +968,34 @@ def loss_L1LN(p_true, p_pred):
 
 SSIM = ssim.SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
 def loss_SSIM(p_true, p_pred):
-    p_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
-    p_pred, _ = unsqeeze4dim(p_pred[DCfg.gapRng])
+    p_true, _ = unsqeeze4dim(p_true)
+    p_pred, _ = unsqeeze4dim(p_pred)
     #return (1 - SSIM( p_true+0.5, p_pred+0.5 ) ) / 2
     return (1 - SSIM( p_true, p_pred ) ) / 2
 
 MSSSIM = ssim.MS_SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
 def loss_MSSSIM(p_true, p_pred):
-    p_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
-    p_pred, _ = unsqeeze4dim(p_pred[DCfg.gapRng])
+    p_true, _ = unsqeeze4dim(p_true)
+    p_pred, _ = unsqeeze4dim(p_pred)
     #return (1 - MSSSIM( p_true+0.5, p_pred+0.5 ) ) / 2
     return (1 - MSSSIM( p_true, p_pred ) ) / 2
+
+
+def loss_COR(p_true, p_pred):
+    d_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
+    d_pred, _ = unsqeeze4dim(p_pred[DCfg.gapRng])
+    means = torch.mean(d_true, dim=(-1,-2), keepdim=True)
+    d_true = d_true - means
+    d_pred = d_pred - means
+    cor = (d_true*d_pred).sum(dim=(-1,-2))
+    dist = 1 - cor / (d_true**2).sum(dim=(-1,-2))
+    return torch.abs(dist.squeeze(1))
+    #return 1 - cor / torch.sqrt( ( (p_true-means)**2 ).sum(dim=(-1,-2)) * ( (p_pred-means)**2 ).sum(dim=(-1,-2)) + 1e-7 )
+
+def loss_STD(p_true, p_pred):
+    p_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
+    p_pred, _ = unsqeeze4dim(p_pred[DCfg.gapRng])
+    return (p_true - p_pred).std(dim=(-1,-2,-3))
 
 
 @dataclass
@@ -996,6 +1013,8 @@ metrices = {
     'L1LN'   : Metrics(loss_L1LN,    1, 1),
     'SSIM'   : Metrics(loss_SSIM,    1, 1),
     'MSSSIM' : Metrics(loss_MSSSIM,  1, 1),
+    'STD'    : Metrics(loss_STD,     1, 1),
+    'COR'    : Metrics(loss_COR,     1, 1),
 }
 
 # Gap 2 metrices
@@ -1431,8 +1450,6 @@ def train(savedCheckPoint):
                 extViews = extViews.cpu().numpy()
                 refViews, genImages, _ = generateDisplay()
                 refViews = refViews.cpu().numpy()
-                genLoss, indLosses = loss_Gen(images, fakeImages)
-
                 rndIndeces = random.sample(range(images.shape[0]), 2)
                 rndViews, rndGen, _ = generateDisplay(images[rndIndeces,...])
                 rndViews = rndViews.cpu().numpy()
