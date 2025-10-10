@@ -132,7 +132,7 @@ def plotData(dataY, rangeY=None, dataYR=None, rangeYR=None,
     if dataX is None :
         dataX = np.arange(rangeP.start, rangeP.stop)
 
-    plt.style.use('default')
+    #plt.style.use('default')
     plt.style.use('dark_background')
     fig, ax1 = plt.subplots(figsize=figsize)
     ax1.xaxis.grid(True, 'both', linestyle='dotted')
@@ -615,7 +615,18 @@ def showMe(tSet, index=None) :
     plotImage(image.cpu())
     return rindex
 
+def normalizeImages(images) :
+    images, orgDims = unsqeeze4dim(images)
+    images = images.clone().detach()
+    stds, means = torch.std_mean(images, dim=(-1,-2), keepdim=True)
+    stds += 1e-7
+    images = (images - means) / stds # normalize per image
+    return images, (orgDims, stds, means)
 
+def reNormalizeImages(images, norms) :
+    images = images * norms[1][:,[0],...] + norms[2][:,[0],...] # renormalise
+    images = squeezeOrg(images, norms[0])
+    return images
 
 
 
@@ -698,7 +709,7 @@ class SubGeneratorTemplate(nn.Module):
         return res
 
 
-    def preProc(self, images) :
+    def preFill(self, images) :
         images, orgDims = unsqeeze4dim(images)
         if self.cfg.gapW == 2:
             res = torch.zeros( (images.shape[0], 1 , *self.cfg.gapSh ), device=images.device)
@@ -713,21 +724,6 @@ class SubGeneratorTemplate(nn.Module):
             res = self.lowResGenerator.forward(preImages)[self.lowResGenerator.cfg.gapRng]
             res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
         return squeezeOrg(res, orgDims)
-
-
-    def normalizeImages(self, images) :
-        images, orgDims = unsqeeze4dim(images)
-        images = images.clone().detach()
-        images[:,[0],*self.cfg.gapRng] = self.preProc(images)
-        stds, means = torch.std_mean(images, dim=(-1,-2), keepdim=True)
-        stds += 1e-7
-        images = (images - means) / stds # normalize per image
-        return images, (orgDims, stds, means)
-
-    def reNormalizeImages(self, images, norms) :
-        images = images * norms[1][:,[0],...] + norms[2][:,[0],...] # renormalise
-        images = squeezeOrg(images, norms[0])
-        return images
 
     def dropIN(self,images) :
         dwTrain = [images,]
@@ -749,9 +745,11 @@ class SubGeneratorTemplate(nn.Module):
             images = images.repeat((1,self.inChannels,1,1))
             torch.nn.init.normal_( images[:,1:,:,:] , mean=0.0, std=0.1 )
         with torch.no_grad():
-            images, norms = self.normalizeImages(images)
+            images = images.clone().detach()
+            images[:,[0],*self.cfg.gapRng] = self.preFill(images)
+            images, norms = normalizeImages(images)
         results = self.dropIN(images)
-        return self.reNormalizeImages(results, norms)
+        return reNormalizeImages(results, norms)
 
 
 
@@ -786,7 +784,9 @@ class GeneratorTemplate(SubGeneratorTemplate):
     def forward(self, images):
         # channel 0
         with torch.no_grad():
-            images, norms = self.normalizeImages(images)
+            images = images.clone().detach()
+            images[:,[0],*self.cfg.gapRng] = self.preFill(images)
+            images, norms = normalizeImages(images)
         # channel 1
         stripeImages = self.stripeGenerator.forward(images)
         # channel 2
@@ -805,14 +805,16 @@ class GeneratorTemplate(SubGeneratorTemplate):
         # combine channels and drop in
         modelIn = torch.cat((images, stripeImages, bricksM, bricksP), dim=1)
         results = self.dropIN(modelIn)
-        return self.reNormalizeImages(results, norms)
+        return reNormalizeImages(results, norms)
 
 
     ### this version of forward is only to calculate what bricks generator does with no main generator.
     def __forward(self, images):
         # channel 0
         with torch.no_grad():
-            images, norms = self.normalizeImages(images)
+            images = images.clone().detach()
+            images[:,[0],*self.cfg.gapRng] = self.preFill(images)
+            images, norms = normalizeImages(images)
         bricksM = self.brickGenerator.forward(images.view(-1,1, *self.brickGenerator.cfg.sinoSh))
         bricksM = bricksM.view(-1,1, *self.cfg.sinoSh)
         edge = self.brickGenerator.cfg.sinoSh[-2]//2
@@ -820,15 +822,17 @@ class GeneratorTemplate(SubGeneratorTemplate):
         bricksP[:,:,edge:-edge,:] = self.brickGenerator.forward(images[:,:,edge:-edge,:].reshape(-1,1, *self.brickGenerator.cfg.sinoSh)) \
             .view(-1,1, self.cfg.sinoSh[-2]-2*edge, self.cfg.sinoSh[-1] )
         results = ( bricksM + bricksM ) / 2
-        return self.reNormalizeImages(results, norms)
+        return reNormalizeImages(results, norms)
 
     ### this version of forward is to train only stripe generator with no main generator.
     ### to be used with specific transformGTforStripe - see it below
     def __forward(self, images):
         with torch.no_grad():
-            images, norms = self.normalizeImages(images)
+            images = images.clone().detach()
+            images[:,[0],*self.cfg.gapRng] = self.preFill(images)
+            images, norms = normalizeImages(images)
         stripeImages = self.stripeGenerator.forward(images)
-        return self.reNormalizeImages(stripeImages, norms)
+        return reNormalizeImages(stripeImages, norms)
 
 def transformGT_forStripeTraining(images):
     with torch.no_grad():
@@ -1010,6 +1014,20 @@ def loss_STD(p_true, p_pred):
     p_pred, _ = unsqeeze4dim(p_pred[DCfg.gapRng])
     return (p_true - p_pred).std(dim=(-1,-2,-3))
 
+normalHist = torch.tensor([0.044058, 0.09185, 0.14988, 0.19145, 0.19146, 0.14987, 0.09184, 0.04405])
+def loss_HIST(p_true, p_pred):
+    global normalHist
+    diffImages = p_true[DCfg.gapRng] - p_pred[DCfg.gapRng]
+    normDiff, _ = normalizeImages(diffImages)
+    normDiff = normDiff.view(normDiff.shape[0],-1)
+    normalHist = normalHist.to(normDiff.device)
+    toRet = []
+    for imgn in range(normDiff.shape[0]) :
+        img = normDiff[imgn,...]
+        hist = torch.histc(img, bins=8, min=-2, max=2) / math.prod(img.shape)
+        img_loss = torch.sum( (hist - normalHist)**2 )
+        toRet.append( img_loss )
+    return torch.stack(toRet)
 
 @dataclass
 class Metrics:
@@ -1028,6 +1046,7 @@ metrices = {
     'MSSSIM' : Metrics(loss_MSSSIM,  1, 1),
     'STD'    : Metrics(loss_STD,     1, 1),
     'COR'    : Metrics(loss_COR,     1, 1),
+    'HIST'   : Metrics(loss_HIST,    1, 1),
 }
 
 # Gap 2 metrices
@@ -1189,7 +1208,7 @@ def summarizeMe(toSumm, onPrep=True):
         for i in range(batchSplit) :
             subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
             subImages = images[subRange,...]
-            patchImages = generator.preProc(subImages) \
+            patchImages = generator.preFill(subImages) \
                             if onPrep else \
                           generator.forward(subImages)[DCfg.gapRng]
             fakeImages[subRange,...,DCfg.gapRngX] = patchImages
@@ -1229,7 +1248,7 @@ def generateDisplay(inp=None, boxes=None) :
     preImages = images.clone()
     views = torch.empty((nofIm, 4, viewLen, viewLen ), dtype=torch.float32, device=TCfg.device)
     with torch.no_grad() :
-        prePatches = generator.preProc(images)
+        prePatches = generator.preFill(images)
         preImages[DCfg.gapRng] = prePatches
         genPatches = generator.forward(images)[DCfg.gapRng]
         genImages[DCfg.gapRng] = genPatches
@@ -1255,7 +1274,8 @@ def generateDisplay(inp=None, boxes=None) :
 
 
 def displayImages(inp=None, boxes=None) :
-    views, genImages, _ = generateDisplay(inp, boxes)
+    allImages = generateDisplay(inp, boxes)
+    views, genImages, _ = allImages
     genImages = unsqeeze4dim(genImages)[0]
     views = views.cpu().numpy()
     nofIm = views.shape[0]
@@ -1274,6 +1294,7 @@ def displayImages(inp=None, boxes=None) :
         plt.imshow(views[curim,3,...], cmap='gray', vmin=-vmm, vmax=vmm)
         plt.axis("off")
         plt.show()
+    return allImages
 
 
 
