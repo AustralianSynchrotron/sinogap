@@ -762,50 +762,48 @@ class SubGeneratorTemplate(nn.Module):
 
 class GeneratorTemplate(SubGeneratorTemplate):
 
-    def __init__(self, gapW, batchNorm=True, inChannels=3):
+    def __init__(self, gapW, batchNorm=True, inChannels=2):
         super(GeneratorTemplate, self).__init__(gapW, False, batchNorm, inChannels=inChannels)
         self.brickGenerator = None
+        self.stripeGenerator = None
 
-
-    def __generatePatches(self, images, noises=None) :
-        if noises is None :
-            noises = torch.randn( 1 if images.dim() < 3 else images.shape[0], TCfg.latentDim).to(TCfg.device)
-        return self.forward((images,noises))
-
-
-    def __fillImages(self, images, noises=None) :
-        images[self.cfg.gapRng] = self.generatePatches(images, noises)
-        return images
-
-
-    def __generateImages(self, images, noises=None) :
-        clone = images.clone()
-        return self.fillImages(clone, noises)
-
+    def createBricksMask(self):
+        brickLen = self.brickGenerator.cfg.sinoSh[-2]
+        halfLine = [i + 0.5 for i in range(brickLen//2)]
+        halfLine = torch.tensor(halfLine, dtype=torch.float32, device=TCfg.device)
+        halfLine /= brickLen//2
+        line = torch.cat( (halfLine, halfLine.flip(0)), dim=0)
+        self.brickMask = line.view(-1,1).repeat(1,self.brickGenerator.cfg.sinoSh[-1])
+        self.brickMask = self.brickMask.unsqueeze(0).unsqueeze(0) # add batch and channel dims
 
     def forward(self, images):
-        # channel 0
+        # prepare input
         with torch.no_grad():
             images = images.clone().detach()
             images[:,[0],*self.cfg.gapRng] = self.preFill(images)
             images, norms = normalizeImages(images)
-        # channel 1
+        # prepareStripe
         stripeImages = self.stripeGenerator.forward(images)
-        # channel 2
+        # brick set 1
         bricksIn = torch.cat((      images.view(-1,1, *self.brickGenerator.cfg.sinoSh),
                               stripeImages.view(-1,1, *self.brickGenerator.cfg.sinoSh)),
                              dim=1)
-        bricksM = self.brickGenerator.forward(bricksIn).view(-1,1, *self.cfg.sinoSh)
-        # channel 3
+        bricksM = self.brickMask * self.brickGenerator.forward(bricksIn)
+        bricksM = bricksM.view(-1,1, *self.cfg.sinoSh)
+        # bricks set 2
         edge = self.brickGenerator.cfg.sinoSh[-2]//2
         bricksIn = torch.cat((      images[:,:,edge:-edge,:].reshape(-1,1, *self.brickGenerator.cfg.sinoSh),
                               stripeImages[:,:,edge:-edge,:].reshape(-1,1, *self.brickGenerator.cfg.sinoSh)),
                              dim=1)
-        bricksP = images.clone()
-        bricksP[:,:,edge:-edge,:] = self.brickGenerator.forward(bricksIn) \
-            .view(-1,1, self.cfg.sinoSh[-2]-2*edge, self.cfg.sinoSh[-1] )
+        bricksP = self.brickMask * self.brickGenerator.forward(bricksIn)
+        bricksP = bricksP.view(-1,1, self.cfg.sinoSh[-2]-2*edge, self.cfg.sinoSh[-1] )
+        # mix bricks sets
+        bricksMix = bricksM
+        bricksMix[:,:,edge:-edge,:] = bricksMix[:,:,edge:-edge,:] + bricksP
+        bricksMix[:,:,:edge,:]      = bricksMix[:,:,:edge,:] / self.brickMask[:,:,:edge,:]
+        bricksMix[:,:,-edge:,:]     = bricksMix[:,:,-edge:,:] / self.brickMask[:,:,-edge:,:]
         # combine channels and drop in
-        modelIn = torch.cat((images, stripeImages, bricksM, bricksP), dim=1)
+        modelIn = torch.cat((images, bricksMix), dim=1)
         results = self.dropIN(modelIn)
         return reNormalizeImages(results, norms)
 
@@ -949,7 +947,7 @@ def saveModels(path="") :
 
 BCE = nn.BCELoss(reduction='none')
 def loss_Adv(images, truth):
-    if discriminator is not None :
+    if discriminator is None :
         raise Exception("Discriminator is not defined.")
     labels = torch.full((images.shape[0], 1),  (1 - TCfg.labelSmoothFac ) if truth else TCfg.labelSmoothFac,
                 dtype=torch.float, device=TCfg.device, requires_grad=False)
@@ -1325,7 +1323,8 @@ def saveCheckPoint(path, epoch, iterations, minGEpoch, lastGLoss,
     checkPoint['lastGLoss'] = lastGLoss
     checkPoint['startFrom'] = startFrom
     checkPoint['generator'] = generator.state_dict()
-    checkPoint['discriminator'] = discriminator.state_dict()
+    if discriminator is not None :
+        checkPoint['discriminator'] = discriminator.state_dict()
     if not optimizerGen is None :
         checkPoint['optimizerGen'] = optimizerGen.state_dict()
     if not schedulerGen is None :
@@ -1348,7 +1347,8 @@ def loadCheckPoint(path, generator, discriminator,
     lastGLoss = checkPoint['lastGLoss']
     startFrom = checkPoint['startFrom'] if 'startFrom' in checkPoint else 0
     generator.load_state_dict(checkPoint['generator'])
-    discriminator.load_state_dict(checkPoint['discriminator'])
+    if discriminator is not None :
+        discriminator.load_state_dict(checkPoint['discriminator'])
     if not optimizerGen is None :
         optimizerGen.load_state_dict(checkPoint['optimizerGen'])
     if not schedulerGen is None :

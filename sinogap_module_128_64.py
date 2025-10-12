@@ -1325,7 +1325,8 @@ def saveCheckPoint(path, epoch, iterations, minGEpoch, lastGLoss,
     checkPoint['lastGLoss'] = lastGLoss
     checkPoint['startFrom'] = startFrom
     checkPoint['generator'] = generator.state_dict()
-    checkPoint['discriminator'] = discriminator.state_dict()
+    if discriminator is not None :
+        checkPoint['discriminator'] = discriminator.state_dict()
     if not optimizerGen is None :
         checkPoint['optimizerGen'] = optimizerGen.state_dict()
     if not schedulerGen is None :
@@ -1348,7 +1349,8 @@ def loadCheckPoint(path, generator, discriminator,
     lastGLoss = checkPoint['lastGLoss']
     startFrom = checkPoint['startFrom'] if 'startFrom' in checkPoint else 0
     generator.load_state_dict(checkPoint['generator'])
-    discriminator.load_state_dict(checkPoint['discriminator'])
+    if discriminator is not None :
+        discriminator.load_state_dict(checkPoint['discriminator'])
     if not optimizerGen is None :
         optimizerGen.load_state_dict(checkPoint['optimizerGen'])
     if not schedulerGen is None :
