@@ -35,6 +35,7 @@ import tifffile
 import tqdm
 
 import ssim
+from eagle_loss import Eagle_Loss
 
 
 def initIfNew(var, val=None) :
@@ -783,10 +784,9 @@ class GeneratorTemplate(SubGeneratorTemplate):
 
     def forward(self, images):
         # channel 0
-        with torch.no_grad():
-            images = images.clone().detach()
-            images[:,[0],*self.cfg.gapRng] = self.preFill(images)
-            images, norms = normalizeImages(images)
+        images = images.clone().detach()
+        images[:,[0],*self.cfg.gapRng] = self.preFill(images)
+        images, norms = normalizeImages(images)
         # channel 1
         stripeImages = self.stripeGenerator.forward(images)
         # channel 2
@@ -912,6 +912,7 @@ optimizer_G = initIfNew('optimizer_G')
 optimizer_D = initIfNew('optimizer_D')
 scheduler_G = initIfNew('scheduler_G')
 scheduler_D = initIfNew('scheduler_D')
+optimizers_G = []
 
 def adjustScheduler(scheduler, iniLr, target) :
     if scheduler is None :
@@ -944,6 +945,15 @@ def saveModels(path="") :
 
 
 
+
+
+
+
+
+
+
+
+
 BCE = nn.BCELoss(reduction='none')
 def loss_Adv(images, truth):
     labels = torch.full((images.shape[0], 1),  (1 - TCfg.labelSmoothFac ) if truth else TCfg.labelSmoothFac,
@@ -959,7 +969,6 @@ def loss_Adv_Dis(p_true, p_pred):
     loss_pred, predictions_pred = loss_Adv(p_pred, False)
     return ( torch.cat((loss_true, loss_pred), dim=0),
              torch.cat((predictions_true, predictions_pred), dim=0) )
-
 
 MSE = nn.MSELoss(reduction='none')
 def loss_MSE(p_true, p_pred):
@@ -997,7 +1006,6 @@ def loss_MSSSIM(p_true, p_pred):
     #return (1 - MSSSIM( p_true+0.5, p_pred+0.5 ) ) / 2
     return (1 - MSSSIM( p_true, p_pred ) ) / 2
 
-
 def loss_COR(p_true, p_pred):
     d_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
     d_pred, _ = unsqeeze4dim(p_pred[DCfg.gapRng])
@@ -1029,6 +1037,14 @@ def loss_HIST(p_true, p_pred):
         toRet.append( img_loss )
     return torch.stack(toRet)
 
+EAGLE = Eagle_Loss(patch_size=3)
+def loss_EAGLE(p_true, p_pred):
+    p_true, _ = unsqeeze4dim(p_true)
+    p_pred, _ = unsqeeze4dim(p_pred)
+    loss = EAGLE(p_true, p_pred)
+    return loss
+
+
 @dataclass
 class Metrics:
     calculate : callable
@@ -1047,6 +1063,7 @@ metrices = {
     'STD'    : Metrics(loss_STD,     1, 1),
     'COR'    : Metrics(loss_COR,     1, 1),
     'HIST'   : Metrics(loss_HIST,    1, 1),
+    'EAGLE'  : Metrics(loss_EAGLE,   1, 1),
 }
 
 # Gap 2 metrices
@@ -1397,7 +1414,8 @@ def train_step(allImages):
 
 
         # train generator
-        optimizer_G.zero_grad(set_to_none=False)
+        for optim in optimizers_G :
+            optim.zero_grad(set_to_none=False)
         for i in range(batchSplit) :
             subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
             subImages = images[subRange,...]#.clone().detach()
@@ -1411,8 +1429,9 @@ def train_step(allImages):
                 trainRes.metrices[key] += indLosses[key]
             genLoss /= subBatchSize
             genLoss.backward()
-        optimizer_G.step()
-        optimizer_G.zero_grad(set_to_none=True)
+        for optim in optimizers_G :
+            optim.step()
+            optim.zero_grad(set_to_none=True)
 
     return trainRes
 
