@@ -35,6 +35,7 @@ import tifffile
 import tqdm
 
 import ssim
+from eagle_loss import Eagle_Loss
 
 
 def initIfNew(var, val=None) :
@@ -724,7 +725,7 @@ class SubGeneratorTemplate(nn.Module):
             preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
             #with torch.set_grad_enabled(not self.lowResGenerator is None) :
             res = self.lowResGenerator.forward(preImages)[self.lowResGenerator.cfg.gapRng]
-            res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
+            res = torch.nn.functional.interpolate(res, scale_factor=2, mode='nearest')
         return squeezeOrg(res, orgDims)
 
     def dropIN(self,images) :
@@ -762,8 +763,9 @@ class SubGeneratorTemplate(nn.Module):
 
 class GeneratorTemplate(SubGeneratorTemplate):
 
-    def __init__(self, gapW, batchNorm=True, inChannels=2):
+    def __init__(self, gapW, batchNorm=True, inChannels=2, addFC=False):
         super(GeneratorTemplate, self).__init__(gapW, False, batchNorm, inChannels=inChannels)
+        self.addFC = addFC
         self.brickGenerator = None
         self.stripeGenerator = None
 
@@ -776,34 +778,103 @@ class GeneratorTemplate(SubGeneratorTemplate):
         self.brickMask = line.view(-1,1).repeat(1,self.brickGenerator.cfg.sinoSh[-1])
         self.brickMask = self.brickMask.unsqueeze(0).unsqueeze(0) # add batch and channel dims
 
+#    def createFClink(self) :
+#        smpl = torch.zeros((1, self.inChannels, *self.cfg.sinoSh))
+#        for encoder in self.encoders :
+#            smpl = encoder(smpl)
+#        encSh = smpl.shape
+#        linChannels = math.prod(encSh)
+#        head = nn.Sequential(
+#            nn.Flatten(),
+#            nn.Linear(linChannels, linChannels),
+#            nn.LeakyReLU(0.2),
+#        )
+#        fillWheights(head)
+#        tail = nn.Sequential(
+#            nn.Linear(linChannels * (2 if self.addFC else 1) , linChannels),
+#            nn.LeakyReLU(0.2),
+#            nn.Unflatten(1, encSh[1:]),
+#        )
+#        fillWheights(tail)
+#        return head, tail
+#
+#    def preFill(self, images) :
+#        images, orgDims = unsqeeze4dim(images)
+#        if self.cfg.gapW == 2:
+#            res = images.clone().detach()
+#            res[...,self.cfg.gapRngX.start]   = ( 2*images[:,[0],:,self.cfg.gapRngX.start-1] + \
+#                                                    images[:,[0],:,self.cfg.gapRngX.stop] ) / 3
+#            res[...,self.cfg.gapRngX.start+1] = (   images[:,[0],:,self.cfg.gapRngX.start-1] + \
+#                                                  2*images[:,[0],:,self.cfg.gapRngX.stop] ) / 3
+#        elif self.lowResGenerator is None :
+#            res = images[:,[0],*self.cfg.gapRng]
+#        else :
+#            preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
+#            #with torch.set_grad_enabled(not self.lowResGenerator is None) :
+#            res, lrgFC = self.lowResGenerator.forward(preImages)
+#            res = torch.nn.functional.interpolate(res, scale_factor=2, mode='nearest')
+#        return squeezeOrg(res, orgDims), lrgFC
+#
+#    def dropIN(self,images, lrFC = None) :
+#        dwTrain = [images,]
+#        for encoder in self.encoders :
+#            dwTrain.append(encoder(dwTrain[-1]))
+#            #print(f"{dwTrain[-2].shape} -> {dwTrain[-1].shape}")
+#        #return dwTrain[-1]
+#        mid = self.fcLink[0](dwTrain[-1])
+#        mid = torch.cat( (mid, lrFC), dim=1 ) if self.addFC else mid
+#        mid = self.fcLink[1](mid)
+#        #return mid
+#        upTrain = [mid]
+#        for level, decoder in enumerate(self.decoders) :
+#            upTrain.append( decoder( torch.cat( (upTrain[-1], dwTrain[-1-level]), dim=1 ) ) )
+#            #print(f"{upTrain[-2].shape} -> {upTrain[-1].shape} ({dwTrain[-2-level].shape})")
+#        res = self.lastTouch(torch.cat( (upTrain[-1], images ), dim=1 ))
+#        return res * self.amplitude + images[:,[0],...], mid
+
     def forward(self, images):
         # prepare input
         with torch.no_grad():
             images = images.clone().detach()
+#            lrgRes = self.preFill(images)
+#            images[:,[0],*self.cfg.gapRng] = lrgRes[0][self.cfg.gapRng]
+#            lrgFC = lrgRes[1]
             images[:,[0],*self.cfg.gapRng] = self.preFill(images)
             images, norms = normalizeImages(images)
         # prepareStripe
         stripeImages = self.stripeGenerator.forward(images)
-        # brick set 1
-        bricksIn = torch.cat((      images.view(-1,1, *self.brickGenerator.cfg.sinoSh),
-                              stripeImages.view(-1,1, *self.brickGenerator.cfg.sinoSh)),
-                             dim=1)
-        bricksM = self.brickMask * self.brickGenerator.forward(bricksIn)
-        bricksM = bricksM.view(-1,1, *self.cfg.sinoSh)
-        # bricks set 2
+        # refolded images into bricks
+        imsz = math.prod(self.brickGenerator.cfg.sinoSh)
+        nofIm = images.shape[0]
+        bricksIn = images.view(images.shape[0],-1)
+        bricksIn = bricksIn.unfold(1,imsz,imsz//2).unfold(2,*self.brickGenerator.cfg.sinoSh)
+        bricksIn = bricksIn.reshape(-1,1,*self.brickGenerator.cfg.sinoSh)
+        bricksOut = self.brickMask * self.brickGenerator.forward(bricksIn)
+        bricksMix = bricksOut.view(nofIm,-1,*self.brickGenerator.cfg.sinoSh)[:,0::2,:,:]\
+                             .reshape(nofIm,1,-1,self.brickGenerator.cfg.sinoSh[-1])
         edge = self.brickGenerator.cfg.sinoSh[-2]//2
-        bricksIn = torch.cat((      images[:,:,edge:-edge,:].reshape(-1,1, *self.brickGenerator.cfg.sinoSh),
-                              stripeImages[:,:,edge:-edge,:].reshape(-1,1, *self.brickGenerator.cfg.sinoSh)),
-                             dim=1)
-        bricksP = self.brickMask * self.brickGenerator.forward(bricksIn)
-        bricksP = bricksP.view(-1,1, self.cfg.sinoSh[-2]-2*edge, self.cfg.sinoSh[-1] )
+        bricksMix[:,:,edge:-edge,:] = bricksMix[:,:,edge:-edge,:] \
+            + bricksOut.view(nofIm,-1,*self.brickGenerator.cfg.sinoSh)[:,1::2,:,:]\
+                             .reshape(nofIm,1,-1,self.brickGenerator.cfg.sinoSh[-1])
+        ## brick set 1
+        #bricksIn = torch.cat((      images.view(-1,1, *self.brickGenerator.cfg.sinoSh),
+        #                      stripeImages.view(-1,1, *self.brickGenerator.cfg.sinoSh)),
+        #                     dim=1)
+        #bricksM = self.brickMask * self.brickGenerator.forward(bricksIn)
+        #bricksM = bricksM.view(-1,1, *self.cfg.sinoSh)
+        ## bricks set 2
+        #edge = self.brickGenerator.cfg.sinoSh[-2]//2
+        #bricksIn = torch.cat((      images[:,:,edge:-edge,:].reshape(-1,1, *self.brickGenerator.cfg.sinoSh),
+        #                      stripeImages[:,:,edge:-edge,:].reshape(-1,1, *self.brickGenerator.cfg.sinoSh)),
+        #                     dim=1)
+        #bricksP = self.brickMask * self.brickGenerator.forward(bricksIn)
+        #bricksP = bricksP.view(-1,1, self.cfg.sinoSh[-2]-2*edge, self.cfg.sinoSh[-1] )
         # mix bricks sets
-        bricksMix = bricksM
-        bricksMix[:,:,edge:-edge,:] = bricksMix[:,:,edge:-edge,:] + bricksP
         bricksMix[:,:,:edge,:]      = bricksMix[:,:,:edge,:] / self.brickMask[:,:,:edge,:]
         bricksMix[:,:,-edge:,:]     = bricksMix[:,:,-edge:,:] / self.brickMask[:,:,-edge:,:]
         # combine channels and drop in
         modelIn = torch.cat((images, bricksMix), dim=1)
+        #results, myFC = self.dropIN(modelIn, lrgFC)
         results = self.dropIN(modelIn)
         return reNormalizeImages(results, norms)
 
@@ -903,7 +974,7 @@ discriminator = initIfNew('discriminator')
 
 
 def createOptimizer(model, lr) :
-    return optim.Adam(
+    return optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=lr,
         betas=(0.5, 0.999)
@@ -912,6 +983,7 @@ optimizer_G = initIfNew('optimizer_G')
 optimizer_D = initIfNew('optimizer_D')
 scheduler_G = initIfNew('scheduler_G')
 scheduler_D = initIfNew('scheduler_D')
+optimizers_G = []
 
 def adjustScheduler(scheduler, iniLr, target) :
     if scheduler is None :
@@ -1032,6 +1104,18 @@ def loss_HIST(p_true, p_pred):
         toRet.append( img_loss )
     return torch.stack(toRet)
 
+EAGLE = None
+def loss_EAGLE(p_true, p_pred):
+    p_true, _ = unsqeeze4dim(p_true)
+    p_pred, _ = unsqeeze4dim(p_pred)
+    loss = EAGLE(p_pred, p_true)
+    return loss
+
+
+
+
+
+
 @dataclass
 class Metrics:
     calculate : callable
@@ -1112,8 +1196,10 @@ def transformGT(images):
     return images
 
 
+from datetime import datetime
+debugFile = None
 def loss_Gen(p_true, p_pred):
-    global metrices, minMetrices, maxMetrices
+    global metrices, minMetrices, maxMetrices, debugFile
     loss = 0
     sumweights = 0
     individualLosses = {}
@@ -1129,6 +1215,11 @@ def loss_Gen(p_true, p_pred):
                     sumweights += metrics.weight
         else :
             individualLosses[key] = p_true.shape[0]
+    if debugFile is not None :
+        nofIm = p_true.shape[0]
+        debugFile.write(  f"{datetime.now()}. Loss {loss.sum().item()/nofIm}. " + \
+            ' '.join( [ f"{key}: {individualLosses[key]/nofIm:.3e}" for key in individualLosses.keys() ] ) + \
+            "\n" )
     loss /= sumweights
     updateExtremes(loss, 'loss', p_true, p_pred)
     return loss.sum() , individualLosses
@@ -1403,7 +1494,8 @@ def train_step(allImages):
 
 
         # train generator
-        optimizer_G.zero_grad(set_to_none=False)
+        for optim in optimizers_G :
+            optim.zero_grad(set_to_none=False)
         for i in range(batchSplit) :
             subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
             subImages = images[subRange,...]#.clone().detach()
@@ -1417,8 +1509,9 @@ def train_step(allImages):
                 trainRes.metrices[key] += indLosses[key]
             genLoss /= subBatchSize
             genLoss.backward()
-        optimizer_G.step()
-        optimizer_G.zero_grad(set_to_none=True)
+        for optim in optimizers_G :
+            optim.step()
+            optim.zero_grad(set_to_none=True)
 
     return trainRes
 
@@ -1479,6 +1572,8 @@ def train(savedCheckPoint):
             images = data[0].to(TCfg.device)
             imer += images.shape[0]
             trainRes = train_step(images)
+            if math.isnan(trainRes.lossG):
+                raise Exception("Eagle did it again!")
             resAcc += trainRes
             updAcc += trainRes
 
