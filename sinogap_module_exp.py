@@ -255,7 +255,7 @@ def save_model(model, model_path):
 
 
 def load_model(model, model_path):
-    model.load_state_dict(torch.load(model_path, map_location=TCfg.device))
+    model.load_state_dict(torch.load(model_path))#, map_location=TCfg.device))
     return model
 
 
@@ -1214,7 +1214,7 @@ def summarizeMe(toSumm, onPrep=True):
     def summarizeImages(images) :
         nonlocal sumAcc
 
-        images = unsqeeze4dim(images.to(TCfg.device))[0]
+        images = unsqeeze4dim(images)[0]
         nofIm = images.shape[0]
         sumAcc.nofIm += nofIm
 
@@ -1261,7 +1261,7 @@ def generateDisplay(inp=None, boxes=None) :
     viewLen = DCfg.sinoSh[-1]
 
     genImages = images.clone()
-    views = torch.empty((nofIm, 4, viewLen, viewLen ), dtype=torch.float32, device=TCfg.device)
+    views = torch.empty((nofIm, 4, viewLen, viewLen ), dtype=torch.float32, device=images.device)
     with torch.no_grad() :
         preImages = generator.preFill(images)
         genPatches = generator.forward(images)
@@ -1378,7 +1378,7 @@ def train_step(allImages):
     global skipGen, skipDis
 
     trainRes = TrainResClass()
-    allImages, _ = unsqeeze4dim(allImages.to(TCfg.device))
+    allImages, _ = unsqeeze4dim(allImages)
     nofAllIm = allImages.shape[0]
 
     while trainRes.nofIm < nofAllIm :
@@ -1484,7 +1484,7 @@ def train(savedCheckPoint):
                 startFrom -= 1
                 continue
             iter += 1
-            images = data[0].to(TCfg.device)
+            images = data[0]
             imer += images.shape[0]
             trainRes = train_step(images)
             resAcc += trainRes
