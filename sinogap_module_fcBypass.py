@@ -850,6 +850,11 @@ class GeneratorTemplate(SubGeneratorTemplate):
         results = stripeImages
         return reNormalizeImages(results, norms), mid
 
+    def to(self, whatever):
+        self.brickMask = self.brickMask.to(whatever)
+        if self.lowResGenerator is not None :
+            self.lowResGenerator = self.lowResGenerator.to(whatever)
+        return super(GeneratorTemplate, self).to(whatever)
 
 
 
@@ -1521,9 +1526,9 @@ def train(savedCheckPoint):
     global trainLoader, testLoader, testSet, refImages, minMetrices, maxMetrices
     lastGLoss = minGLoss
 
-    if discriminator is not None :
-        discriminator.to(TCfg.device)
-    generator.to(TCfg.device)
+    #if discriminator is not None :
+    #    discriminator.to(TCfg.device)
+    #generator.to(TCfg.device)
     lastUpdateTime = time.time()
     lastSaveTime = time.time()
 
