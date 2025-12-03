@@ -625,7 +625,7 @@ def normalizeImages(images) :
     return images, (orgDims, stds, means)
 
 def reNormalizeImages(images, norms) :
-    images = images * norms[1][:,[0],...] + norms[2][:,[0],...] # renormalise
+    images = images * norms[1][:,[0],...].to(images.device) + norms[2][:,[0],...].to(images.device) # renormalise
     images = squeezeOrg(images, norms[0])
     return images
 
@@ -713,16 +713,14 @@ class SubGeneratorTemplate(nn.Module):
     def preFill(self, images) :
         images, orgDims = unsqeeze4dim(images)
         if self.cfg.gapW == 2:
-            res = torch.zeros( (images.shape[0], 1 , *self.cfg.gapSh ), device=images.device)
-            res[...,0] += 2*images[:,[0],:,self.cfg.gapRngX.start-1] + images[:,[0],:,self.cfg.gapRngX.stop]
-            res[...,1] += 2*images[:,[0],:,self.cfg.gapRngX.stop] + images[:,[0],:,self.cfg.gapRngX.start-1]
-            res /= 3
+            res = images.clone()
+            res[...,self.cfg.gapRngX.start]  = ( 2*images[:,[0],:,self.cfg.gapRngX.start-1] + images[:,[0],:,self.cfg.gapRngX.stop] ) / 3
+            res[...,self.cfg.gapRngX.stop-1] = ( 2*images[:,[0],:,self.cfg.gapRngX.stop] + images[:,[0],:,self.cfg.gapRngX.start-1] ) / 3
         elif self.lowResGenerator is None :
-            res = images[:,[0],*self.cfg.gapRng]
+            res = images
         else :
             preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
-            #with torch.set_grad_enabled(not self.lowResGenerator is None) :
-            res = self.lowResGenerator.forward(preImages)[self.lowResGenerator.cfg.gapRng]
+            res = self.lowResGenerator.forward(preImages)
             res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
         return squeezeOrg(res, orgDims)
 
@@ -742,15 +740,21 @@ class SubGeneratorTemplate(nn.Module):
         return res * self.amplitude + images[:,[0],...]
 
     def forward(self, images):
-        if self.inChannels > 1 and  images.shape[1] == 1 : # fill missing channels with noise
-            images = images.repeat((1,self.inChannels,1,1))
-            torch.nn.init.normal_( images[:,1:,:,:] , mean=0.0, std=0.1 )
-        with torch.no_grad():
-            images = images.clone().detach()
-            images[:,[0],*self.cfg.gapRng] = self.preFill(images)
-            images, norms = normalizeImages(images)
+        imDevice = images.device
+        myDevice = next(self.lastTouch.parameters()).device
+        images = images.to(myDevice)
+        if self.inChannels > images.shape[1] : # fill missing channels with noise
+            #images = images.repeat((1,self.inChannels,1,1))
+            lSh = list(images.shape)
+            lSh[1] = self.inChannels - lSh[1]
+            latentChannels = torch.randn( lSh, device=images.device )
+            images = torch.cat( (images, latentChannels), dim=1 )
+        images = images.clone().detach()
+        images[:,[0],*self.cfg.gapRng] = self.preFill(images)[:,[0],*self.cfg.gapRng]
+        images, norms = normalizeImages(images)
         results = self.dropIN(images)
-        return reNormalizeImages(results, norms)
+        results = reNormalizeImages(results, norms).to(imDevice)
+        return results
 
 
 
@@ -766,26 +770,16 @@ class GeneratorTemplate(SubGeneratorTemplate):
         self.brickGenerator = None
 
 
-    def __generatePatches(self, images, noises=None) :
-        if noises is None :
-            noises = torch.randn( 1 if images.dim() < 3 else images.shape[0], TCfg.latentDim).to(TCfg.device)
-        return self.forward((images,noises))
-
-
-    def __fillImages(self, images, noises=None) :
-        images[self.cfg.gapRng] = self.generatePatches(images, noises)
-        return images
-
-
-    def __generateImages(self, images, noises=None) :
-        clone = images.clone()
-        return self.fillImages(clone, noises)
-
-
     def forward(self, images):
+
+        imDevice = images.device
+        myDevice = next(self.lastTouch.parameters()).device
+        images = images.to(myDevice)
+
         # channel 0
         images = images.clone().detach()
-        images[:,[0],*self.cfg.gapRng] = self.preFill(images)
+        preImages = self.preFill(images)
+        images[:,[0],*self.cfg.gapRng] = preImages[:,[0],*self.cfg.gapRng]
         images, norms = normalizeImages(images)
         # channel 1
         stripeImages = self.stripeGenerator.forward(images)
@@ -804,8 +798,16 @@ class GeneratorTemplate(SubGeneratorTemplate):
             .view(-1,1, self.cfg.sinoSh[-2]-2*edge, self.cfg.sinoSh[-1] )
         # combine channels and drop in
         modelIn = torch.cat((images, stripeImages, bricksM, bricksP), dim=1)
+        if self.inChannels > modelIn.shape[1] : # fill missing channels with noise
+            #images = images.repeat((1,self.inChannels,1,1))
+            lSh = list(modelIn.shape)
+            lSh[1] = self.inChannels - lSh[1]
+            latentChannels = torch.randn( lSh, device=images.device )
+            modelIn = torch.cat( (modelIn, latentChannels), dim=1 )
         results = self.dropIN(modelIn)
-        return reNormalizeImages(results, norms)
+
+        results = reNormalizeImages(results, norms).to(imDevice)
+        return results
 
 
     ### this version of forward is only to calculate what bricks generator does with no main generator.
@@ -851,21 +853,15 @@ lowResGenerators = initIfNew('lowResGenerators', {})
 
 class DiscriminatorTemplate(nn.Module):
 
-    def __init__(self, omitEdges=0):
+    def __init__(self):
         super(DiscriminatorTemplate, self).__init__()
-        self.baseChannels = 64
-        self.omitEdges = omitEdges
 
-
-    def encblock(self, chIn, chOut, kernel, stride=1, norm=False, dopadding=False) :
+    def encblock(self, chIn, chOut, kernel, stride=1, norm=False, padding=1) :
         chIn = int(chIn*self.baseChannels)
         chOut = int(chOut*self.baseChannels)
         layers = []
-        layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias=True,
-                                padding='same', padding_mode='reflect') \
-                                if stride == 1 and dopadding else \
-                                nn.Conv2d(chIn, chOut, kernel, stride=stride, bias=True)
-                     )
+        layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias = not norm,
+                                padding=padding, padding_mode='reflect')  )
         if norm :
             layers.append(nn.BatchNorm2d(chOut))
         layers.append(nn.LeakyReLU(0.2))
@@ -889,12 +885,7 @@ class DiscriminatorTemplate(nn.Module):
         return toRet
 
     def forward(self, images):
-        if images.dim() == 3:
-            images = images.unsqueeze(1)
-        if self.omitEdges :
-            images = images.clone() # I want to exclude two blocks on the edges :
-            images[ ..., :self.omitEdges, DCfg.gapRngX ] = 0
-            images[ ..., -self.omitEdges:, DCfg.gapRngX ] = 0
+        images, _ = normalizeImages(images)
         convRes = self.body(images)
         res = self.head(convRes)
         return res
@@ -956,10 +947,17 @@ def saveModels(path="") :
 
 BCE = nn.BCELoss(reduction='none')
 def loss_Adv(images, truth):
-    labels = torch.full((images.shape[0], 1),  (1 - TCfg.labelSmoothFac ) if truth else TCfg.labelSmoothFac,
-                dtype=torch.float, device=TCfg.device, requires_grad=False)
-    predictions = discriminator(images)
-    return BCE(predictions, labels), predictions
+    nofIm = images.shape[0]
+    batchSplit = TCfg.batchSplit if TCfg.batchSplit > 1 else 1
+    subBatchSize = TCfg.batchSize // batchSplit
+    subBatches = max (nofIm // subBatchSize, 1)
+    predictions = torch.empty((nofIm, 1), dtype=torch.float, device=images.device)
+    for i in range(subBatches) :
+        subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
+        predictions[subRange,...] = discriminator(images[subRange,...])
+    labels = torch.full((nofIm, 1),  (1 - TCfg.labelSmoothFac ) if truth else TCfg.labelSmoothFac,
+                        dtype=torch.float, device=images.device)
+    return BCE(predictions, labels)[...,0], predictions
 
 def loss_Adv_Gen(p_true, p_pred):
     return loss_Adv(p_pred, True)[0]
@@ -1128,7 +1126,7 @@ def transformGT(images):
 
 def loss_Gen(p_true, p_pred):
     global metrices, minMetrices, maxMetrices
-    loss = 0
+    loss = torch.zeros( (p_true.shape[0]), device=p_true.device )
     sumweights = 0
     individualLosses = {}
     p_true = transformGT(p_true)
@@ -1149,7 +1147,8 @@ def loss_Gen(p_true, p_pred):
 
 def loss_Dis(p_true, p_pred):
     p_true = transformGT(p_true)
-    return loss_Adv_Dis(p_true, p_pred)
+    advRes = loss_Adv_Dis(p_true, p_pred)
+    return advRes[0].sum() / ( 2 * metrices['Adv'].norm ) , advRes[1]
 
 
 
@@ -1262,13 +1261,11 @@ def generateDisplay(inp=None, boxes=None) :
     viewLen = DCfg.sinoSh[-1]
 
     genImages = images.clone()
-    preImages = images.clone()
     views = torch.empty((nofIm, 4, viewLen, viewLen ), dtype=torch.float32, device=TCfg.device)
     with torch.no_grad() :
-        prePatches = generator.preFill(images)
-        preImages[DCfg.gapRng] = prePatches
-        genPatches = generator.forward(images)[DCfg.gapRng]
-        genImages[DCfg.gapRng] = genPatches
+        preImages = generator.preFill(images)
+        genPatches = generator.forward(images)
+        genImages[DCfg.gapRng] = genPatches[DCfg.gapRng]
     hGap = DCfg.gapW // 2
 
     if inp is None :
@@ -1284,9 +1281,9 @@ def generateDisplay(inp=None, boxes=None) :
         views[curim,1,...] = preImages[rng]
         views[curim,2,...] = genImages[rng]
         views[curim,3,...] = 0
-        views[curim,3,*DCfg.gapRng] = (genPatches - prePatches)[rng]
-        views[curim,3,:,hGap:hGap+DCfg.gapW] = (images[DCfg.gapRng] - prePatches)[rng]
-        views[curim,3,:,-DCfg.gapW-hGap:-hGap] = (images[DCfg.gapRng] - genPatches)[rng]
+        views[curim,3,*DCfg.gapRng] = (genPatches - preImages)[DCfg.gapRng][rng]
+        views[curim,3,:,hGap:hGap+DCfg.gapW] = (images - preImages)[DCfg.gapRng][rng]
+        views[curim,3,:,-DCfg.gapW-hGap:-hGap] = (images - genPatches)[DCfg.gapRng][rng]
     return views, squeezeOrg(genImages, orgDim) , squeezeOrg(preImages, orgDim)
 
 
@@ -1375,6 +1372,7 @@ def loadCheckPoint(path, generator, discriminator,
 
 
 skipDis = False
+skipGen = False
 
 def train_step(allImages):
     global skipGen, skipDis
@@ -1394,19 +1392,19 @@ def train_step(allImages):
         subBatchSize = nofIm // batchSplit
 
         # train discriminator
-        if metrices['Adv'].weight > 0 :
-            optimizer_D.zero_grad()
+        if not skipDis and metrices['Adv'].weight > 0 :
+            optimizer_D.zero_grad(set_to_none=False)
             for i in range(batchSplit) :
                 subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
-                subImages = images[subRange,...].clone().detach()
-                with torch.no_grad() : # create fake images to be descriminated
-                    subFakeImages = generator.generateImages(subImages)
-                subImages.requires_grad = True
-                subFakeImages.requires_grad = True
+                subImages = images[subRange,...]#.clone().detach()
+                #with torch.no_grad() : # create fake images to be descriminated
+                subFakeImages = generator.generateImages(subImages)
+                #subImages.requires_grad = True
+                #subFakeImages.requires_grad = True
                 disLoss, probs = loss_Dis(subImages, subFakeImages)
                 trainRes.lossD += disLoss.item()
-                trainRes.predReal += probs[:nofIm,0].sum().item()
-                trainRes.predFake += probs[nofIm:,0].sum().item()
+                trainRes.predReal += probs[:subBatchSize,0].sum().item()
+                trainRes.predFake += probs[subBatchSize:,0].sum().item()
                 disLoss /= subBatchSize
                 disLoss.backward()
             optimizer_D.step()
@@ -1414,24 +1412,25 @@ def train_step(allImages):
 
 
         # train generator
-        for optim in optimizers_G :
-            optim.zero_grad(set_to_none=False)
-        for i in range(batchSplit) :
-            subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
-            subImages = images[subRange,...]#.clone().detach()
-            subImages.requires_grad = True
-            subFakeImages = generator.generateImages(subImages)
-            #subFakeImages = fakeImages[subRange,...]
-            #subFakeImages[DCfg.gapRng] = generator.generatePatches(subImages)
-            genLoss, indLosses = loss_Gen(subImages, subFakeImages)
-            trainRes.lossG += genLoss.item()
-            for key in indLosses.keys() :
-                trainRes.metrices[key] += indLosses[key]
-            genLoss /= subBatchSize
-            genLoss.backward()
-        for optim in optimizers_G :
-            optim.step()
-            optim.zero_grad(set_to_none=True)
+        if not skipGen :
+            for optim in optimizers_G :
+                optim.zero_grad(set_to_none=False)
+            for i in range(batchSplit) :
+                subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
+                subImages = images[subRange,...]#.clone().detach()
+                #subImages.requires_grad = True
+                subFakeImages = generator.generateImages(subImages)
+                #subFakeImages = fakeImages[subRange,...]
+                #subFakeImages[DCfg.gapRng] = generator.generatePatches(subImages)
+                genLoss, indLosses = loss_Gen(subImages, subFakeImages)
+                trainRes.lossG += genLoss.item()
+                for key in indLosses.keys() :
+                    trainRes.metrices[key] += indLosses[key]
+                genLoss /= subBatchSize
+                genLoss.backward()
+            for optim in optimizers_G :
+                optim.step()
+                optim.zero_grad(set_to_none=True)
 
     return trainRes
 
@@ -1464,8 +1463,6 @@ def train(savedCheckPoint):
     global trainLoader, testLoader, testSet, refImages, minMetrices, maxMetrices
     lastGLoss = minGLoss
 
-    discriminator.to(TCfg.device)
-    generator.to(TCfg.device)
     lastUpdateTime = time.time()
     lastSaveTime = time.time()
 
@@ -1498,7 +1495,12 @@ def train(savedCheckPoint):
 
                 # generate previews
                 generator.eval()
-                extImages = torch.stack((maxMetrices['loss'][1],minMetrices['loss'][1]))
+                if None in [ minMetrices, maxMetrices ] or \
+                   not 'loss' in minMetrices or not 'loss' in maxMetrices or \
+                   None in [ minMetrices['loss'], maxMetrices['loss'] ] :
+                    extImages = images[random.sample(range(images.shape[0]), 2),...]
+                else :
+                    extImages = torch.stack((maxMetrices['loss'][1],minMetrices['loss'][1]))
                 extViews, extGen, _ = generateDisplay(extImages)
                 extViews = extViews.cpu().numpy()
                 refViews, genImages, _ = generateDisplay()
@@ -1507,7 +1509,6 @@ def train(savedCheckPoint):
                 rndViews, rndGen, _ = generateDisplay(images[rndIndeces,...])
                 rndViews = rndViews.cpu().numpy()
                 generator.train()
-
 
                 IPython.display.clear_output(wait=True)
                 beforeReport(locals())
