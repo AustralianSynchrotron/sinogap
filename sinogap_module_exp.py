@@ -255,7 +255,7 @@ def save_model(model, model_path):
 
 
 def load_model(model, model_path):
-    model.load_state_dict(torch.load(model_path))#, map_location=TCfg.device))
+    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
     return model
 
 
@@ -767,7 +767,10 @@ class GeneratorTemplate(SubGeneratorTemplate):
 
     def __init__(self, gapW, batchNorm=True, inChannels=3):
         super(GeneratorTemplate, self).__init__(gapW, False, batchNorm, inChannels=inChannels)
+        self.inChannels = inChannels
         self.brickGenerator = None
+        self.stipeGenerator = None
+        self.finalGenerator = None
 
 
     def forward(self, images):
