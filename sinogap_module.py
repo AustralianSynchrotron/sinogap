@@ -655,11 +655,14 @@ class SubGeneratorTemplate(nn.Module):
         self.amplitude = 4
         self.batchNorm = batchNorm
 
+    def device(self):
+        return next(self.lastTouch.parameters()).device
+
     def encblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=1) :
         if norm is None :
             norm = self.batchNorm
-        chIn = int(chIn*self.baseChannels)
-        chOut = int(chOut*self.baseChannels)
+        chIn = chIn*self.baseChannels if chIn >= 0 else -chIn
+        chOut = chOut*self.baseChannels if chOut >= 0 else -chOut
         layers = []
         layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias = not norm,
                                 padding=padding, padding_mode='reflect')  )
@@ -677,8 +680,8 @@ class SubGeneratorTemplate(nn.Module):
                 outputPadding = stride - 1
             else :
                 outputPadding = tuple( strd - 1 for strd in stride )
-        chIn = int(chIn*self.baseChannels)
-        chOut = int(chOut*self.baseChannels)
+        chIn = chIn*self.baseChannels if chIn >= 0 else -chIn
+        chOut = chOut*self.baseChannels if chOut >= 0 else -chOut
         layers = []
         layers.append( nn.ConvTranspose2d(chIn, chOut, kernel, stride=stride, bias = not norm,
                                           padding=padding, padding_mode='zeros', output_padding=outputPadding) )
@@ -795,10 +798,10 @@ class SubGeneratorTemplate(nn.Module):
         return res * self.amplitude + images[:,[0],...]
 
     def forward(self, images):
-        myDevice = next(self.lastTouch.parameters()).device
+        myDevice = self.device()
         images = images.to(myDevice)
         preImages = self.preFill(images)
-        images = self.fillTheGap(images, self.preFill(images))
+        images = self.fillTheGap(images, preImages)
         images, norms = normalizeImages(images)
         if self.inChannels > images.shape[1] : # fill missing channels with noise
             if isinstance(self.latentGenerator, float) :
@@ -831,7 +834,7 @@ class GeneratorTemplate(SubGeneratorTemplate):
         halfLine /= brickLen//2
         line = torch.cat( (halfLine, halfLine.flip(0)), dim=0)
         self.brickMask = line.view(-1,1).repeat(1,self.brickGenerator.cfg.sinoSh[-1])
-        self.brickMask = self.brickMask.unsqueeze(0).unsqueeze(0).to(TCfg.device) # add batch and channel dims
+        self.brickMask = self.brickMask.unsqueeze(0).unsqueeze(0) # add batch and channel dims
 
     def stripe2bricks(self,stripes) :
         nofIm = stripes.shape[0]
@@ -844,6 +847,7 @@ class GeneratorTemplate(SubGeneratorTemplate):
     def bricks2stripe(self, bricks) :
         nofChans = self.cfg.sinoSh[-2] // self.brickGenerator.cfg.sinoSh[-2]
         nofChans = nofChans * 2 - 1 # interleaved stripes
+        self.brickMask = self.brickMask.to(bricks.device)
         bricks = bricks * self.brickMask.to(bricks.device)
         bricks = bricks.view(-1,nofChans,*self.brickGenerator.cfg.sinoSh)
         nofIm = bricks.shape[0]
@@ -1311,18 +1315,18 @@ def summarizeMe(toSumm, onPrep=True):
     return sumAcc
 
 
+
 def generateDisplay(inp=None, boxes=None) :
     images = refImages if inp is None else inp
-    images = images.to(TCfg.device)
     images, orgDim = unsqeeze4dim(images)
     nofIm = images.shape[0]
     viewLen = DCfg.sinoSh[-1]
+    imDevice = images.device
 
     genImages = images.clone()
-    views = torch.empty((nofIm, 4, viewLen, viewLen ), dtype=torch.float32, device=images.device)
     with torch.no_grad() :
-        preImages = generator.preFill(images)
-        genPatches = generator.forward(images)
+        preImages = generator.preFill(images).to(imDevice)
+        genPatches = generator.forward(images).to(imDevice)
         genImages[DCfg.gapRng] = genPatches[DCfg.gapRng]
     hGap = DCfg.gapW // 2
 
@@ -1333,6 +1337,7 @@ def generateDisplay(inp=None, boxes=None) :
         diffY = fn.conv2d(diffImages, torch.ones((1,1,diffImages.shape[-1],diffImages.shape[-1]), device=diffImages.device))
         boxes = diffY.squeeze(1,-1).argmax(dim=-1)
 
+    views = torch.empty((nofIm, 4, viewLen, viewLen ), dtype=torch.float32, device=imDevice)
     for curim in range(nofIm) :
         rng = np.s_[curim, 0, boxes[curim] : boxes[curim] + viewLen, : ]
         views[curim,0,...] = images   [rng]
