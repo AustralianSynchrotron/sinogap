@@ -201,8 +201,16 @@ def sliceShape(shape, sl) :
 
 
 def tensorStat(stat) :
-    print(f"{stat.mean().item():.3e}, {stat.std().item():.3e}, "
-          f"{stat.min().item():.3e}, {stat.max().item():.3e}")
+    if not torch.numel(stat) :
+        print("Empty tensor.")
+        return
+    absstat = stat.abs()
+    print(f"Mean {stat.mean().item():.3e}, Std {stat.std().item():.3e}, "
+          f"Ext [{stat.min().item():.3e}, {stat.max().item():.3e}], "
+          f"Abs {absstat.mean().item():.3e}, Tin {absstat.min().item():.3e}, "
+          f"Zrs { 1 - torch.count_nonzero(absstat)/torch.numel(absstat):.3e}, "
+          f"Nan { 1 - torch.count_nonzero(torch.isfinite(stat))/torch.numel(stat):.3e}")
+
 
 
 def fillWheights(seq, std=0.001) :
@@ -556,12 +564,12 @@ def createDataSet(path, listOfData, exclusive=False, expose=1) :
         transList.append(transforms.RandomVerticalFlip()),
     #transList.append(transforms.Normalize(mean=(0.5), std=(1)))
     mytransforms = transforms.Compose(transList)
-    return sinoRoot.get_dataset( transform=mytransforms, expose=expose, shuffle = not exclusive )
+    return sinoRoot.get_dataset( transform=mytransforms, expose=expose, shuffle = True )
 trainSet = initIfNew('trainSet')
 testSet = initIfNew('testSet')
 
 
-def createDataLoader(tSet, num_workers=os.cpu_count()) :
+def createDataLoader(tSet, num_workers=os.cpu_count(), shuffle=False) :
     return torch.utils.data.DataLoader(
         dataset=tSet,
         batch_size = TCfg.batchSize * max(1, -TCfg.batchSplit) ,
@@ -618,9 +626,8 @@ def showMe(tSet, index=None) :
 
 def normalizeImages(images) :
     images, orgDims = unsqeeze4dim(images)
-    images = images.clone().detach()
     stds, means = torch.std_mean(images, dim=(-1,-2), keepdim=True)
-    stds += 1e-7
+    stds = stds + 1e-7
     images = (images - means) / stds # normalize per image
     return images, (orgDims, stds, means)
 
@@ -640,6 +647,7 @@ class SubGeneratorTemplate(nn.Module):
         super(SubGeneratorTemplate, self).__init__()
         self.cfg = DCfgClass(gapW, brick)
         self.lowResGenerator = None
+        self.latentGenerator = None
         self.baseChannels = None
         self.inChannels = inChannels
         self.amplitude = 4
@@ -648,8 +656,8 @@ class SubGeneratorTemplate(nn.Module):
     def encblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=1) :
         if norm is None :
             norm = self.batchNorm
-        chIn = int(chIn*self.baseChannels)
-        chOut = int(chOut*self.baseChannels)
+        chIn = chIn*self.baseChannels if chIn > 0 else -chIn
+        chOut = chOut*self.baseChannels if chOut > 0 else -chOut
         layers = []
         layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias = not norm,
                                 padding=padding, padding_mode='reflect')  )
@@ -667,8 +675,8 @@ class SubGeneratorTemplate(nn.Module):
                 outputPadding = stride - 1
             else :
                 outputPadding = tuple( strd - 1 for strd in stride )
-        chIn = int(chIn*self.baseChannels)
-        chOut = int(chOut*self.baseChannels)
+        chIn = chIn*self.baseChannels if chIn > 0 else -chIn
+        chOut = chOut*self.baseChannels if chOut > 0 else -chOut
         layers = []
         layers.append( nn.ConvTranspose2d(chIn, chOut, kernel, stride=stride, bias = not norm,
                                           padding=padding, padding_mode='zeros', output_padding=outputPadding) )
@@ -703,6 +711,30 @@ class SubGeneratorTemplate(nn.Module):
         fillWheights(toRet)
         return toRet
 
+    def createLatentGenerator(self) :
+        latInSh = self.fcLink[-1].unflattened_size[-2:]
+        latInSh = (1,self.baseChannels,*latInSh)
+        latInChannels = math.prod(latInSh)
+        toRet = nn.Sequential(
+            nn.Linear(latInChannels, latInChannels),
+            nn.LeakyReLU(0.2),
+            nn.Unflatten(1, latInSh[1:]),
+        )
+        for decoder in self.decoders :
+            conv = decoder[0]
+            toRet.append( self.decblock(-self.baseChannels,-self.baseChannels,
+                                        kernel=conv.kernel_size,
+                                        stride=conv.stride,
+                                        norm=False,
+                                        padding=conv.padding,
+                                        outputPadding=conv.output_padding
+                                        ) )
+        toRet.append(( self.encblock(-self.baseChannels, -1, kernel=1, padding=0, norm=False) ))
+        fillWheights(toRet)
+        return toRet
+
+    def device(self) :
+        return next(self.lastTouch.parameters()).device
 
     def generateImages(self, images, noises=None) :
         res = images.clone()
@@ -740,20 +772,21 @@ class SubGeneratorTemplate(nn.Module):
         return res * self.amplitude + images[:,[0],...]
 
     def forward(self, images):
-        imDevice = images.device
-        myDevice = next(self.lastTouch.parameters()).device
-        images = images.to(myDevice)
-        if self.inChannels > images.shape[1] : # fill missing channels with noise
-            #images = images.repeat((1,self.inChannels,1,1))
-            lSh = list(images.shape)
-            lSh[1] = self.inChannels - lSh[1]
-            latentChannels = torch.randn( lSh, device=images.device )
-            images = torch.cat( (images, latentChannels), dim=1 )
-        images = images.clone().detach()
+        images = images.to(self.device())
+        images = images.clone()#.detach()
         images[:,[0],*self.cfg.gapRng] = self.preFill(images)[:,[0],*self.cfg.gapRng]
         images, norms = normalizeImages(images)
+        if self.inChannels > images.shape[1] : # fill missing channels with noise
+            if isinstance(self.latentGenerator, float) :
+                lSh = list(images.shape)
+                lSh[1] = self.inChannels - lSh[1]
+                latentChannels = self.latentGenerator * torch.randn( lSh, device=images.device )
+            else :
+                latentIn = torch.randn( (images.shape[0], self.latentGenerator[0].in_features), device=images.device )
+                latentChannels = self.latentGenerator(latentIn)
+            images = torch.cat( (images, latentChannels), dim=1 )
         results = self.dropIN(images)
-        results = reNormalizeImages(results, norms).to(imDevice)
+        results = reNormalizeImages(results, norms)#.to(imDevice)
         return results
 
 
@@ -773,6 +806,25 @@ class GeneratorTemplate(SubGeneratorTemplate):
         self.finalGenerator = None
 
 
+    def stripe2bricks(self,stripes) :
+        nofIm = stripes.shape[0]
+        imsz = math.prod(self.brickGenerator.cfg.sinoSh)
+        bricks = stripes.view(nofIm,-1)
+        bricks = bricks.unfold(1,imsz,imsz//2).unfold(2,*self.brickGenerator.cfg.sinoSh)
+        bricks = bricks.reshape(-1,1,*self.brickGenerator.cfg.sinoSh)
+        return bricks
+
+    def bricks2stripe(self, bricks) :
+        nofChans = self.cfg.sinoSh[-2] // self.brickGenerator.cfg.sinoSh[-2]
+        nofChans = nofChans * 2 - 1 # interleaved stripes
+        bricks = bricks.view(-1,nofChans,*self.brickGenerator.cfg.sinoSh)
+        nofIm = bricks.shape[0]
+        stripesO = bricks[:,0::2,:,:].reshape(nofIm,1,-1,self.brickGenerator.cfg.sinoSh[-1])
+        stripesS = stripesO.clone()
+        edge = self.brickGenerator.cfg.sinoSh[-2]//2
+        stripesS[:,:,edge:-edge,:] = bricks[:,1::2,:,:].reshape(nofIm,1,-1,self.brickGenerator.cfg.sinoSh[-1])
+        return torch.cat( (stripesO, stripesS), dim=1 )
+
     def forward(self, images):
 
         imDevice = images.device
@@ -780,64 +832,35 @@ class GeneratorTemplate(SubGeneratorTemplate):
         images = images.to(myDevice)
 
         # channel 0
-        images = images.clone().detach()
+        images = images.clone()#.detach()
         preImages = self.preFill(images)
         images[:,[0],*self.cfg.gapRng] = preImages[:,[0],*self.cfg.gapRng]
         images, norms = normalizeImages(images)
+
         # channel 1
-        stripeImages = self.stripeGenerator.forward(images)
-        # channel 2
-        bricksIn = torch.cat((      images.view(-1,1, *self.brickGenerator.cfg.sinoSh),
-                              stripeImages.view(-1,1, *self.brickGenerator.cfg.sinoSh)),
-                             dim=1)
-        bricksM = self.brickGenerator.forward(bricksIn).view(-1,1, *self.cfg.sinoSh)
-        # channel 3
-        edge = self.brickGenerator.cfg.sinoSh[-2]//2
-        bricksIn = torch.cat((      images[:,:,edge:-edge,:].reshape(-1,1, *self.brickGenerator.cfg.sinoSh),
-                              stripeImages[:,:,edge:-edge,:].reshape(-1,1, *self.brickGenerator.cfg.sinoSh)),
-                             dim=1)
-        bricksP = images.clone()
-        bricksP[:,:,edge:-edge,:] = self.brickGenerator.forward(bricksIn) \
-            .view(-1,1, self.cfg.sinoSh[-2]-2*edge, self.cfg.sinoSh[-1] )
+        stripeImages = self.stripeGenerator.forward(images).to(myDevice)
+        # channels 2 and 3
+        brickedImages = self.stripe2bricks(images).to(self.brickGenerator.device())
+        brickedStipes = self.stripe2bricks(stripeImages).to(self.brickGenerator.device())
+        bricksIn = torch.cat((brickedImages, brickedStipes), dim=1)
+        brickImages = self.brickGenerator.forward(bricksIn)
+        brickImages = self.bricks2stripe(brickImages)
         # combine channels and drop in
-        modelIn = torch.cat((images, stripeImages, bricksM, bricksP), dim=1)
+        modelIn = torch.cat((images, stripeImages, brickImages), dim=1)
         if self.inChannels > modelIn.shape[1] : # fill missing channels with noise
-            #images = images.repeat((1,self.inChannels,1,1))
-            lSh = list(modelIn.shape)
-            lSh[1] = self.inChannels - lSh[1]
-            latentChannels = torch.randn( lSh, device=images.device )
+            if self.latentGenerator is None :
+                lSh = list(modelIn.shape)
+                lSh[1] = self.inChannels - lSh[1]
+                latentChannels = torch.randn( lSh, device=images.device )
+            else :
+                latentIn = torch.randn( (images.shape[0], self.latentGenerator[0].in_features), device=images.device )
+                latentChannels = self.latentGenerator(latentIn)
             modelIn = torch.cat( (modelIn, latentChannels), dim=1 )
         results = self.dropIN(modelIn)
 
         results = reNormalizeImages(results, norms).to(imDevice)
         return results
 
-
-    ### this version of forward is only to calculate what bricks generator does with no main generator.
-    def __forward(self, images):
-        # channel 0
-        with torch.no_grad():
-            images = images.clone().detach()
-            images[:,[0],*self.cfg.gapRng] = self.preFill(images)
-            images, norms = normalizeImages(images)
-        bricksM = self.brickGenerator.forward(images.view(-1,1, *self.brickGenerator.cfg.sinoSh))
-        bricksM = bricksM.view(-1,1, *self.cfg.sinoSh)
-        edge = self.brickGenerator.cfg.sinoSh[-2]//2
-        bricksP = images.clone()
-        bricksP[:,:,edge:-edge,:] = self.brickGenerator.forward(images[:,:,edge:-edge,:].reshape(-1,1, *self.brickGenerator.cfg.sinoSh)) \
-            .view(-1,1, self.cfg.sinoSh[-2]-2*edge, self.cfg.sinoSh[-1] )
-        results = ( bricksM + bricksM ) / 2
-        return reNormalizeImages(results, norms)
-
-    ### this version of forward is to train only stripe generator with no main generator.
-    ### to be used with specific transformGTforStripe - see it below
-    def __forward(self, images):
-        with torch.no_grad():
-            images = images.clone().detach()
-            images[:,[0],*self.cfg.gapRng] = self.preFill(images)
-            images, norms = normalizeImages(images)
-        stripeImages = self.stripeGenerator.forward(images)
-        return reNormalizeImages(stripeImages, norms)
 
 def transformGT_forStripeTraining(images):
     with torch.no_grad():
@@ -860,8 +883,8 @@ class DiscriminatorTemplate(nn.Module):
         super(DiscriminatorTemplate, self).__init__()
 
     def encblock(self, chIn, chOut, kernel, stride=1, norm=False, padding=1) :
-        chIn = int(chIn*self.baseChannels)
-        chOut = int(chOut*self.baseChannels)
+        chIn = chIn*self.baseChannels if chIn >= 0 else -chIn
+        chOut = chOut*self.baseChannels if chOut >= 0 else -chOut
         layers = []
         layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias = not norm,
                                 padding=padding, padding_mode='reflect')  )
@@ -871,23 +894,28 @@ class DiscriminatorTemplate(nn.Module):
         fillWheights(layers)
         return torch.nn.Sequential(*layers)
 
-    def createHead(self) :
-        encSh = self.body(torch.zeros((1,1,*DCfg.sinoSh))).shape
+    def createHead(self, chMid, sinoSh=None) :
+        if sinoSh is None :
+            sinoSh = DCfg.sinoSh
+        encSh = self.body(torch.zeros((1,1,*sinoSh))).shape
         linChannels = math.prod(encSh)
+        chMid *= self.baseChannels
         toRet = nn.Sequential(
             nn.Flatten(),
             #nn.Dropout(0.4),
-            nn.Linear(linChannels, self.baseChannels*4),
+            nn.Linear(linChannels, chMid),
             #nn.Linear(linChannels, 1),
             nn.LeakyReLU(0.2),
             #nn.Dropout(0.4),
-            nn.Linear(self.baseChannels*4, 1),
+            nn.Linear(chMid, 1),
             nn.Sigmoid(),
         )
         fillWheights(toRet)
         return toRet
 
     def forward(self, images):
+        myDevice = next(self.parameters()).device
+        images = images.to(myDevice)
         images, _ = normalizeImages(images)
         convRes = self.body(images)
         res = self.head(convRes)
@@ -897,7 +925,7 @@ discriminator = initIfNew('discriminator')
 
 
 def createOptimizer(model, lr) :
-    return optim.Adam(
+    return optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=lr,
         betas=(0.5, 0.999)
@@ -959,7 +987,7 @@ def loss_Adv(images, truth):
         subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
         predictions[subRange,...] = discriminator(images[subRange,...])
     labels = torch.full((nofIm, 1),  (1 - TCfg.labelSmoothFac ) if truth else TCfg.labelSmoothFac,
-                        dtype=torch.float, device=images.device)
+                        dtype=torch.float, device=predictions.device)
     return BCE(predictions, labels)[...,0], predictions
 
 def loss_Adv_Gen(p_true, p_pred):
@@ -1140,7 +1168,7 @@ def loss_Gen(p_true, p_pred):
                 individualLosses[key] = thisLoss.sum().item()
                 updateExtremes(thisLoss, key, p_true, p_pred)
                 if  metrics.weight > 0 :
-                    loss += metrics.weight * thisLoss
+                    loss += metrics.weight * thisLoss.to(p_true.device)
                     sumweights += metrics.weight
         else :
             individualLosses[key] = p_true.shape[0]
@@ -1223,25 +1251,23 @@ def summarizeMe(toSumm, onPrep=True):
 
         batchSplit = TCfg.batchSplit if TCfg.batchSplit > 1 else 1
         subBatchSize = nofIm // batchSplit
-        fakeImages = images.clone()
+        #fakeImages = images.clone()
         for i in range(batchSplit) :
             subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
             subImages = images[subRange,...]
-            patchImages = generator.preFill(subImages) \
-                            if onPrep else \
-                          generator.forward(subImages)[DCfg.gapRng]
-            fakeImages[subRange,...,DCfg.gapRngX] = patchImages
+            subFakeImages = generator.preFill(subImages) \
+                                if onPrep else \
+                            generator.generateImages(subImages)
+            if metrices['Adv'].weight > 0 :
+                disLoss, probs = loss_Dis(subImages, subFakeImages)
+                sumAcc.lossD += disLoss.item()
+                sumAcc.predReal += probs[:subBatchSize,0].sum().item()
+                sumAcc.predFake += probs[subBatchSize:,0].sum().item()
+            genLoss, indLosses = loss_Gen(subImages, subFakeImages)
+            sumAcc.lossG += genLoss.item()
+            for key in indLosses.keys() :
+                sumAcc.metrices[key] += indLosses[key]
 
-        genLoss, indLosses = loss_Gen(images, fakeImages)
-        sumAcc.lossG += genLoss.item()
-        for key in indLosses.keys() :
-            sumAcc.metrices[key] += indLosses[key]
-
-        if metrices['Adv'].weight > 0 : # discriminator
-            disLoss, probs = loss_Dis(images, fakeImages)
-            sumAcc.lossD += disLoss.item()
-            sumAcc.predReal += probs[:nofIm,0].sum()
-            sumAcc.predFake += probs[nofIm:,0].sum()
 
     with torch.no_grad() :
         if isinstance(toSumm, torch.utils.data.DataLoader) :
@@ -1262,12 +1288,12 @@ def generateDisplay(inp=None, boxes=None) :
     images, orgDim = unsqeeze4dim(images)
     nofIm = images.shape[0]
     viewLen = DCfg.sinoSh[-1]
+    imDevice = images.device
 
     genImages = images.clone()
-    views = torch.empty((nofIm, 4, viewLen, viewLen ), dtype=torch.float32, device=images.device)
     with torch.no_grad() :
-        preImages = generator.preFill(images)
-        genPatches = generator.forward(images)
+        preImages = generator.preFill(images).to(imDevice)
+        genPatches = generator.forward(images).to(imDevice)
         genImages[DCfg.gapRng] = genPatches[DCfg.gapRng]
     hGap = DCfg.gapW // 2
 
@@ -1278,6 +1304,7 @@ def generateDisplay(inp=None, boxes=None) :
         diffY = fn.conv2d(diffImages, torch.ones((1,1,diffImages.shape[-1],diffImages.shape[-1]), device=diffImages.device))
         boxes = diffY.squeeze(1,-1).argmax(dim=-1)
 
+    views = torch.empty((nofIm, 4, viewLen, viewLen ), dtype=torch.float32, device=imDevice)
     for curim in range(nofIm) :
         rng = np.s_[curim, 0, boxes[curim] : boxes[curim] + viewLen, : ]
         views[curim,0,...] = images   [rng]
@@ -1374,8 +1401,15 @@ def loadCheckPoint(path, generator, discriminator,
 
 
 
-skipDis = False
-skipGen = False
+repeatDis = 1
+repeatGen = 1
+
+def doTrainDis(locals) :
+    return True
+
+def doTrainGen(locals) :
+    return True
+
 
 def train_step(allImages):
     global skipGen, skipDis
@@ -1386,6 +1420,9 @@ def train_step(allImages):
 
     while trainRes.nofIm < nofAllIm :
 
+        freeGPUmem()
+        freeGPUmem()
+
         images = allImages[ trainRes.nofIm : trainRes.nofIm + TCfg.batchSize , ... ]
         #fakeImages = images.clone().detach()
         nofIm = images.shape[0]
@@ -1395,27 +1432,41 @@ def train_step(allImages):
         subBatchSize = nofIm // batchSplit
 
         # train discriminator
-        if not skipDis and metrices['Adv'].weight > 0 :
-            optimizer_D.zero_grad(set_to_none=False)
-            for i in range(batchSplit) :
-                subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
-                subImages = images[subRange,...]#.clone().detach()
-                #with torch.no_grad() : # create fake images to be descriminated
-                subFakeImages = generator.generateImages(subImages)
-                #subImages.requires_grad = True
-                #subFakeImages.requires_grad = True
-                disLoss, probs = loss_Dis(subImages, subFakeImages)
-                trainRes.lossD += disLoss.item()
-                trainRes.predReal += probs[:subBatchSize,0].sum().item()
-                trainRes.predFake += probs[subBatchSize:,0].sum().item()
-                disLoss /= subBatchSize
-                disLoss.backward()
-            optimizer_D.step()
-            optimizer_D.zero_grad(set_to_none=True)
+        if metrices['Adv'].weight > 0 :
+            if repeatDis :
+                for _ in range(repeatDis) :
+                    optimizer_D.zero_grad(set_to_none=False)
+                    for i in range(batchSplit) :
+                        subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
+                        subImages = images[subRange,...]#.clone().detach()
+                        with torch.no_grad() : # create fake images to be descriminated
+                            subFakeImages = generator.generateImages(subImages)
+                        #subImages.requires_grad = True
+                        #subFakeImages.requires_grad = True
+                        disLoss, probs = loss_Dis(subImages, subFakeImages)
+                        trainRes.predReal += probs[:subBatchSize,0].sum().item() / repeatDis
+                        trainRes.predFake += probs[subBatchSize:,0].sum().item() / repeatDis
+                        trainRes.lossD += disLoss.item() / repeatDis
+                        if doTrainDis(locals()) :
+                            disLoss /= subBatchSize
+                            disLoss.backward()
+                    optimizer_D.step()
+                    optimizer_D.zero_grad(set_to_none=True)
+            else :
+                with torch.no_grad() : # create fake images to be descriminated
+                    for i in range(batchSplit) :
+                        subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
+                        subImages = images[subRange,...]#.clone().detach()
+                        subFakeImages = generator.generateImages(subImages)
+                        disLoss, probs = loss_Dis(subImages, subFakeImages)
+                        trainRes.predReal += probs[:subBatchSize,0].sum().item()
+                        trainRes.predFake += probs[subBatchSize:,0].sum().item()
+                        trainRes.lossD += disLoss.item()
+
 
 
         # train generator
-        if not skipGen :
+        for _ in range(repeatGen) :
             for optim in optimizers_G :
                 optim.zero_grad(set_to_none=False)
             for i in range(batchSplit) :
@@ -1426,14 +1477,16 @@ def train_step(allImages):
                 #subFakeImages = fakeImages[subRange,...]
                 #subFakeImages[DCfg.gapRng] = generator.generatePatches(subImages)
                 genLoss, indLosses = loss_Gen(subImages, subFakeImages)
-                trainRes.lossG += genLoss.item()
+                trainRes.lossG += genLoss.item() / repeatGen
                 for key in indLosses.keys() :
-                    trainRes.metrices[key] += indLosses[key]
+                    trainRes.metrices[key] += indLosses[key] / repeatGen
                 genLoss /= subBatchSize
-                genLoss.backward()
+                if doTrainGen(locals()) :
+                    genLoss.backward()
             for optim in optimizers_G :
                 optim.step()
                 optim.zero_grad(set_to_none=True)
+
 
     return trainRes
 
@@ -1602,21 +1655,25 @@ def train(savedCheckPoint):
 
         generator.eval()
         displayImages()
-        resTest = summarizeMe(testLoader, False)
-        resTest *= 1/resTest.nofIm
-        writer.add_scalars("Losses epoch test",
-            {'Dis': resTest.lossD
-            ,'Gen': resTest.lossG
-            #,'Adv' : resTest.metrices['Adv']
-            }, epoch )
-        for key in resTest.metrices.keys() :
-            if metrices[key].norm > 0 :
-                writer.add_scalars("Metrices epoch test", {key : resTest.metrices[key],}, epoch )
-        writer.add_scalars("Probs epoch test",
-            {'Ref':resTest.predReal
-            ,'Gen':resTest.predFake
-            #,'Pre':trainRes.predGen
-            }, epoch )
+        try :
+            resTest = summarizeMe(testLoader, False)
+            resTest *= 1/resTest.nofIm
+            writer.add_scalars("Losses epoch test",
+                {'Dis': resTest.lossD
+                ,'Gen': resTest.lossG
+                #,'Adv' : resTest.metrices['Adv']
+                }, epoch )
+            for key in resTest.metrices.keys() :
+                if metrices[key].norm > 0 :
+                    writer.add_scalars("Metrices epoch test", {key : resTest.metrices[key],}, epoch )
+            writer.add_scalars("Probs epoch test",
+                {'Ref':resTest.predReal
+                ,'Gen':resTest.predFake
+                #,'Pre':trainRes.predGen
+                }, epoch )
+        except Exception as e:
+            continue
+
         generator.train()
 
 
