@@ -12,6 +12,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum
 import glob
+import copy
 
 import math
 import statistics
@@ -198,56 +199,6 @@ def sliceShape(shape, sl) :
         return indeces[1]-indeces[0]
     else :
         raise Exception(f"Incompatible object {sl}")
-
-
-def tensorStat(stat) :
-    if not torch.numel(stat) :
-        print("Empty tensor.")
-        return
-    absstat = stat.abs()
-    print(f"Mean {stat.mean().item():.3e}, Std {stat.std().item():.3e}, "
-          f"Ext [{stat.min().item():.3e}, {stat.max().item():.3e}], "
-          f"Abs {absstat.mean().item():.3e}, Tin {absstat.min().item():.3e}, "
-          f"Zrs { 1 - torch.count_nonzero(absstat)/torch.numel(absstat):.3e}, "
-          f"Nan { 1 - torch.count_nonzero(torch.isfinite(stat))/torch.numel(stat):.3e}")
-
-
-
-def fillWheights(seq, std=0.001) :
-    for wh in seq :
-        if hasattr(wh, 'weight') :
-            #torch.nn.init.xavier_uniform_(wh.weight)
-            #torch.nn.init.zeros_(wh.weight)
-            #torch.nn.init.constant_(wh.weight, 0)
-            #torch.nn.init.uniform_(wh.weight, a=0.0, b=1.0, generator=None)
-            torch.nn.init.normal_(wh.weight, mean=0.0, std=std)
-        if hasattr(wh, 'bias') and wh.bias is not None :
-            torch.nn.init.normal_(wh.bias, mean=0.0, std=0)
-
-
-def unsqeeze4dim(tens):
-    orgDims = tens.dim()
-    if tens.dim() == 2 :
-        tens = tens.unsqueeze(0)
-    if tens.dim() == 3 :
-        tens = tens.unsqueeze(1)
-    return tens, orgDims
-
-
-def squeezeOrg(tens, orgDims):
-    if orgDims == tens.dim():
-        pass
-    if tens.dim() != 4 or orgDims > 4 or orgDims < 2:
-        raise Exception(f"Unexpected dimensions to squeeze: {tens.dim()} {orgDims}.")
-    if orgDims < 4 :
-        if tens.shape[1] > 1:
-            raise Exception(f"Cant squeeze dimension 1 in: {tens.shape}.")
-        tens = tens.squeeze(1)
-    if orgDims < 3 :
-        if tens.shape[0] > 1:
-            raise Exception(f"Cant squeeze dimension 0 in: {tens.shape}.")
-        tens = tens.squeeze(0)
-    return tens
 
 
 def set_seed(SEED_VALUE):
@@ -543,6 +494,7 @@ listOfTrainData = [
     "19932.10_8093920_35keV",
     "19932.14_2442231_23keV",
     "19932.16_4193759_60keV",
+    "25763c.11_training"
 ]
 listOfTestData = [
     "19603a.Exposures.70keV_7m_Calf2_Threshold35keV_25ms_Take2",
@@ -569,7 +521,7 @@ trainSet = initIfNew('trainSet')
 testSet = initIfNew('testSet')
 
 
-def createDataLoader(tSet, num_workers=os.cpu_count(), shuffle=False) :
+def createDataLoader(tSet, num_workers=os.cpu_count()) :
     return torch.utils.data.DataLoader(
         dataset=tSet,
         batch_size = TCfg.batchSize * max(1, -TCfg.batchSplit) ,
@@ -624,8 +576,22 @@ def showMe(tSet, index=None) :
     plotImage(image.cpu())
     return rindex
 
+
+def tensorStat(stat) :
+    if not torch.numel(stat) :
+        print("Empty tensor.")
+        return
+    absstat = stat.abs()
+    print(f"Mean {stat.mean().item():.3e}, Std {stat.std().item():.3e}, "
+          f"Ext [{stat.min().item():.3e}, {stat.max().item():.3e}], "
+          f"Abs {absstat.mean().item():.3e}, Tin {absstat.min().item():.3e}, "
+          f"Zrs { 1 - torch.count_nonzero(absstat)/torch.numel(absstat):.3e}, "
+          f"Nan { 1 - torch.count_nonzero(torch.isfinite(stat))/torch.numel(stat):.3e}")
+
 def normalizeImages(images) :
     images, orgDims = unsqeeze4dim(images)
+    #images = images.clone().detach()
+    #with torch.no_grad() :
     stds, means = torch.std_mean(images, dim=(-1,-2), keepdim=True)
     stds = stds + 1e-7
     images = (images - means) / stds # normalize per image
@@ -635,6 +601,116 @@ def reNormalizeImages(images, norms) :
     images = images * norms[1][:,[0],...].to(images.device) + norms[2][:,[0],...].to(images.device) # renormalise
     images = squeezeOrg(images, norms[0])
     return images
+
+def reinit(model, mean=0, std=1):
+    for param in model.parameters() :
+        torch.nn.init.normal_(param, mean=mean, std=std)
+
+def addnoise(model, std=1):
+    for param in model.parameters() :
+        param.data += torch.randn_like(param.data) * std
+
+def fillWheights(seq, std=0.001) :
+    for wh in seq :
+        if hasattr(wh, 'weight') :
+            #torch.nn.init.xavier_uniform_(wh.weight)
+            #torch.nn.init.zeros_(wh.weight)
+            #torch.nn.init.constant_(wh.weight, 0)
+            #torch.nn.init.uniform_(wh.weight, a=0.0, b=1.0, generator=None)
+            torch.nn.init.normal_(wh.weight, mean=0.0, std=std)
+        if hasattr(wh, 'bias') and wh.bias is not None :
+            torch.nn.init.normal_(wh.bias, mean=0.0, std=0)
+
+def unsqeeze4dim(tens):
+    orgDims = tens.dim()
+    if tens.dim() == 2 :
+        tens = tens.unsqueeze(0)
+    if tens.dim() == 3 :
+        tens = tens.unsqueeze(1)
+    return tens, orgDims
+
+def squeezeOrg(tens, orgDims):
+    if orgDims == tens.dim():
+        pass
+    if tens.dim() != 4 or orgDims > 4 or orgDims < 2:
+        raise Exception(f"Unexpected dimensions to squeeze: {tens.dim()} {orgDims}.")
+    if orgDims < 4 :
+        if tens.shape[1] > 1:
+            raise Exception(f"Cant squeeze dimension 1 in: {tens.shape}.")
+        tens = tens.squeeze(1)
+    if orgDims < 3 :
+        if tens.shape[0] > 1:
+            raise Exception(f"Cant squeeze dimension 0 in: {tens.shape}.")
+        tens = tens.squeeze(0)
+    return tens
+
+def stripe2bricks(stripes) :
+    width = stripes.shape[-1]
+    channels = stripes.shape[1]
+    bricks = stripes.unfold(-2,width,width//2).permute(0,2,1,4,3).reshape(-1,channels,width,width)
+    return  bricks
+
+brickMasks = {}
+def bricks2stripe(bricks, ratio=None) :
+    global brickMasks
+    if ratio is None:
+        ratio = DCfg.sinoSh[-2] // DCfg.sinoSh[-1]
+    nofIm = bricks.shape[0] // (2*ratio-1)
+    width = bricks.shape[-1]
+    channels = bricks.shape[1]
+    myMask = brickMasks[width].to(bricks.device)
+    bricks = myMask * bricks
+    stripesOrg = bricks.view(nofIm,-1,channels,width,width)[:, ::2,...].transpose(1,2).reshape((nofIm,channels,-1,width))
+    stripesAux = bricks.view(nofIm,-1,channels,width,width)[:,1::2,...].transpose(1,2).reshape((nofIm,channels,-1,width))
+    edge = width//2
+    stripes = torch.cat([ stripesOrg[:,:,:edge,:] / myMask[:,:,:edge,:],
+                          stripesOrg[:,:,edge:-edge,:] + stripesAux,
+                          stripesOrg[:,:,-edge:,:] / myMask[:,:,-edge:,:]
+                        ],
+                        dim=-2)
+    return stripes
+
+def createBrickMasks():
+    brickMasks = {}
+    brickLen = DCfg.sinoSh[-2]
+    while brickLen >= 2 :
+        halfLine = [ i + 0.5 for i in range(brickLen//2)]
+        halfLine = torch.tensor(halfLine, dtype=torch.float32)
+        halfLine /= brickLen//2
+        line = torch.cat( (halfLine, halfLine.flip(0)), dim=0)
+        myMask = line.view(-1,1).repeat(1,brickLen)
+        myMask = myMask.unsqueeze(0).unsqueeze(0) # add batch and channel dims
+        brickMasks[brickLen] = myMask
+        brickLen //= 2
+    return brickMasks
+
+def fillTheGap(images, gap) :
+    if images.shape[-2] != gap.shape[-2] or images.shape[0] != gap.shape[0] :
+        raise Exception(f"Filling gaps requires inputs of the same size except last dimension. Got {images.shape} and {gap.shape}.")
+    if DCfg.sinoSh[-1] % images.shape[-1] != 0 :
+        raise Exception(f"Width of the images {images.shape[-1]} is an integer of {DCfg.sinoSh[-1]}.")
+    ratio = DCfg.sinoSh[-1] // images.shape[-1]
+    if DCfg.gapW % ratio + DCfg.gapRngX.start % ratio != 0 :
+        raise Exception(f"Gap width {DCfg.gapW} and gap start {DCfg.gapRngX.start} must be integer multiples of {ratio}.")
+    gapWidth = DCfg.gapW // ratio
+    gapStart = DCfg.gapRngX.start // ratio
+    if images.shape[-1] == gap.shape[-1] :
+        gapRng = np.s_[gapStart:gapStart+gapWidth]
+    elif gap.shape[-1] == gapWidth :
+        gapRng = np.s_[:]
+    else :
+        raise Exception(f"Bad gap width {gap.shape[-1]} for filling images of width {images.shape[-1]}.")
+    channels = min(images.shape[1], gap.shape[1])
+    gapped = torch.cat( [ images[:,:channels,:, : gapStart],
+                          gap   [:,:channels,:, gapRng].to(images.device),
+                          images[:,:channels,:, gapStart+gapWidth : ]
+                        ],
+                        dim=-1
+                      )
+    gapped = torch.cat( (gapped, images[:,channels:,...]), dim=1 )
+    return gapped
+
+
 
 
 
@@ -646,18 +722,20 @@ class SubGeneratorTemplate(nn.Module):
     def __init__(self, gapW, brick, batchNorm=True, inChannels=1):
         super(SubGeneratorTemplate, self).__init__()
         self.cfg = DCfgClass(gapW, brick)
-        self.lowResGenerator = None
-        self.latentGenerator = None
         self.baseChannels = None
+        self.baseChannelsOther = None
         self.inChannels = inChannels
         self.amplitude = 4
         self.batchNorm = batchNorm
 
+    def device(self):
+        return next(self.lastTouch.parameters()).device
+
     def encblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=1) :
         if norm is None :
             norm = self.batchNorm
-        chIn = chIn*self.baseChannels if chIn > 0 else -chIn
-        chOut = chOut*self.baseChannels if chOut > 0 else -chOut
+        #chIn = chIn*self.baseChannels if chIn >= 0 else -chIn
+        #chOut = chOut*self.baseChannels if chOut >= 0 else -chOut
         layers = []
         layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias = not norm,
                                 padding=padding, padding_mode='reflect')  )
@@ -667,28 +745,28 @@ class SubGeneratorTemplate(nn.Module):
         fillWheights(layers)
         return torch.nn.Sequential(*layers)
 
-    def decblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=1, outputPadding=None) :
-        if norm is None :
-            norm = self.batchNorm
-        if outputPadding is None :
-            if isinstance(stride, int) :
-                outputPadding = stride - 1
-            else :
-                outputPadding = tuple( strd - 1 for strd in stride )
-        chIn = chIn*self.baseChannels if chIn > 0 else -chIn
-        chOut = chOut*self.baseChannels if chOut > 0 else -chOut
-        layers = []
-        layers.append( nn.ConvTranspose2d(chIn, chOut, kernel, stride=stride, bias = not norm,
-                                          padding=padding, padding_mode='zeros', output_padding=outputPadding) )
-        if norm :
-            layers.append(nn.BatchNorm2d(chOut))
-        layers.append(nn.LeakyReLU(0.2))
-        fillWheights(layers)
-        return torch.nn.Sequential(*layers)
+    def groundFloor(self, mult, kernel, stride=1) :
+        block1 = self.encblock(self.inChannels,
+                               self.baseChannels,
+                               kernel=kernel, stride=1, norm=False)
+        block2 = self.encblock(self.baseChannels+self.baseChannelsOther,
+                               mult*self.baseChannels,
+                               kernel=kernel, stride=stride, norm=self.batchNorm)
+        return (block1, block2)
 
-    def createFClink(self) :
+    def encFloor(self, chIn, mult, kernel, stride=1, norm=None, other=1) :
+        block1 = self.encblock( chIn*(self.baseChannels + other * self.baseChannelsOther),
+                               chIn*self.baseChannels,
+                               kernel, stride=1, norm=norm)
+        block2 = self.encblock( chIn*(self.baseChannels + other * self.baseChannelsOther),
+                               chIn*self.baseChannels*mult,
+                               kernel, stride=stride, norm=norm)
+        return (block1, block2)
+
+    def createAttic(self, encoders) :
         smpl = torch.zeros((1, self.inChannels, *self.cfg.sinoSh))
-        for encoder in self.encoders :
+        for encoder in encoders :
+            smpl = torch.zeros((1, encoder[0].in_channels, *smpl.shape[2:]))
             smpl = encoder(smpl)
         encSh = smpl.shape
         linChannels = math.prod(encSh)
@@ -700,16 +778,45 @@ class SubGeneratorTemplate(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Unflatten(1, encSh[1:]),
         )
-        fillWheights(toRet)
         return toRet
 
-    def createLastTouch(self, chIn=1) :
+    def decblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=1, outputPadding=None) :
+        if norm is None :
+            norm = self.batchNorm
+        if outputPadding is None :
+            if isinstance(stride, int) :
+                outputPadding = stride - 1
+            else :
+                outputPadding = tuple( strd - 1 for strd in stride )
+        #chIn = chIn*self.baseChannels if chIn >= 0 else -chIn
+        #chOut = chOut*self.baseChannels if chOut >= 0 else -chOut
+        layers = []
+        layers.append( nn.ConvTranspose2d(chIn, chOut, kernel, stride=stride, bias = not norm,
+                                          padding=padding, padding_mode='zeros', output_padding=outputPadding) )
+        if norm :
+            layers.append(nn.BatchNorm2d(chOut))
+        layers.append(nn.LeakyReLU(0.2))
+        fillWheights(layers)
+        return torch.nn.Sequential(*layers)
+
+    def decFloor(self, chOut, reduce, kernel, stride=1, norm=None, other=1) :
+        block1 = self.decblock( reduce*2*chOut*(self.baseChannels + other * self.baseChannelsOther),
+                                chOut*self.baseChannels,
+                                kernel, stride=stride, norm=self.batchNorm)
+        block2 = self.decblock( 2*chOut*(self.baseChannels + other * self.baseChannelsOther),
+                                chOut*self.baseChannels,
+                                kernel, stride=1, norm=norm)
+        return (block1, block2)
+
+
+    def createBasement(self, chIn) :
         toRet = nn.Sequential(
-            nn.Conv2d(chIn*self.baseChannels+self.inChannels, 1, 1),
+            nn.Conv2d(chIn*(self.baseChannels+self.baseChannelsOther)+self.inChannels, 1, 1),
             nn.Tanh(),
         )
         fillWheights(toRet)
         return toRet
+
 
     def createLatentGenerator(self) :
         latInSh = self.fcLink[-1].unflattened_size[-2:]
@@ -733,21 +840,36 @@ class SubGeneratorTemplate(nn.Module):
         fillWheights(toRet)
         return toRet
 
-    def device(self) :
-        return next(self.lastTouch.parameters()).device
 
     def generateImages(self, images, noises=None) :
-        res = images.clone()
-        res[self.cfg.gapRng] = self.forward(images)[self.cfg.gapRng]
-        return res
+        return fillTheGap(images, self.forward(images)[:,[0],...])
 
 
-    def preFill(self, images) :
+    def forward(self, images):
+        return images
+
+
+class GeneratorTemplate(SubGeneratorTemplate):
+
+    def __init__(self, gapW, batchNorm=True):
+        super(GeneratorTemplate, self).__init__(gapW, False, batchNorm)
+        self.brickGenerator = None
+        self.stipeGenerator = None
+        self.finalGenerator = None
+
+
+    def lowResProc(self, images) :
         images, orgDims = unsqeeze4dim(images)
         if self.cfg.gapW == 2:
-            res = images.clone()
-            res[...,self.cfg.gapRngX.start]  = ( 2*images[:,[0],:,self.cfg.gapRngX.start-1] + images[:,[0],:,self.cfg.gapRngX.stop] ) / 3
-            res[...,self.cfg.gapRngX.stop-1] = ( 2*images[:,[0],:,self.cfg.gapRngX.stop] + images[:,[0],:,self.cfg.gapRngX.start-1] ) / 3
+            gap = torch.cat( [ ( 2*images[:,0:1,:,[self.cfg.gapRngX.start-1]] + images[:,0:1,:,[self.cfg.gapRngX.stop]   ] ) / 3,
+                               ( 2*images[:,0:1,:,[self.cfg.gapRngX.stop]   ] + images[:,0:1,:,[self.cfg.gapRngX.start-1]] ) / 3,
+                             ],
+                             dim=-1
+                           )
+            res = fillTheGap(images, gap)
+            #res = images.clone()
+            #res[...,self.cfg.gapRngX.start]  = ( 2*images[:,[0],:,self.cfg.gapRngX.start-1] + images[:,[0],:,self.cfg.gapRngX.stop] ) / 3
+            #res[...,self.cfg.gapRngX.stop-1] = ( 2*images[:,[0],:,self.cfg.gapRngX.stop] + images[:,[0],:,self.cfg.gapRngX.start-1] ) / 3
         elif self.lowResGenerator is None :
             res = images
         else :
@@ -756,120 +878,114 @@ class SubGeneratorTemplate(nn.Module):
             res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
         return squeezeOrg(res, orgDims)
 
-    def dropIN(self,images) :
-        dwTrain = [images,]
-        for encoder in self.encoders :
-            dwTrain.append(encoder(dwTrain[-1]))
-            #print(f"{dwTrain[-2].shape} -> {dwTrain[-1].shape}")
-        #return dwTrain[-1]
-        mid = self.fcLink(dwTrain[-1])
-        #return mid
-        upTrain = [mid]
-        for level, decoder in enumerate(self.decoders) :
-            upTrain.append( decoder( torch.cat( (upTrain[-1], dwTrain[-1-level]), dim=1 ) ) )
-            #print(f"{upTrain[-2].shape} -> {upTrain[-1].shape} ({dwTrain[-2-level].shape})")
-        res = self.lastTouch(torch.cat( (upTrain[-1], images ), dim=1 ))
-        return res * self.amplitude + images[:,[0],...]
 
-    def forward(self, images):
-        images = images.to(self.device())
-        images = images.clone()#.detach()
-        images[:,[0],*self.cfg.gapRng] = self.preFill(images)[:,[0],*self.cfg.gapRng]
-        images, norms = normalizeImages(images)
-        if self.inChannels > images.shape[1] : # fill missing channels with noise
-            if isinstance(self.latentGenerator, float) :
-                lSh = list(images.shape)
-                lSh[1] = self.inChannels - lSh[1]
-                latentChannels = self.latentGenerator * torch.randn( lSh, device=images.device )
-            else :
-                latentIn = torch.randn( (images.shape[0], self.latentGenerator[0].in_features), device=images.device )
-                latentChannels = self.latentGenerator(latentIn)
-            images = torch.cat( (images, latentChannels), dim=1 )
-        results = self.dropIN(images)
-        results = reNormalizeImages(results, norms)#.to(imDevice)
-        return results
-
-
-
-
-
-
-
-
-class GeneratorTemplate(SubGeneratorTemplate):
-
-    def __init__(self, gapW, batchNorm=True, inChannels=3):
-        super(GeneratorTemplate, self).__init__(gapW, False, batchNorm, inChannels=inChannels)
-        self.inChannels = inChannels
-        self.brickGenerator = None
-        self.stipeGenerator = None
-        self.finalGenerator = None
-
-
-    def stripe2bricks(self,stripes) :
-        nofIm = stripes.shape[0]
-        imsz = math.prod(self.brickGenerator.cfg.sinoSh)
-        bricks = stripes.view(nofIm,-1)
-        bricks = bricks.unfold(1,imsz,imsz//2).unfold(2,*self.brickGenerator.cfg.sinoSh)
-        bricks = bricks.reshape(-1,1,*self.brickGenerator.cfg.sinoSh)
-        return bricks
-
-    def bricks2stripe(self, bricks) :
-        nofChans = self.cfg.sinoSh[-2] // self.brickGenerator.cfg.sinoSh[-2]
-        nofChans = nofChans * 2 - 1 # interleaved stripes
-        bricks = bricks.view(-1,nofChans,*self.brickGenerator.cfg.sinoSh)
-        nofIm = bricks.shape[0]
-        stripesO = bricks[:,0::2,:,:].reshape(nofIm,1,-1,self.brickGenerator.cfg.sinoSh[-1])
-        stripesS = stripesO.clone()
-        edge = self.brickGenerator.cfg.sinoSh[-2]//2
-        stripesS[:,:,edge:-edge,:] = bricks[:,1::2,:,:].reshape(nofIm,1,-1,self.brickGenerator.cfg.sinoSh[-1])
-        return torch.cat( (stripesO, stripesS), dim=1 )
+    def procTail(self, stripe_starter, bricksStriped_starter,
+                       bricks_starter, stripeBricked_starter) :
+        stripe_dwTrainTail = [stripe_starter,]
+        for encoder in self.stripeGenerator.tailEncoders  :
+            stripe_dwTrainTail.append(encoder(stripe_dwTrainTail[-1]))
+        # stripes linear link
+        stripe_mid = self.stripeGenerator.fcLink(stripe_dwTrainTail[-1])
+        stripe_upTrainTail = [stripe_mid,]
+        # stripes tail decoders
+        for level, decoder in enumerate(self.stripeGenerator.tailDecoders) :
+            stripe_upTrainTail.append( decoder( torch.cat( (stripe_upTrainTail[-1], stripe_dwTrainTail[-1-level]), dim=1 ) ) )
+        return stripe_upTrainTail[-1]
 
     def forward(self, images):
 
-        imDevice = images.device
-        myDevice = next(self.lastTouch.parameters()).device
-        images = images.to(myDevice)
+        # preform inputs
+        lrImages = self.lowResProc(images)
+        filledImages = fillTheGap(images, lrImages[:,[0],...])
+        if self.lowResGenerator is None :
+            stripeIn = filledImages.to(self.stripeGenerator.device())
+        else :
+            stripeIn = torch.cat( [ img.to(self.stripeGenerator.device()) for img in (
+                                    filledImages,
+                                    lrImages
+                                )  ], dim=1)
+        stripeIn, stripe_norms = normalizeImages(stripeIn)
+        lrImagesNormalized = stripeIn[:,[-1],...]
+        stripe_dwTrain = [stripeIn,]
 
-        # channel 0
-        images = images.clone()#.detach()
-        preImages = self.preFill(images)
-        images[:,[0],*self.cfg.gapRng] = preImages[:,[0],*self.cfg.gapRng]
-        images, norms = normalizeImages(images)
+        lrImagesBricked = stripe2bricks(lrImages)
+        filledImagesBricked = stripe2bricks(filledImages)
+        if self.lowResGenerator is None :
+            bricksIn = lrImagesBricked.to(self.brickGenerator.device())
+        else :
+            bricksIn = torch.cat( [ img.to(self.brickGenerator.device()) for img in (
+                                    filledImagesBricked,
+                                    lrImagesBricked
+                                ) ], dim=1)
+        bricksIn, bricks_norms = normalizeImages(bricksIn)
+        lrImagesBrickedNormalized = bricksIn[:,[-1],...]
+        bricks_dwTrain = [bricksIn,]
 
-        # channel 1
-        stripeImages = self.stripeGenerator.forward(images).to(myDevice)
-        # channels 2 and 3
-        brickedImages = self.stripe2bricks(images).to(self.brickGenerator.device())
-        brickedStipes = self.stripe2bricks(stripeImages).to(self.brickGenerator.device())
-        bricksIn = torch.cat((brickedImages, brickedStipes), dim=1)
-        brickImages = self.brickGenerator.forward(bricksIn)
-        brickImages = self.bricks2stripe(brickImages)
-        # combine channels and drop in
-        modelIn = torch.cat((images, stripeImages, brickImages), dim=1)
-        if self.inChannels > modelIn.shape[1] : # fill missing channels with noise
-            if self.latentGenerator is None :
-                lSh = list(modelIn.shape)
-                lSh[1] = self.inChannels - lSh[1]
-                latentChannels = torch.randn( lSh, device=images.device )
-            else :
-                latentIn = torch.randn( (images.shape[0], self.latentGenerator[0].in_features), device=images.device )
-                latentChannels = self.latentGenerator(latentIn)
-            modelIn = torch.cat( (modelIn, latentChannels), dim=1 )
-        results = self.dropIN(modelIn)
+        stripeBricked_dwTrain = [torch.empty((bricksIn.shape[0],0,bricksIn.shape[2],bricksIn.shape[3])),]
+        bricksStriped_dwTrain = [torch.empty((stripeIn.shape[0],0,stripeIn.shape[2],stripeIn.shape[3])),]
 
-        results = reNormalizeImages(results, norms).to(imDevice)
+        # encoding
+        for level, (brick_encoder, stripe_encoder) in enumerate( zip(self.brickGenerator.encoders, self.stripeGenerator.headEncoders) ):
+
+            bricksI = torch.cat( [ bricks_dwTrain[-1], stripeBricked_dwTrain[-1].to(self.brickGenerator.device()) ], dim=1 )
+            bricks_dwTrain.append( brick_encoder( bricksI ) )
+            bricksStriped_dwTrain.append( bricks2stripe(bricks_dwTrain[-1]) )
+
+            stripeI = torch.cat( [ stripe_dwTrain[-1], bricksStriped_dwTrain[-2].to(self.stripeGenerator.device()) ], dim=1 )
+            stripe_dwTrain.append( stripe_encoder(stripeI))
+            stripeBricked_dwTrain.append( stripe2bricks(stripe_dwTrain[-1]) )
+
+        # bricks linear link
+        bricks_mid = self.brickGenerator.fcLink(bricks_dwTrain[-1])
+
+        # stripes tail
+        tailed = self.procTail(stripe_dwTrain[-1], bricksStriped_dwTrain[-1],
+                               bricks_dwTrain[-1], stripeBricked_dwTrain[-1], )
+
+        bricks_upTrain = [bricks_mid,]
+        stripe_upTrain = [tailed,]
+        # decoding
+        for level, (brick_decoder, stripe_decoder) in enumerate( zip(self.brickGenerator.decoders, self.stripeGenerator.headDecoders) ):
+
+            bricksI = torch.cat( [ img.to(self.brickGenerator.device()) for img in (
+                                    bricks_upTrain[-1],
+                                    bricks_dwTrain[-1-level],
+                                    stripe2bricks(stripe_upTrain[-1]),
+                                    stripeBricked_dwTrain[-1-level]
+                                ) ], dim=1)
+            bricks_upTrain.append( brick_decoder(bricksI) )
+
+            stripeI = torch.cat( [ img.to(self.stripeGenerator.device()) for img in (
+                                    stripe_upTrain[-1],
+                                    stripe_dwTrain[-1-level],
+                                    bricks2stripe(bricks_upTrain[-2]),
+                                    bricksStriped_dwTrain[-1-level],
+                                ) ] , dim=1)
+            stripe_upTrain.append( stripe_decoder(stripeI) )
+
+        # last touches
+        stripe_results = self.stripeGenerator.lastTouch(torch.cat( [ img.to(self.stripeGenerator.device()) for img in (
+                stripe_upTrain[-1],
+                stripeIn,
+                bricks2stripe(bricks_upTrain[-1]),
+            ) ], dim=1 ))
+        stripe_results = stripe_results * self.stripeGenerator.amplitude + \
+            lrImagesNormalized.to(self.stripeGenerator.device())
+        stripe_results = reNormalizeImages(stripe_results, stripe_norms)
+
+        bricks_results = self.brickGenerator.lastTouch(torch.cat( [ img.to(self.brickGenerator.device()) for img in (
+                bricks_upTrain[-1],
+                bricksIn,
+                stripe2bricks(stripe_upTrain[-1]),
+            ) ], dim=1 ))
+        bricks_results = bricks_results * self.brickGenerator.amplitude + \
+            lrImagesBrickedNormalized.to(self.brickGenerator.device())
+        bricks_results = reNormalizeImages(bricks_results, bricks_norms)
+        bricks_results = bricks2stripe(bricks_results)
+
+        # final result
+        results =  ( bricks_results + stripe_results.to(self.brickGenerator.device()) ) / 2
         return results
-
-
-def transformGT_forStripeTraining(images):
-    with torch.no_grad():
-        images, orgdims = unsqeeze4dim(images)
-        images = torch.nn.functional.interpolate(images, scale_factor=(1/DCfg.gapW,1), mode='bilinear')
-        images = torch.nn.functional.interpolate(images, scale_factor=(  DCfg.gapW,1), mode='bilinear')
-    return squeezeOrg(images, orgdims)
-
-
 
 
 
@@ -924,17 +1040,13 @@ class DiscriminatorTemplate(nn.Module):
 discriminator = initIfNew('discriminator')
 
 
-def createOptimizer(model, lr) :
-    return optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr,
-        betas=(0.5, 0.999)
-    )
-optimizer_G = initIfNew('optimizer_G')
-optimizer_D = initIfNew('optimizer_D')
-scheduler_G = initIfNew('scheduler_G')
-scheduler_D = initIfNew('scheduler_D')
+def createOptimizers() :
+    raise Exception("Don't use this function, redefine it as needed.")
+schedulers_G = []
+schedulers_D = []
 optimizers_G = []
+optimizers_D = []
+
 
 def adjustScheduler(scheduler, iniLr, target) :
     if scheduler is None :
@@ -945,25 +1057,6 @@ def adjustScheduler(scheduler, iniLr, target) :
     or gamma > 1 and curLR < target :
         scheduler.step()
     return f"LR : {scheduler.get_last_lr()[0]:.3e} ({curLR:.3e}). "
-
-
-def restoreCheckpoint(path=None, logDir=None) :
-    if logDir is None :
-        logDir = TCfg.logDir
-    if path is None :
-        if os.path.exists(logDir) :
-            raise Exception(f"Starting new experiment with existing log directory \"{logDir}\"."
-                            " Remove it .")
-        try : os.remove(TCfg.historyHDF)
-        except : pass
-        return 0, 0, 0, None, 0, TrainResClass()
-    else :
-        return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D)
-
-
-def saveModels(path="") :
-    save_model(generator, model_path = ( path if path else f"model_{TCfg.exec}" ) + "_gen.pt" )
-    save_model(discriminator, model_path = ( path if path else f"model_{TCfg.exec}" ) + "_dis.pt"  )
 
 
 
@@ -978,6 +1071,8 @@ def saveModels(path="") :
 
 BCE = nn.BCELoss(reduction='none')
 def loss_Adv(images, truth):
+    if discriminator is None :
+        raise Exception("Discriminator is not initialized for adversarial loss.")
     nofIm = images.shape[0]
     batchSplit = TCfg.batchSplit if TCfg.batchSplit > 1 else 1
     subBatchSize = TCfg.batchSize // batchSplit
@@ -987,7 +1082,8 @@ def loss_Adv(images, truth):
         subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
         predictions[subRange,...] = discriminator(images[subRange,...])
     labels = torch.full((nofIm, 1),  (1 - TCfg.labelSmoothFac ) if truth else TCfg.labelSmoothFac,
-                        dtype=torch.float, device=predictions.device)
+                        dtype=torch.float, device=images.device)
+    BCE.to(images.device)
     return BCE(predictions, labels)[...,0], predictions
 
 def loss_Adv_Gen(p_true, p_pred):
@@ -1001,12 +1097,59 @@ def loss_Adv_Dis(p_true, p_pred):
 
 MSE = nn.MSELoss(reduction='none')
 def loss_MSE(p_true, p_pred):
+    MSE.to(p_pred.device)
     return MSE(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
+
+avgKernel = torch.ones((1,1,3,3), dtype=torch.float32)
+def loss_MSEC(p_true, p_pred):
+    global avgKernel
+    dev = p_pred.device
+    MSE.to(dev)
+    avgKernel = avgKernel.to(dev)
+    p_true = p_true.to(dev)
+    mseLoss = MSE(p_true[DCfg.gapRng], p_pred[DCfg.gapRng])
+    diffLoss = p_true[DCfg.gapRng] - p_pred[DCfg.gapRng]
+    convDiff = torch.nn.functional.conv2d( diffLoss, avgKernel, padding=1 )
+    loss = mseLoss * convDiff**2
+    return loss.sum(dim=(-1,-2,-3))
+
+def loss_MSEA(p_true, p_pred):
+    MSE.to(p_pred.device)
+    #return MSE(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
+    gap_true = p_true[DCfg.gapRng]
+    gap_pred = p_pred[DCfg.gapRng]
+    allMSEs = torch.zeros((gap_true.shape[0],9,gap_true.shape[-2],gap_true.shape[-1]), device=p_pred.device) + 1e10
+    for id2 in [-1,0,1] :
+        for id3 in [-1,0,1] :
+            allMSEs[:,[(id3+1)*3+(id2+1)],
+                      max(0,id2) : gap_true.shape[2] + min(0,id2),
+                      max(0,id3) : gap_true.shape[3] + min(0,id3)] = \
+                MSE( gap_true[:,:,max(0,id2) : gap_true.shape[2] + min(0,id2),
+                                  max(0,id3) : gap_true.shape[3] + min(0,id3)] ,
+                     gap_pred[:,:,max(0,id2)-id2 : gap_true.shape[2] + min(0,id2)-id2,
+                                  max(0,id3)-id3 : gap_true.shape[3] + min(0,id3)-id3] )
+    minMSE = allMSEs.min(dim=1, keepdim=True)
+    return minMSE.sum(dim=(-1,-2,-3))
 
 def loss_MSEN(p_true, p_pred):
     rawLoss = loss_MSE(p_true, p_pred)
     stds = 1e-7 +  calculateNorm(p_true)[0].view([-1])
     return rawLoss / stds**2
+
+def loss_MSENorm(p_true, p_pred):
+    n_true, norms = normalizeImages(p_true)
+    n_pred = (p_pred - norms[1]) / norms[2]
+    return loss_MSE(n_true, n_pred)
+
+def loss_MSEBrick(p_true, p_pred):
+    b_true = stripe2bricks(p_true)
+    b_pred = stripe2bricks(p_pred)
+    n_true, norms = normalizeImages(b_true)
+    n_pred = (b_pred - norms[2]) / norms[1]
+    bLosses = loss_MSE(n_true, n_pred)
+    sLosses = bLosses.view(p_true.shape[0], -1).mean(dim=1)
+    return sLosses
+
 
 def loss_SMSE(p_true, p_pred):
     mseLoss = MSE(p_true[DCfg.gapRng], p_pred[DCfg.gapRng])
@@ -1014,6 +1157,7 @@ def loss_SMSE(p_true, p_pred):
 
 L1L = nn.L1Loss(reduction='none')
 def loss_L1L(p_true, p_pred):
+    L1L.to(p_true.device)
     return L1L(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
 
 def loss_L1LN(p_true, p_pred):
@@ -1026,6 +1170,7 @@ def loss_SSIM(p_true, p_pred):
     p_true, _ = unsqeeze4dim(p_true)
     p_pred, _ = unsqeeze4dim(p_pred)
     #return (1 - SSIM( p_true+0.5, p_pred+0.5 ) ) / 2
+    SSIM.to(p_true.device)
     return (1 - SSIM( p_true, p_pred ) ) / 2
 
 MSSSIM = ssim.MS_SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
@@ -1033,6 +1178,7 @@ def loss_MSSSIM(p_true, p_pred):
     p_true, _ = unsqeeze4dim(p_true)
     p_pred, _ = unsqeeze4dim(p_pred)
     #return (1 - MSSSIM( p_true+0.5, p_pred+0.5 ) ) / 2
+    MSSSIM.to(p_true.device)
     return (1 - MSSSIM( p_true, p_pred ) ) / 2
 
 def loss_COR(p_true, p_pred):
@@ -1071,7 +1217,28 @@ def loss_EAGLE(p_true, p_pred):
     p_true, _ = unsqeeze4dim(p_true)
     p_pred, _ = unsqeeze4dim(p_pred)
     loss = EAGLE(p_true, p_pred)
+    EAGLE.to(p_true.device)
     return loss
+
+
+sobelKernelXY = torch.tensor([[[[-1, 0, 1],
+                                [-2, 0, 2],
+                                [-1, 0, 1]]], # x
+                              [[[ 1, 2, 1],
+                                [ 0, 0, 0],
+                                [-1,-2,-1]]], # y
+                             ], dtype=torch.float32)
+
+def loss_ABSGRD(p_true, p_pred):
+    global sobelKernelXY
+    p_true, _ = unsqeeze4dim(p_true)
+    p_pred, _ = unsqeeze4dim(p_pred)
+    sobelKernelXY = sobelKernelXY.to(p_pred.device)
+    grad_true = torch.nn.functional.conv2d(p_true, sobelKernelXY, padding=1)
+    grad_pred = torch.nn.functional.conv2d(p_pred, sobelKernelXY, padding=1)
+    agrd_true = torch.square(grad_true).sum(dim=1, keepdim=True)
+    agrd_pred = torch.square(grad_pred).sum(dim=1, keepdim=True)
+    return torch.abs(agrd_true - agrd_pred).sum(dim=(-1,-2,-3))
 
 
 @dataclass
@@ -1083,6 +1250,7 @@ class Metrics:
 metrices = {
     'Adv'    : Metrics(loss_Adv_Gen, 0, 0),
     'MSE'    : Metrics(loss_MSE,     1, 1),
+    'MSEC'   : Metrics(loss_MSEC,     1, 1),
     #'SMSE'   : Metrics(loss_SMSE,    1, 1),
     'MSEN'   : Metrics(loss_MSEN,    1, 1),
     'L1L'    : Metrics(loss_L1L,     1, 1),
@@ -1093,24 +1261,7 @@ metrices = {
     'COR'    : Metrics(loss_COR,     1, 1),
     'HIST'   : Metrics(loss_HIST,    1, 1),
     'EAGLE'  : Metrics(loss_EAGLE,   1, 1),
-}
-
-# Gap 2 metrices
-{
-#metrices = {
-#    'Adv'    : Metrics(loss_Adv_Gen, 0,         0),
-#    'MSE'    : Metrics(loss_MSE,     1.154e-01, 1),
-#    'L1L'    : Metrics(loss_L1L,     2.571e+00, 1),
-#    'SSIM'   : Metrics(loss_SSIM,    4.183e-04, 1),
-#    'MSSSIM' : Metrics(loss_MSSSIM,  4.515e-06, 1),
-#}
-#metricesTrain = {
-#    'Adv'    : Metrics(loss_Adv_Gen, 0,         0),
-#    'MSE'    : Metrics(loss_MSE,     5.836e-01, 1),
-#    'L1L'    : Metrics(loss_L1L,     9.742e+00, 1),
-#    'SSIM'   : Metrics(loss_SSIM,    8.717e-04, 1),
-#    'MSSSIM' : Metrics(loss_MSSSIM,  3.358e-05, 1),
-#}
+    'ABSGRD' : Metrics(loss_ABSGRD,  1, 1),
 }
 
 
@@ -1151,33 +1302,28 @@ def updateExtremes(vector, key, p_true, p_pred) :
 
 
 
-def transformGT(images):
-    return images
-
-
 def loss_Gen(p_true, p_pred):
     global metrices, minMetrices, maxMetrices
-    loss = torch.zeros( (p_true.shape[0]), device=p_true.device )
+    myDev = p_pred.device
+    p_true = p_true.to(myDev)
+    losses = []
     sumweights = 0
     individualLosses = {}
-    p_true = transformGT(p_true)
     for key, metrics in metrices.items():
         if metrics.norm > 0 :
             with torch.set_grad_enabled( metrics.weight > 0 ) :
-                thisLoss = metrics.calculate(p_true, p_pred) / metrics.norm
+                thisLoss = metrics.calculate(p_true, p_pred).to(myDev) / metrics.norm
+                losses.append(thisLoss * metrics.weight)
+                sumweights += metrics.weight
                 individualLosses[key] = thisLoss.sum().item()
                 updateExtremes(thisLoss, key, p_true, p_pred)
-                if  metrics.weight > 0 :
-                    loss += metrics.weight * thisLoss.to(p_true.device)
-                    sumweights += metrics.weight
         else :
             individualLosses[key] = p_true.shape[0]
-    loss /= sumweights
+    loss = sum(losses) / sumweights
     updateExtremes(loss, 'loss', p_true, p_pred)
     return loss.sum() , individualLosses
 
 def loss_Dis(p_true, p_pred):
-    p_true = transformGT(p_true)
     advRes = loss_Adv_Dis(p_true, p_pred)
     return advRes[0].sum() / ( 2 * metrices['Adv'].norm ) , advRes[1]
 
@@ -1239,7 +1385,7 @@ def summarizeMe(toSumm, onPrep=True):
     sumAcc = TrainResClass()
 
     #generator.train()
-    generator.eval()
+    #generator.eval()
     #discriminator.eval()
 
     def summarizeImages(images) :
@@ -1251,14 +1397,13 @@ def summarizeMe(toSumm, onPrep=True):
 
         batchSplit = TCfg.batchSplit if TCfg.batchSplit > 1 else 1
         subBatchSize = nofIm // batchSplit
-        #fakeImages = images.clone()
         for i in range(batchSplit) :
             subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
             subImages = images[subRange,...]
-            subFakeImages = generator.preFill(subImages) \
+            subFakeImages = generator.lowResProc(subImages) \
                                 if onPrep else \
                             generator.generateImages(subImages)
-            if metrices['Adv'].weight > 0 :
+            if 'Adv' in metrices and metrices['Adv'].weight > 0 :
                 disLoss, probs = loss_Dis(subImages, subFakeImages)
                 sumAcc.lossD += disLoss.item()
                 sumAcc.predReal += probs[:subBatchSize,0].sum().item()
@@ -1282,8 +1427,8 @@ def summarizeMe(toSumm, onPrep=True):
     return sumAcc
 
 
+
 def generateDisplay(inp=None, boxes=None) :
-    #images = images.to(TCfg.device)
     images = refImages if inp is None else inp
     images, orgDim = unsqeeze4dim(images)
     nofIm = images.shape[0]
@@ -1292,7 +1437,7 @@ def generateDisplay(inp=None, boxes=None) :
 
     genImages = images.clone()
     with torch.no_grad() :
-        preImages = generator.preFill(images).to(imDevice)
+        preImages = generator.lowResProc(images).to(imDevice)
         genPatches = generator.forward(images).to(imDevice)
         genImages[DCfg.gapRng] = genPatches[DCfg.gapRng]
     hGap = DCfg.gapW // 2
@@ -1321,7 +1466,7 @@ def displayImages(inp=None, boxes=None) :
     allImages = generateDisplay(inp, boxes)
     views, genImages, _ = allImages
     genImages = unsqeeze4dim(genImages)[0]
-    views = views.cpu().numpy()
+    views = views.detach().cpu().numpy()
     nofIm = views.shape[0]
     for curim in range(nofIm) :
         if not DCfg.brick :
@@ -1350,54 +1495,100 @@ def calculateNorm(images) :
     toRet = torch.std_mean( noGapImages, dim=(-1,-2), keepdim=True )
     return toRet[0], toRet[1]
 
+epoch=initIfNew('epoch', 0)
+imer = initIfNew('iter', 0)
+minGEpoch = initIfNew('minGEpoch')
+minGLoss = initIfNew('lastGLoss')
+startFrom = initIfNew('startFrom', 0)
 
-def saveCheckPoint(path, epoch, iterations, minGEpoch, lastGLoss,
-                   generator, discriminator,
-                   optimizerGen=None, optimizerDis=None,
-                   schedulerGen=None, schedulerDis=None,
-                   startFrom=0, interimRes=TrainResClass()) :
+
+def saveCheckPoint(path, epoch=epoch, imer=imer, interimRes=TrainResClass()) :
+    global  minGEpoch, minGLoss, generator, discriminator, optimizers_G, optimizers_D
     checkPoint = {}
     checkPoint['epoch'] = epoch
-    checkPoint['iterations'] = iterations
+    checkPoint['iterations'] = imer
     checkPoint['minGEpoch'] = minGEpoch
-    checkPoint['lastGLoss'] = lastGLoss
+    checkPoint['lastGLoss'] = minGLoss
     checkPoint['startFrom'] = startFrom
     checkPoint['generator'] = generator.state_dict()
-    checkPoint['discriminator'] = discriminator.state_dict()
-    if not optimizerGen is None :
-        checkPoint['optimizerGen'] = optimizerGen.state_dict()
-    if not schedulerGen is None :
-        checkPoint['schedulerGen'] = schedulerGen.state_dict()
-    if not optimizerDis is None :
-        checkPoint['optimizerDis'] = optimizerDis.state_dict()
-    if not schedulerDis is None :
-        checkPoint['schedulerDis'] = schedulerDis.state_dict()
+    if discriminator is not None :
+        checkPoint['discriminator'] = discriminator.state_dict()
+    for idx, optim in enumerate(optimizers_G) :
+        checkPoint[f"optimizerGen_{idx}"] = optim.state_dict()
+    for idx, optim in enumerate(optimizers_D) :
+        checkPoint[f"optimizerDis_{idx}"] = optim.state_dict()
     checkPoint['resAcc'] = interimRes
     torch.save(checkPoint, path)
 
 
-def loadCheckPoint(path, generator, discriminator,
-                   optimizerGen=None, optimizerDis=None,
-                   schedulerGen=None, schedulerDis=None) :
-    checkPoint = torch.load(path, map_location=TCfg.device, weights_only=False)
+def loadCheckPoint(path) :
+    global minGEpoch, minGLoss, generator, discriminator, optimizers_G, optimizers_D
+    checkPoint = torch.load(path, map_location='cpu', weights_only=False)
     epoch = checkPoint['epoch']
     iterations = checkPoint['iterations']
     minGEpoch = checkPoint['minGEpoch']
-    lastGLoss = checkPoint['lastGLoss']
+    minGLoss = checkPoint['lastGLoss']
     startFrom = checkPoint['startFrom'] if 'startFrom' in checkPoint else 0
     generator.load_state_dict(checkPoint['generator'])
-    discriminator.load_state_dict(checkPoint['discriminator'])
-    if not optimizerGen is None :
-        optimizerGen.load_state_dict(checkPoint['optimizerGen'])
-    if not schedulerGen is None :
-        schedulerGen.load_state_dict(checkPoint['schedulerGen'])
-    if not optimizerDis is None :
-        optimizerDis.load_state_dict(checkPoint['optimizerDis'])
-    if not schedulerDis is None :
-        schedulerDis.load_state_dict(checkPoint['schedulerDis'])
+    if discriminator is not None :
+        discriminator.load_state_dict(checkPoint['discriminator'])
+    for idx, optim in enumerate(optimizers_G) :
+        key = f"optimizerGen_{idx}"
+        if key in checkPoint :
+            try : optim.load_state_dict(checkPoint[key])
+            except :
+                print("Failed to load optimizer " + key)
+                continue
+        else :
+            print("No optimizer " + key + " in chekpoint")
+    for idx, optim in enumerate(optimizers_D) :
+        key = f"optimizerDis_{idx}"
+        if key in checkPoint :
+            try : optim.load_state_dict(checkPoint[key])
+            except :
+                print("Failed to load optimizer " + key)
+                continue
+        else :
+            print("No optimizer " + key + " in chekpoint")
     interimRes = checkPoint['resAcc'] if 'resAcc' in checkPoint else TrainResClass()
+    return epoch, iterations, minGEpoch, minGLoss, startFrom, interimRes
 
-    return epoch, iterations, minGEpoch, lastGLoss, startFrom, interimRes
+
+def restoreCheckpoint(path=None, logDir=None) :
+    if logDir is None :
+        logDir = TCfg.logDir
+    if path is None :
+        if os.path.exists(logDir) :
+            raise Exception(f"Starting new experiment with existing log directory \"{logDir}\"."
+                            " Remove it .")
+        try : os.remove(TCfg.historyHDF)
+        except : pass
+        return 0, 0, 0, None, 0, TrainResClass()
+    else :
+        return loadCheckPoint(path)
+
+
+def saveModels(path="") :
+    save_model(generator, model_path = ( path if path else f"model_{TCfg.exec}" ) + "_gen.pt" )
+    if discriminator is not None :
+        save_model(discriminator, model_path = ( path if path else f"model_{TCfg.exec}" ) + "_dis.pt"  )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1411,34 +1602,56 @@ def doTrainGen(locals) :
     return True
 
 
+lrCoeff = 1
+minimal_criteria = None
+def updateCriteria(saveMe=True) :
+    global minimal_criteria, lrCoeff
+    image = refImages[[2],...]
+    box = refBoxes[2]
+    rng = np.s_[0, 0, box : box + DCfg.sinoSh[-1], DCfg.gapRngX]
+    with torch.no_grad() :
+        genImage = generator.forward(image).to(image.device)
+        crit =  MSE(genImage[rng], image[rng]).mean().item() / metrices['MSE'].norm
+        writer.add_scalars("Aux", {'Crit': crit}, imer)
+        if minimal_criteria is None or (crit < minimal_criteria) :
+            minimal_criteria = crit
+            print(f"New best criteria: {crit:.3e}.")
+            if saveMe :
+                #lrCoeff = 1
+                saveCheckPoint(f"checkPoint_{TCfg.exec}_mini.pth", epoch=epoch-1, imer=imer)
+                preImage = generator.lowResProc(image).to(image.device)
+                svImage = torch.cat( [ normalizeImages(img)[0].cpu() for img in
+                                      ( image, preImage, genImage, genImage-preImage, image - genImage ) ] , dim=-1 )
+                tifffile.imwrite(f"mini_{TCfg.exec}.tif", svImage[0,0,...].transpose(-1,-2).numpy())
+    return crit
+
+
+
 def train_step(allImages):
     global skipGen, skipDis
 
     trainRes = TrainResClass()
     allImages, _ = unsqeeze4dim(allImages)
+    allImages.requires_grad_(True)
     nofAllIm = allImages.shape[0]
 
     while trainRes.nofIm < nofAllIm :
 
-        freeGPUmem()
-        freeGPUmem()
-
         images = allImages[ trainRes.nofIm : trainRes.nofIm + TCfg.batchSize , ... ]
-        #fakeImages = images.clone().detach()
         nofIm = images.shape[0]
         trainRes.nofIm += nofIm
-        #images, _ = unsqeeze4dim(images.to(TCfg.device))
         batchSplit = TCfg.batchSplit if TCfg.batchSplit > 1 else 1
         subBatchSize = nofIm // batchSplit
 
         # train discriminator
-        if metrices['Adv'].weight > 0 :
+        if 'Adv' in metrices and  metrices['Adv'].weight > 0 :
             if repeatDis :
                 for _ in range(repeatDis) :
-                    optimizer_D.zero_grad(set_to_none=False)
+                    for optim in optimizers_D :
+                        optim.zero_grad(set_to_none=False)
                     for i in range(batchSplit) :
                         subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
-                        subImages = images[subRange,...]#.clone().detach()
+                        subImages = images[subRange,...]
                         with torch.no_grad() : # create fake images to be descriminated
                             subFakeImages = generator.generateImages(subImages)
                         #subImages.requires_grad = True
@@ -1448,10 +1661,11 @@ def train_step(allImages):
                         trainRes.predFake += probs[subBatchSize:,0].sum().item() / repeatDis
                         trainRes.lossD += disLoss.item() / repeatDis
                         if doTrainDis(locals()) :
-                            disLoss /= subBatchSize
+                            disLoss = disLoss / subBatchSize
                             disLoss.backward()
-                    optimizer_D.step()
-                    optimizer_D.zero_grad(set_to_none=True)
+                    for optim in optimizers_G :
+                        optim.step()
+                        optim.zero_grad(set_to_none=True)
             else :
                 with torch.no_grad() : # create fake images to be descriminated
                     for i in range(batchSplit) :
@@ -1463,40 +1677,33 @@ def train_step(allImages):
                         trainRes.predFake += probs[subBatchSize:,0].sum().item()
                         trainRes.lossD += disLoss.item()
 
-
-
         # train generator
         for _ in range(repeatGen) :
             for optim in optimizers_G :
                 optim.zero_grad(set_to_none=False)
             for i in range(batchSplit) :
                 subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
-                subImages = images[subRange,...]#.clone().detach()
-                #subImages.requires_grad = True
+                subImages = images[subRange,...]
+                #with torch.no_grad():
+                #    subFakeImages = fillTheGap(subImages, torch.zeros_like(subImages[:,[0],*generator.cfg.gapRng]))
                 subFakeImages = generator.generateImages(subImages)
-                #subFakeImages = fakeImages[subRange,...]
-                #subFakeImages[DCfg.gapRng] = generator.generatePatches(subImages)
                 genLoss, indLosses = loss_Gen(subImages, subFakeImages)
                 trainRes.lossG += genLoss.item() / repeatGen
                 for key in indLosses.keys() :
                     trainRes.metrices[key] += indLosses[key] / repeatGen
-                genLoss /= subBatchSize
+                genLoss = genLoss / subBatchSize
                 if doTrainGen(locals()) :
                     genLoss.backward()
             for optim in optimizers_G :
                 optim.step()
                 optim.zero_grad(set_to_none=True)
 
+    if minimal_criteria is not None :
+        updateCriteria()
 
     return trainRes
 
 
-epoch=initIfNew('epoch', 0)
-iter = initIfNew('iter', 0)
-imer = initIfNew('iter', 0)
-minGEpoch = initIfNew('minGEpoch')
-minGLoss = initIfNew('lastGLoss')
-startFrom = initIfNew('startFrom', 0)
 
 def beforeEachEpoch(locals) :
     return
@@ -1513,9 +1720,12 @@ def afterReport(locals) :
 trainLoader=None
 testLoader=None
 resAcc = TrainResClass()
+revert_minimal_criteria = None
+correlatedCriteriaFile = None
 
 def train(savedCheckPoint):
-    global epoch, minGLoss, minGEpoch, iter, startFrom, imer, resAcc
+    global epoch, minGLoss, minGEpoch, startFrom, imer, resAcc
+    global minimal_criteria, revert_minimal_criteria, correlatedCriteriaFile, lrCoeff
     global trainLoader, testLoader, testSet, refImages, minMetrices, maxMetrices
     lastGLoss = minGLoss
 
@@ -1528,29 +1738,40 @@ def train(savedCheckPoint):
 
         trainLoader = createDataLoader(trainSet, num_workers=TCfg.num_workers)
         testLoader = createDataLoader(testSet, num_workers=TCfg.num_workers)
-        generator.train()
-        discriminator.train()
+        #generator.train()
+        #discriminator.train()
         resAcc = TrainResClass()
         updAcc = TrainResClass()
         _ = trackExtremes()
-
 
         for it , data in tqdm.tqdm(enumerate(trainLoader), total=int(len(trainLoader))):
             if startFrom :
                 startFrom -= 1
                 continue
-            iter += 1
             images = data[0]
             imer += images.shape[0]
+
+            if correlatedCriteriaFile is not None :
+                critBefore = updateCriteria(saveMe=False)
+
             trainRes = train_step(images)
             resAcc += trainRes
             updAcc += trainRes
+
+            if correlatedCriteriaFile is not None :
+                critAfter= updateCriteria(saveMe=False)
+                if critAfter < critBefore :
+                    with open(correlatedCriteriaFile, 'a') as f :
+                        print(f"# {critBefore-critAfter:.6e}", file=f)
+                        prnData = torch.stack(data[1]).transpose(0,1)
+                        for row in range(prnData.shape[0]) :
+                            print(prnData[row,...].numpy(), file=f)
 
             #if True:
             if time.time() - lastUpdateTime > 60  or imer == images.shape[0]:
 
                 # generate previews
-                generator.eval()
+                #generator.eval()
                 if None in [ minMetrices, maxMetrices ] or \
                    not 'loss' in minMetrices or not 'loss' in maxMetrices or \
                    None in [ minMetrices['loss'], maxMetrices['loss'] ] :
@@ -1558,33 +1779,30 @@ def train(savedCheckPoint):
                 else :
                     extImages = torch.stack((maxMetrices['loss'][1],minMetrices['loss'][1]))
                 extViews, extGen, _ = generateDisplay(extImages)
-                extViews = extViews.cpu().numpy()
+                extViews = extViews.detach().cpu().numpy()
                 refViews, genImages, _ = generateDisplay()
-                refViews = refViews.cpu().numpy()
+                refViews = refViews.detach().cpu().numpy()
                 rndIndeces = random.sample(range(images.shape[0]), 2)
                 rndViews, rndGen, _ = generateDisplay(images[rndIndeces,...])
-                rndViews = rndViews.cpu().numpy()
-                generator.train()
+                rndViews = rndViews.detach().cpu().numpy()
+                #generator.train()
 
                 IPython.display.clear_output(wait=True)
                 beforeReport(locals())
                 print(f"Epoch: {epoch} ({minGEpoch}). ", end=' ')
                 print(updAcc)
                 updAcc *= 1/updAcc.nofIm
-                writer.add_scalars("Losses per iter",
-                                   {'Dis': updAcc.lossD
-                                   ,'Gen': updAcc.lossG
-                                   #,'Adv' : updAcc.metrices['Adv']
-                                   }, imer )
                 for key in updAcc.metrices.keys() :
                     if metrices[key].norm > 0 :
                         writer.add_scalars("Metrices per iter", {key : updAcc.metrices[key],}, imer )
-                #writer.add_scalars("Metrices per iter", updAcc.metrices, imer )
-                writer.add_scalars("Probs per iter",
-                                   {'Ref':updAcc.predReal
-                                   ,'Gen':updAcc.predFake
-                                   #,'Pre':trainRes.predGen
-                                   }, imer )
+                writer.add_scalars("Losses per iter", {'Gen': updAcc.lossG}, imer )
+                if discriminator is not None :
+                    writer.add_scalars("Losses per iter", {'Dis': updAcc.lossD}, imer )
+                    writer.add_scalars("Probs per iter",
+                                       {'Ref':updAcc.predReal
+                                       ,'Gen':updAcc.predFake
+                                       #,'Pre':trainRes.predGen
+                                       }, imer )
 
                 subLay = (1,1)
                 def addSubplot(pos, img, sym=True) :
@@ -1599,9 +1817,9 @@ def train(savedCheckPoint):
                     subLay = (3,1)
                     plt.figure(frameon=True, layout='compressed', facecolor=(0,0.3,0.5))
                     #plt.subplots_adjust(hspace=0.5, wspace=0)
-                    addSubplot(1, rndGen[0,0,...].transpose(-1,-2).cpu().numpy(), False)
-                    addSubplot(2, genImages[0,0,...].transpose(-1,-2).cpu().numpy(), False)
-                    addSubplot(3, extGen[0,0,...].transpose(-1,-2).cpu().numpy(), False)
+                    addSubplot(1, rndGen[0,0,...].transpose(-1,-2).detach().cpu().numpy(), False)
+                    addSubplot(2, genImages[0,0,...].transpose(-1,-2).detach().cpu().numpy(), False)
+                    addSubplot(3, extGen[0,0,...].transpose(-1,-2).detach().cpu().numpy(), False)
                     plt.show()
 
                 subLay = (2,5)
@@ -1626,55 +1844,62 @@ def train(savedCheckPoint):
                 _ = trackExtremes()
 
             if time.time() - lastSaveTime > 3600 :
+
                 lastSaveTime = time.time()
-                saveCheckPoint(savedCheckPoint+"_hourly.pth",
-                               epoch-1, imer, minGEpoch, minGLoss,
-                               generator, discriminator,
-                               optimizer_G, optimizer_D,
-                               startFrom=it, interimRes=resAcc)
+                saveCheckPoint(savedCheckPoint+"_hourly.pth", epoch=epoch-1, imer=imer, interimRes=resAcc)
                 saveModels(f"model_{TCfg.exec}_hourly")
+
+                if minimal_criteria is not None :
+                    if revert_minimal_criteria is not None :
+                        sv_lr = schedulers_G[0].get_last_lr()[0] / TCfg.learningRateG
+                        #createOptimizers()
+                        freeGPUmem()
+                        _ = restoreCheckpoint(f"checkPoint_{TCfg.exec}_mini.pth")
+                        freeGPUmem()
+                        for optim in optimizers_G :
+                            torch.optim.lr_scheduler.LambdaLR(optim, lambda epoch:sv_lr).step()
+                        freeGPUmem()
+                    #elif revert_minimal_criteria is not None :
+                    #    revert_minimal_criteria = minimal_criteria
 
 
         print(resAcc)
         resAcc *= 1/resAcc.nofIm
-        writer.add_scalars("Losses per epoch",
-                           {'Dis': resAcc.lossD
-                           ,'Gen': resAcc.lossG
-                           #,'Adv' : resAcc.metrices['Adv']
-                           }, epoch )
-        #writer.add_scalars("Metrices per epoch", resAcc.metrices, epoch )
         for key in resAcc.metrices.keys() :
             if metrices[key].norm > 0 :
                 writer.add_scalars("Metrices per epoch", {key : resAcc.metrices[key],}, epoch )
-        writer.add_scalars("Probs per epoch",
-                           {'Ref':resAcc.predReal
-                           ,'Gen':resAcc.predFake
-                           #,'Pre':trainRes.predGen
-                           }, epoch )
+        writer.add_scalars("Losses per epoch",{'Gen': resAcc.lossG,}, epoch )
+        if discriminator is not None :
+            writer.add_scalars("Losses per epoch",{'Dis': resAcc.lossD}, epoch )
+            writer.add_scalars("Probs per epoch",
+                               {'Ref':resAcc.predReal
+                               ,'Gen':resAcc.predFake
+                               #,'Pre':trainRes.predGen
+                               }, epoch )
 
-
+        generator.train()
+        print("Reference images in train mode:")
+        displayImages()
         generator.eval()
+        print("Reference images in eval mode:")
         displayImages()
         try :
             resTest = summarizeMe(testLoader, False)
             resTest *= 1/resTest.nofIm
-            writer.add_scalars("Losses epoch test",
-                {'Dis': resTest.lossD
-                ,'Gen': resTest.lossG
-                #,'Adv' : resTest.metrices['Adv']
-                }, epoch )
             for key in resTest.metrices.keys() :
                 if metrices[key].norm > 0 :
                     writer.add_scalars("Metrices epoch test", {key : resTest.metrices[key],}, epoch )
-            writer.add_scalars("Probs epoch test",
-                {'Ref':resTest.predReal
-                ,'Gen':resTest.predFake
-                #,'Pre':trainRes.predGen
-                }, epoch )
+            writer.add_scalars("Losses epoch test",{'Gen': resTest.lossG}, epoch )
+            if discriminator is not None :
+                writer.add_scalars("Losses epoch test",{'Dis': resTest.lossD}, epoch )
+                writer.add_scalars("Probs epoch test",
+                    {'Ref':resTest.predReal
+                    ,'Gen':resTest.predFake
+                    }, epoch )
         except Exception as e:
             continue
 
-        generator.train()
+        #generator.train()
 
 
         lastGLoss = resTest.lossG # Rec_test
@@ -1683,10 +1908,7 @@ def train(savedCheckPoint):
             minGEpoch = epoch
         saveModels()
         os.system(f"mv {savedCheckPoint}.pth {savedCheckPoint}_previous.pth")
-        saveCheckPoint(savedCheckPoint+".pth",
-                       epoch, imer, minGEpoch, minGLoss,
-                       generator, discriminator,
-                       optimizer_G, optimizer_D)
+        saveCheckPoint(savedCheckPoint+".pth", epoch=epoch, imer=imer)
         if minGEpoch == epoch :
             os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_best.pth")
             os.system(f"cp {savedCheckPoint}_previous.pth {savedCheckPoint}_beforebest.pth")
@@ -1702,6 +1924,9 @@ def train(savedCheckPoint):
 
 
 def freeGPUmem() :
+    gc.collect()
+    with torch.no_grad():
+        torch.cuda.empty_cache()
     gc.collect()
     with torch.no_grad():
         torch.cuda.empty_cache()
