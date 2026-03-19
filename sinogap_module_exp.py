@@ -35,7 +35,8 @@ from h5py import h5d
 import tifffile
 import tqdm
 
-import ssim
+import torchmetrics.image
+#import ssim
 from eagle_loss import Eagle_Loss
 
 
@@ -597,8 +598,10 @@ def normalizeImages(images) :
     images = (images - means) / stds # normalize per image
     return images, (orgDims, stds, means)
 
-def reNormalizeImages(images, norms) :
-    images = images * norms[1][:,[0],...].to(images.device) + norms[2][:,[0],...].to(images.device) # renormalise
+def reNormalizeImages(images, norms, stdOnly=False) :
+    images = images * norms[1][:,[0],...].to(images.device)
+    if not stdOnly :
+        images = images + norms[2][:,[0],...].to(images.device) # renormalise
     images = squeezeOrg(images, norms[0])
     return images
 
@@ -716,17 +719,15 @@ def fillTheGap(images, gap) :
 
 
 
+class SubTemplate(nn.Module):
 
-class SubGeneratorTemplate(nn.Module):
-
-    def __init__(self, gapW, brick, batchNorm=True, inChannels=1):
-        super(SubGeneratorTemplate, self).__init__()
+    def __init__(self, gapW, brick):
+        super().__init__()
         self.cfg = DCfgClass(gapW, brick)
         self.baseChannels = None
         self.baseChannelsOther = None
-        self.inChannels = inChannels
-        self.amplitude = 4
-        self.batchNorm = batchNorm
+        self.lastTouch = None
+        self.batchNorm = False
 
     def device(self):
         return next(self.lastTouch.parameters()).device
@@ -763,6 +764,23 @@ class SubGeneratorTemplate(nn.Module):
                                kernel, stride=stride, norm=norm)
         return (block1, block2)
 
+    def forward(self, images):
+        raise Exception("this is not for direct use")
+
+
+
+
+
+class SubGeneratorTemplate(SubTemplate):
+
+
+    def __init__(self, gapW, brick, batchNorm=True, inChannels=1):
+        super().__init__(gapW, brick)
+        self.inChannels = inChannels
+        self.amplitude = 4
+        self.batchNorm = batchNorm
+
+
     def createAttic(self, encoders) :
         smpl = torch.zeros((1, self.inChannels, *self.cfg.sinoSh))
         for encoder in encoders :
@@ -779,6 +797,7 @@ class SubGeneratorTemplate(nn.Module):
             nn.Unflatten(1, encSh[1:]),
         )
         return toRet
+
 
     def decblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=1, outputPadding=None) :
         if norm is None :
@@ -799,6 +818,7 @@ class SubGeneratorTemplate(nn.Module):
         fillWheights(layers)
         return torch.nn.Sequential(*layers)
 
+
     def decFloor(self, chOut, reduce, kernel, stride=1, norm=None, other=1) :
         block1 = self.decblock( reduce*2*chOut*(self.baseChannels + other * self.baseChannelsOther),
                                 chOut*self.baseChannels,
@@ -818,7 +838,7 @@ class SubGeneratorTemplate(nn.Module):
         return toRet
 
 
-    def createLatentGenerator(self) :
+    def createLatentGenerator(self, decoders=None) :
         latInSh = self.fcLink[-1].unflattened_size[-2:]
         latInSh = (1,self.baseChannels,*latInSh)
         latInChannels = math.prod(latInSh)
@@ -827,18 +847,34 @@ class SubGeneratorTemplate(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Unflatten(1, latInSh[1:]),
         )
-        for decoder in self.decoders :
+        if decoders is None :
+            decoders = self.decoders
+        for decoder in decoders :
             conv = decoder[0]
-            toRet.append( self.decblock(-self.baseChannels,-self.baseChannels,
+            toRet.append( self.decblock(self.baseChannels, self.baseChannels,
                                         kernel=conv.kernel_size,
                                         stride=conv.stride,
                                         norm=False,
                                         padding=conv.padding,
                                         outputPadding=conv.output_padding
                                         ) )
-        toRet.append(( self.encblock(-self.baseChannels, -1, kernel=1, padding=0, norm=False) ))
+        toRet.append(( self.encblock(self.baseChannels, 1, kernel=1, padding=0, norm=False) ))
         fillWheights(toRet)
         return toRet
+
+
+    def addLatent(self, images) :
+        if self.inChannels == images.shape[1] :
+            return images
+        if isinstance(self.latentGenerator, float) :
+            lSh = list(images.shape)
+            lSh[1] = self.inChannels - lSh[1]
+            latentChannels = self.latentGenerator * torch.randn( lSh, device=images.device )
+        else :
+            latentIn = torch.randn( (images.shape[0], self.latentGenerator[0].in_features), device=images.device )
+            latentChannels = self.latentGenerator(latentIn)
+        latentChannels, _ = normalizeImages(latentChannels)
+        return torch.cat( (images, latentChannels), dim=1 )
 
 
     def generateImages(self, images, noises=None) :
@@ -846,16 +882,15 @@ class SubGeneratorTemplate(nn.Module):
 
 
     def forward(self, images):
-        return images
+        raise Exception("this is not for direct use")
 
 
 class GeneratorTemplate(SubGeneratorTemplate):
 
     def __init__(self, gapW, batchNorm=True):
-        super(GeneratorTemplate, self).__init__(gapW, False, batchNorm)
+        super().__init__(gapW, False, batchNorm)
         self.brickGenerator = None
         self.stipeGenerator = None
-        self.finalGenerator = None
 
 
     def lowResProc(self, images) :
@@ -892,7 +927,9 @@ class GeneratorTemplate(SubGeneratorTemplate):
             stripe_upTrainTail.append( decoder( torch.cat( (stripe_upTrainTail[-1], stripe_dwTrainTail[-1-level]), dim=1 ) ) )
         return stripe_upTrainTail[-1]
 
+
     def forward(self, images):
+
 
         # preform inputs
         lrImages = self.lowResProc(images)
@@ -905,7 +942,8 @@ class GeneratorTemplate(SubGeneratorTemplate):
                                     lrImages
                                 )  ], dim=1)
         stripeIn, stripe_norms = normalizeImages(stripeIn)
-        lrImagesNormalized = stripeIn[:,[-1],...]
+        #lrImagesNormalized = stripeIn[:,[-1],...]
+        stripeIn = self.stripeGenerator.addLatent(stripeIn)
         stripe_dwTrain = [stripeIn,]
 
         lrImagesBricked = stripe2bricks(lrImages)
@@ -918,7 +956,8 @@ class GeneratorTemplate(SubGeneratorTemplate):
                                     lrImagesBricked
                                 ) ], dim=1)
         bricksIn, bricks_norms = normalizeImages(bricksIn)
-        lrImagesBrickedNormalized = bricksIn[:,[-1],...]
+        #lrImagesBrickedNormalized = bricksIn[:,[-1],...]
+        bricksIn = self.brickGenerator.addLatent(bricksIn)
         bricks_dwTrain = [bricksIn,]
 
         stripeBricked_dwTrain = [torch.empty((bricksIn.shape[0],0,bricksIn.shape[2],bricksIn.shape[3])),]
@@ -964,27 +1003,25 @@ class GeneratorTemplate(SubGeneratorTemplate):
             stripe_upTrain.append( stripe_decoder(stripeI) )
 
         # last touches
-        stripe_results = self.stripeGenerator.lastTouch(torch.cat( [ img.to(self.stripeGenerator.device()) for img in (
+        stripeI = torch.cat( [ img.to(self.stripeGenerator.device()) for img in (
                 stripe_upTrain[-1],
                 stripeIn,
                 bricks2stripe(bricks_upTrain[-1]),
-            ) ], dim=1 ))
-        stripe_results = stripe_results * self.stripeGenerator.amplitude + \
-            lrImagesNormalized.to(self.stripeGenerator.device())
-        stripe_results = reNormalizeImages(stripe_results, stripe_norms)
+            ) ], dim=1 )
+        stripe_results = self.stripeGenerator.lastTouch(stripeI) * self.stripeGenerator.amplitude
+        stripe_results = reNormalizeImages(stripe_results, stripe_norms, stdOnly=True)
 
-        bricks_results = self.brickGenerator.lastTouch(torch.cat( [ img.to(self.brickGenerator.device()) for img in (
+        bricksI = torch.cat( [ img.to(self.brickGenerator.device()) for img in (
                 bricks_upTrain[-1],
                 bricksIn,
                 stripe2bricks(stripe_upTrain[-1]),
-            ) ], dim=1 ))
-        bricks_results = bricks_results * self.brickGenerator.amplitude + \
-            lrImagesBrickedNormalized.to(self.brickGenerator.device())
-        bricks_results = reNormalizeImages(bricks_results, bricks_norms)
+            ) ], dim=1 )
+        bricks_results = self.brickGenerator.lastTouch(bricksI) * self.brickGenerator.amplitude
+        bricks_results = reNormalizeImages(bricks_results, bricks_norms, stdOnly=True)
         bricks_results = bricks2stripe(bricks_results)
 
         # final result
-        results =  ( bricks_results + stripe_results.to(self.brickGenerator.device()) ) / 2
+        results = lrImages + bricks_results.to(lrImages.device) + stripe_results.to(lrImages.device)
         return results
 
 
@@ -993,49 +1030,97 @@ generator = initIfNew('generator')
 lowResGenerators = initIfNew('lowResGenerators', {})
 
 
-class DiscriminatorTemplate(nn.Module):
 
-    def __init__(self):
-        super(DiscriminatorTemplate, self).__init__()
+class SubDiscriminatorTemplate(SubTemplate):
 
-    def encblock(self, chIn, chOut, kernel, stride=1, norm=False, padding=1) :
-        chIn = chIn*self.baseChannels if chIn >= 0 else -chIn
-        chOut = chOut*self.baseChannels if chOut >= 0 else -chOut
-        layers = []
-        layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias = not norm,
-                                padding=padding, padding_mode='reflect')  )
-        if norm :
-            layers.append(nn.BatchNorm2d(chOut))
-        layers.append(nn.LeakyReLU(0.2))
-        fillWheights(layers)
+    def __init__(self, gapW, brick):
+        super().__init__(gapW, brick)
+        self.baseChannels = None
+        self.baseChannelsOther = None
+        self.inChannels = 1
+
+
+    def createBody(self, encoders) :
+        smpl = torch.zeros((1, 1, *self.cfg.sinoSh))
+        for encoder in encoders :
+            smpl = torch.zeros((1, encoder[0].in_channels, *smpl.shape[2:]))
+            smpl = encoder(smpl)
+        encSh = smpl.shape
+        leftChannels = math.prod(encSh)
+        layers = [nn.Flatten(),]
+        while leftChannels > 1 :
+            outChannels = max(leftChannels//4, 1)
+            layers.append(nn.Linear(leftChannels, outChannels))
+            layers.append(nn.LeakyReLU(0.2))
+            leftChannels = outChannels
         return torch.nn.Sequential(*layers)
 
-    def createHead(self, chMid, sinoSh=None) :
-        if sinoSh is None :
-            sinoSh = DCfg.sinoSh
-        encSh = self.body(torch.zeros((1,1,*sinoSh))).shape
-        linChannels = math.prod(encSh)
-        chMid *= self.baseChannels
-        toRet = nn.Sequential(
-            nn.Flatten(),
-            #nn.Dropout(0.4),
-            nn.Linear(linChannels, chMid),
-            #nn.Linear(linChannels, 1),
-            nn.LeakyReLU(0.2),
-            #nn.Dropout(0.4),
-            nn.Linear(chMid, 1),
+    def createMixer(self) :
+        ratio = self.cfg.sinoSh[-2] // self.cfg.sinoSh[-1]
+        inChans = 2*ratio
+        return torch.nn.Sequential(
+            nn.Linear(inChans, 1),
             nn.Sigmoid(),
         )
-        fillWheights(toRet)
-        return toRet
 
     def forward(self, images):
-        myDevice = next(self.parameters()).device
-        images = images.to(myDevice)
-        images, _ = normalizeImages(images)
-        convRes = self.body(images)
-        res = self.head(convRes)
-        return res
+        raise Exception("this is not for direct use")
+
+
+
+class DiscriminatorTemplate(SubDiscriminatorTemplate):
+
+    def __init__(self, gapW):
+        super().__init__(gapW, False)
+        self.bricksDiscriminator = None
+        self.stripeDiscriminator = None
+
+    def procTail(self, stripe_starter, bricksStriped_starter,
+                       bricks_starter, stripeBricked_starter) :
+        stripe_dwTrainTail = [stripe_starter,]
+        for encoder in self.stripeDiscriminator.tailEncoders  :
+            stripe_dwTrainTail.append(encoder(stripe_dwTrainTail[-1]))
+        # stripes linear link
+        return self.stripeDiscriminator.lastTouch(stripe_dwTrainTail[-1])
+
+
+    def forward(self, images):
+
+        # preform inputs
+        stripeIn = images
+        stripeIn = normalizeImages(stripeIn)[0].to(self.stripeDiscriminator.device())
+        stripe_dwTrain = [stripeIn,]
+
+        bricksIn = stripe2bricks(images)
+        bricksIn = normalizeImages(bricksIn)[0].to(self.bricksDiscriminator.device())
+        bricks_dwTrain = [bricksIn,]
+
+        stripeBricked_dwTrain = [torch.empty((bricksIn.shape[0],0,bricksIn.shape[2],bricksIn.shape[3])),]
+        bricksStriped_dwTrain = [torch.empty((stripeIn.shape[0],0,stripeIn.shape[2],stripeIn.shape[3])),]
+
+        # encoding
+        for level, (brick_encoder, stripe_encoder) in enumerate( zip(self.bricksDiscriminator.encoders, self.stripeDiscriminator.headEncoders) ):
+
+            bricksI = torch.cat( [ bricks_dwTrain[-1], stripeBricked_dwTrain[-1].to(self.bricksDiscriminator.device()) ], dim=1 )
+            bricks_dwTrain.append( brick_encoder( bricksI ) )
+            bricksStriped_dwTrain.append( bricks2stripe(bricks_dwTrain[-1]) )
+
+            stripeI = torch.cat( [ stripe_dwTrain[-1], bricksStriped_dwTrain[-2].to(self.stripeDiscriminator.device()) ], dim=1 )
+            stripe_dwTrain.append( stripe_encoder(stripeI))
+            stripeBricked_dwTrain.append( stripe2bricks(stripe_dwTrain[-1]) )
+
+        # stripes tail
+        stripe_res = self.procTail(stripe_dwTrain[-1], bricksStriped_dwTrain[-1],
+                               bricks_dwTrain[-1], stripeBricked_dwTrain[-1], )
+        # bricks linear link
+        bricks_res = self.bricksDiscriminator.lastTouch(bricks_dwTrain[-1])
+        bricks_res = bricks_res.view(stripe_res.shape[0],-1)
+
+        results = torch.cat( [stripe_res, bricks_res], dim=1 )
+        results = self.stripeDiscriminator.mixer(results)
+        return results
+
+
 
 discriminator = initIfNew('discriminator')
 
@@ -1165,21 +1250,37 @@ def loss_L1LN(p_true, p_pred):
     stds = 1e-7 + calculateNorm(p_true)[0].view([-1])
     return rawLoss / stds
 
-SSIM = ssim.SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
+
+#SSIM = ssim.SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
+SSIM = torchmetrics.image.StructuralSimilarityIndexMeasure(
+    data_range=2.0, kernel_size=1, reduction = None)
 def loss_SSIM(p_true, p_pred):
     p_true, _ = unsqeeze4dim(p_true)
     p_pred, _ = unsqeeze4dim(p_pred)
     #return (1 - SSIM( p_true+0.5, p_pred+0.5 ) ) / 2
-    SSIM.to(p_true.device)
-    return (1 - SSIM( p_true, p_pred ) ) / 2
+    SSIM.to(p_pred.device)
+    return (1 - SSIM( p_true.to(p_pred.device), p_pred ) ) / 2
 
-MSSSIM = ssim.MS_SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
+#MSSSIM = ssim.MS_SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
+MSSSIM = torchmetrics.image.MultiScaleStructuralSimilarityIndexMeasure(
+    data_range=2.0, kernel_size=1, gaussian_kernel=False, reduction = None)
 def loss_MSSSIM(p_true, p_pred):
-    p_true, _ = unsqeeze4dim(p_true)
+    p_true, _ = unsqeeze4dim(p_true.to(p_pred.device))
     p_pred, _ = unsqeeze4dim(p_pred)
     #return (1 - MSSSIM( p_true+0.5, p_pred+0.5 ) ) / 2
-    MSSSIM.to(p_true.device)
+    MSSSIM.to(p_pred.device)
     return (1 - MSSSIM( p_true, p_pred ) ) / 2
+
+SSC = torchmetrics.image.SpatialCorrelationCoefficient(window_size=3)
+def loss_SCC(p_true, p_pred):
+    SSC.to(p_pred.device)
+    return 1 / ( 1e-7 + SSC(p_true[DCfg.gapRng].to(p_pred.device), p_pred[DCfg.gapRng]) )
+
+TV = torchmetrics.image.TotalVariation(reduction = None)
+def loss_TV(p_true, p_pred):
+    TV.to(p_pred.device)
+    return TV(p_true[DCfg.gapRng].to(p_pred.device) - p_pred[DCfg.gapRng])
+
 
 def loss_COR(p_true, p_pred):
     d_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
@@ -1302,7 +1403,7 @@ def updateExtremes(vector, key, p_true, p_pred) :
 
 
 
-def loss_Gen(p_true, p_pred):
+def loss_Gen(p_true, p_pred, advWeights=None):
     global metrices, minMetrices, maxMetrices
     myDev = p_pred.device
     p_true = p_true.to(myDev)
@@ -1313,6 +1414,8 @@ def loss_Gen(p_true, p_pred):
         if metrics.norm > 0 :
             with torch.set_grad_enabled( metrics.weight > 0 ) :
                 thisLoss = metrics.calculate(p_true, p_pred).to(myDev) / metrics.norm
+                if key == 'Adv' and advWeights is not None and (advWeights.shape[0] == p_pred.shape[0]) :
+                    thisLoss = thisLoss * advWeights.to(thisLoss.device).detach()
                 losses.append(thisLoss * metrics.weight)
                 sumweights += metrics.weight
                 individualLosses[key] = thisLoss.sum().item()
@@ -1644,7 +1747,9 @@ def train_step(allImages):
         subBatchSize = nofIm // batchSplit
 
         # train discriminator
+        advWeights = None
         if 'Adv' in metrices and  metrices['Adv'].weight > 0 :
+            advWeights = torch.zeros((nofIm,1), device = TCfg.device)
             if repeatDis :
                 for _ in range(repeatDis) :
                     for optim in optimizers_D :
@@ -1660,19 +1765,21 @@ def train_step(allImages):
                         trainRes.predReal += probs[:subBatchSize,0].sum().item() / repeatDis
                         trainRes.predFake += probs[subBatchSize:,0].sum().item() / repeatDis
                         trainRes.lossD += disLoss.item() / repeatDis
+                        advWeights[subRange,...] += ( (probs[ :subBatchSize , [0] ]+1e-7) / (probs[ subBatchSize: , [0] ]+1e-7) ).to(TCfg.device) -  1
                         if doTrainDis(locals()) :
                             disLoss = disLoss / subBatchSize
                             disLoss.backward()
                     for optim in optimizers_G :
                         optim.step()
                         optim.zero_grad(set_to_none=True)
+                advWeights /= repeatDis
             else :
                 with torch.no_grad() : # create fake images to be descriminated
                     for i in range(batchSplit) :
                         subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
                         subImages = images[subRange,...]#.clone().detach()
                         subFakeImages = generator.generateImages(subImages)
-                        disLoss, probs = loss_Dis(subImages, subFakeImages)
+                        disLoss, probs = loss_Dis(subImages, subFakeImages.detach())
                         trainRes.predReal += probs[:subBatchSize,0].sum().item()
                         trainRes.predFake += probs[subBatchSize:,0].sum().item()
                         trainRes.lossD += disLoss.item()
@@ -1687,7 +1794,7 @@ def train_step(allImages):
                 #with torch.no_grad():
                 #    subFakeImages = fillTheGap(subImages, torch.zeros_like(subImages[:,[0],*generator.cfg.gapRng]))
                 subFakeImages = generator.generateImages(subImages)
-                genLoss, indLosses = loss_Gen(subImages, subFakeImages)
+                genLoss, indLosses = loss_Gen(subImages, subFakeImages, advWeights)
                 trainRes.lossG += genLoss.item() / repeatGen
                 for key in indLosses.keys() :
                     trainRes.metrices[key] += indLosses[key] / repeatGen
@@ -1701,6 +1808,8 @@ def train_step(allImages):
     if minimal_criteria is not None :
         updateCriteria()
 
+    del genLoss
+    del indLosses
     return trainRes
 
 
@@ -1723,7 +1832,7 @@ resAcc = TrainResClass()
 revert_minimal_criteria = None
 correlatedCriteriaFile = None
 
-def train(savedCheckPoint):
+def train(savedCheckPoint, epochSize=None):
     global epoch, minGLoss, minGEpoch, startFrom, imer, resAcc
     global minimal_criteria, revert_minimal_criteria, correlatedCriteriaFile, lrCoeff
     global trainLoader, testLoader, testSet, refImages, minMetrices, maxMetrices
@@ -1742,9 +1851,14 @@ def train(savedCheckPoint):
         #discriminator.train()
         resAcc = TrainResClass()
         updAcc = TrainResClass()
-        _ = trackExtremes()
+        #_ = trackExtremes()
 
-        for it , data in tqdm.tqdm(enumerate(trainLoader), total=int(len(trainLoader))):
+        total = len(trainLoader)
+        if epochSize is not None :
+            total = min(total,epochSize)
+        for it , data in tqdm.tqdm(enumerate(trainLoader), total=total):
+            if epochSize is not None and resAcc.nofIm >= epochSize * TCfg.batchSize :
+                break
             if startFrom :
                 startFrom -= 1
                 continue
@@ -1754,6 +1868,7 @@ def train(savedCheckPoint):
             if correlatedCriteriaFile is not None :
                 critBefore = updateCriteria(saveMe=False)
 
+            freeGPUmem()
             trainRes = train_step(images)
             resAcc += trainRes
             updAcc += trainRes
@@ -1841,7 +1956,7 @@ def train(savedCheckPoint):
                 afterReport(locals())
                 lastUpdateTime = time.time()
                 updAcc = TrainResClass()
-                _ = trackExtremes()
+                #_ = trackExtremes()
 
             if time.time() - lastSaveTime > 3600 :
 

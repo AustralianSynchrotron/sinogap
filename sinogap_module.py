@@ -12,6 +12,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum
 import glob
+import copy
 
 import math
 import statistics
@@ -544,6 +545,7 @@ listOfTrainData = [
     "19932.10_8093920_35keV",
     "19932.14_2442231_23keV",
     "19932.16_4193759_60keV",
+    "25763c.11_training"
 ]
 listOfTestData = [
     "19603a.Exposures.70keV_7m_Calf2_Threshold35keV_25ms_Take2",
@@ -640,6 +642,13 @@ def reNormalizeImages(images, norms) :
     return images
 
 
+def reinit(model, mean=0, std=1):
+    for param in model.parameters() :
+        torch.nn.init.normal_(param, mean=mean, std=std)
+
+def addnoise(model, std=1):
+    for param in model.parameters() :
+        param.data += torch.randn_like(param.data) * std
 
 
 
@@ -654,6 +663,7 @@ class SubGeneratorTemplate(nn.Module):
         self.inChannels = inChannels
         self.amplitude = 4
         self.batchNorm = batchNorm
+        self.fcLink = None
 
     def device(self):
         return next(self.lastTouch.parameters()).device
@@ -694,6 +704,7 @@ class SubGeneratorTemplate(nn.Module):
     def createFClink(self) :
         smpl = torch.zeros((1, self.inChannels, *self.cfg.sinoSh))
         for encoder in self.encoders :
+            smpl = torch.zeros((1, encoder[0].in_channels, *smpl.shape[2:]))
             smpl = encoder(smpl)
         encSh = smpl.shape
         linChannels = math.prod(encSh)
@@ -762,27 +773,21 @@ class SubGeneratorTemplate(nn.Module):
         return gapped
 
 
-    def preFill(self, images) :
-        images, orgDims = unsqeeze4dim(images)
-        if self.cfg.gapW == 2:
-            gap = torch.cat( [ ( 2*images[:,0:1,:,[self.cfg.gapRngX.start-1]] + images[:,0:1,:,[self.cfg.gapRngX.stop]   ] ) / 3,
-                               ( 2*images[:,0:1,:,[self.cfg.gapRngX.stop]   ] + images[:,0:1,:,[self.cfg.gapRngX.start-1]] ) / 3,
-                             ],
-                             dim=-1
-                           )
-            res = self.fillTheGap(images, gap)
-            #res = images.clone()
-            #res[...,self.cfg.gapRngX.start]  = ( 2*images[:,[0],:,self.cfg.gapRngX.start-1] + images[:,[0],:,self.cfg.gapRngX.stop] ) / 3
-            #res[...,self.cfg.gapRngX.stop-1] = ( 2*images[:,[0],:,self.cfg.gapRngX.stop] + images[:,[0],:,self.cfg.gapRngX.start-1] ) / 3
-        elif self.lowResGenerator is None :
-            res = images
-        else :
-            preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
-            res = self.lowResGenerator.forward(preImages)
-            res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
-        return squeezeOrg(res, orgDims)
+    def forward(self, images):
 
-    def dropIN(self,images) :
+        myDevice = self.device()
+        images = images.to(myDevice)
+        images, norms = normalizeImages(images)
+        if self.inChannels > images.shape[1] : # fill missing channels with noise
+            if isinstance(self.latentGenerator, float) :
+                lSh = list(images.shape)
+                lSh[1] = self.inChannels - lSh[1]
+                latentChannels = self.latentGenerator * torch.randn( lSh, device=images.device )
+            else :
+                latentIn = torch.randn( (images.shape[0], self.latentGenerator[0].in_features), device=images.device )
+                latentChannels = self.latentGenerator(latentIn)
+            images = torch.cat( (images, latentChannels), dim=1 )
+
         dwTrain = [images,]
         for encoder in self.encoders :
             dwTrain.append(encoder(dwTrain[-1]))
@@ -794,25 +799,9 @@ class SubGeneratorTemplate(nn.Module):
         for level, decoder in enumerate(self.decoders) :
             upTrain.append( decoder( torch.cat( (upTrain[-1], dwTrain[-1-level]), dim=1 ) ) )
             #print(f"{upTrain[-2].shape} -> {upTrain[-1].shape} ({dwTrain[-2-level].shape})")
-        res = self.lastTouch(torch.cat( (upTrain[-1], images ), dim=1 ))
-        return res * self.amplitude + images[:,[0],...]
+        results = self.lastTouch(torch.cat( (upTrain[-1], images ), dim=1 ))
 
-    def forward(self, images):
-        myDevice = self.device()
-        images = images.to(myDevice)
-        preImages = self.preFill(images)
-        images = self.fillTheGap(images, preImages)
-        images, norms = normalizeImages(images)
-        if self.inChannels > images.shape[1] : # fill missing channels with noise
-            if isinstance(self.latentGenerator, float) :
-                lSh = list(images.shape)
-                lSh[1] = self.inChannels - lSh[1]
-                latentChannels = self.latentGenerator * torch.randn( lSh, device=images.device )
-            else :
-                latentIn = torch.randn( (images.shape[0], self.latentGenerator[0].in_features), device=images.device )
-                latentChannels = self.latentGenerator(latentIn)
-            images = torch.cat( (images, latentChannels), dim=1 )
-        results = self.dropIN(images)
+        results = results * self.amplitude + images[:,[0],...]
         results = reNormalizeImages(results, norms)
         return results
 
@@ -820,9 +809,8 @@ class SubGeneratorTemplate(nn.Module):
 
 class GeneratorTemplate(SubGeneratorTemplate):
 
-    def __init__(self, gapW, batchNorm=True, inChannels=3):
-        super(GeneratorTemplate, self).__init__(gapW, False, batchNorm, inChannels=inChannels)
-        self.inChannels = inChannels
+    def __init__(self, gapW, batchNorm=True):
+        super(GeneratorTemplate, self).__init__(gapW, False, batchNorm)
         self.brickGenerator = None
         self.stipeGenerator = None
         self.finalGenerator = None
@@ -861,47 +849,74 @@ class GeneratorTemplate(SubGeneratorTemplate):
                             dim=-2)
         return stripes
 
+    def bricks22stripes(self, bricks) :
+        nofChans = self.cfg.sinoSh[-2] // self.brickGenerator.cfg.sinoSh[-2]
+        nofChans = nofChans * 2 - 1 # interleaved stripes
+        bricks = bricks.view(-1,nofChans,*self.brickGenerator.cfg.sinoSh)
+        nofIm = bricks.shape[0]
+        edge = self.brickGenerator.cfg.sinoSh[-2]//2
+        stripeM = bricks[:,0::2,:,:].reshape(nofIm,1,-1,self.brickGenerator.cfg.sinoSh[-1])
+        stripeP = bricks[:,1::2,:,:].reshape(nofIm,1,-1,self.brickGenerator.cfg.sinoSh[-1])
+        stripeP = torch.cat([ stripeM[:,:,:edge,:].to(bricks.device) ,
+                              stripeP,
+                              stripeM[:,:,-edge:,:].to(bricks.device)
+                            ], dim=-2)
+        return stripeM, stripeP
+
+
+    def lowResProc(self, images) :
+        images, orgDims = unsqeeze4dim(images)
+        if self.cfg.gapW == 2:
+            gap = torch.cat( [ ( 2*images[:,0:1,:,[self.cfg.gapRngX.start-1]] + images[:,0:1,:,[self.cfg.gapRngX.stop]   ] ) / 3,
+                               ( 2*images[:,0:1,:,[self.cfg.gapRngX.stop]   ] + images[:,0:1,:,[self.cfg.gapRngX.start-1]] ) / 3,
+                             ],
+                             dim=-1
+                           )
+            res = self.fillTheGap(images, gap)
+            #res = images.clone()
+            #res[...,self.cfg.gapRngX.start]  = ( 2*images[:,[0],:,self.cfg.gapRngX.start-1] + images[:,[0],:,self.cfg.gapRngX.stop] ) / 3
+            #res[...,self.cfg.gapRngX.stop-1] = ( 2*images[:,[0],:,self.cfg.gapRngX.stop] + images[:,[0],:,self.cfg.gapRngX.start-1] ) / 3
+        elif self.lowResGenerator is None :
+            res = images
+        else :
+            preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
+            res = self.lowResGenerator.forward(preImages)
+            res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
+        return squeezeOrg(res, orgDims)
+
 
     def forward(self, images):
 
-        imDevice = images.device
-        myDevice = next(self.lastTouch.parameters()).device
-        images = images.to(myDevice)
-
         # channel 0
-        #images = images.clone()#.detach()
-        preImages = self.preFill(images)
-        images = self.fillTheGap(images, preImages)
-        images, norms = normalizeImages(images)
-        # channel 1
-        stripeImages = self.stripeGenerator.forward(images)
-        # channel 2
-        bricksIn = torch.cat((      images.view(-1,1, *self.brickGenerator.cfg.sinoSh),
-                              stripeImages.view(-1,1, *self.brickGenerator.cfg.sinoSh)),
-                             dim=1)
-        bricksM = self.brickGenerator.forward(bricksIn).view(-1,1, *self.cfg.sinoSh)
-        # channel 3
-        edge = self.brickGenerator.cfg.sinoSh[-2]//2
-        bricksIn = torch.cat((      images[:,:,edge:-edge,:].reshape(-1,1, *self.brickGenerator.cfg.sinoSh),
-                              stripeImages[:,:,edge:-edge,:].reshape(-1,1, *self.brickGenerator.cfg.sinoSh)),
-                             dim=1)
-        bricksP = self.brickGenerator.forward(bricksIn).view(-1,1, self.cfg.sinoSh[-2]-2*edge, self.cfg.sinoSh[-1] )
-        bricksP = torch.cat([images[:,:,:edge,:],
-                             bricksP,
-                             images[:,:,-edge:,:]
-                            ],
-                            dim=-2)
-        # combine channels and drop in
-        modelIn = torch.cat((images, stripeImages, bricksM, bricksP), dim=1)
-        if self.inChannels > modelIn.shape[1] : # fill missing channels with noise
-            #images = images.repeat((1,self.inChannels,1,1))
-            lSh = list(modelIn.shape)
-            lSh[1] = self.inChannels - lSh[1]
-            latentChannels = torch.randn( lSh, device=images.device )
-            modelIn = torch.cat( (modelIn, latentChannels), dim=1 )
-        results = self.dropIN(modelIn)
+        preImages = self.lowResProc(images)
+        preFilledImages = self.fillTheGap(images, preImages)
+        preFilledImages, norms = normalizeImages(preFilledImages)
 
-        results = reNormalizeImages(results, norms)#.to(imDevice)
+        # channel 1
+        stripesIn = images if self.stripeGenerator.cfg.gapW == 2 else \
+            torch.cat( (images, preImages.to(images.device)), dim=1)
+        stripeForBricks = self.stripeGenerator.forward(stripesIn)
+
+        # brick processing
+        brickedImages = self.stripe2bricks(preFilledImages).to(self.brickGenerator.device())
+        brickedStripe = self.stripe2bricks(stripeForBricks).to(self.brickGenerator.device())
+        bricksIn = torch.cat((brickedImages, brickedStripe), dim=1)
+        bricksOut = self.brickGenerator.forward(bricksIn)
+        # channels 2 and 3
+        stripesOfBricks = self.bricks22stripes(bricksOut)
+        # channel 4
+        stripeInterpolated = self.bricks2stripe(bricksOut)
+
+        # combine channels and drop into final generator
+        modelIn = torch.cat([ img.to(self.finalGenerator.device()) for img in [
+                                    stripeInterpolated,
+                                    stripeForBricks,
+                                    *stripesOfBricks,
+                                    preFilledImages,
+                                    preImages,
+                            ] ], dim=1)
+        results = self.finalGenerator.forward(modelIn)
+        results = reNormalizeImages(results, norms)
         return results
 
 
@@ -967,17 +982,12 @@ class DiscriminatorTemplate(nn.Module):
 discriminator = initIfNew('discriminator')
 
 
-def createOptimizer(model, lr) :
-    return optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr,
-        betas=(0.5, 0.999)
-    )
-optimizer_G = initIfNew('optimizer_G')
-optimizer_D = initIfNew('optimizer_D')
-scheduler_G = initIfNew('scheduler_G')
-scheduler_D = initIfNew('scheduler_D')
+def createOptimizers() :
+    raise Exception("Don't use this function, redefine it as needed.")
+schedulers_G = []
+schedulers_D = []
 optimizers_G = []
+optimizers_D = []
 
 
 def adjustScheduler(scheduler, iniLr, target) :
@@ -1029,13 +1039,59 @@ def loss_Adv_Dis(p_true, p_pred):
 
 MSE = nn.MSELoss(reduction='none')
 def loss_MSE(p_true, p_pred):
-    MSE.to(p_true.device)
+    MSE.to(p_pred.device)
     return MSE(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
+
+avgKernel = torch.ones((1,1,3,3), dtype=torch.float32)
+def loss_MSEC(p_true, p_pred):
+    global avgKernel
+    dev = p_pred.device
+    MSE.to(dev)
+    avgKernel = avgKernel.to(dev)
+    p_true = p_true.to(dev)
+    mseLoss = MSE(p_true[DCfg.gapRng], p_pred[DCfg.gapRng])
+    diffLoss = p_true[DCfg.gapRng] - p_pred[DCfg.gapRng]
+    convDiff = torch.nn.functional.conv2d( diffLoss, avgKernel, padding=1 )
+    loss = mseLoss * convDiff**2
+    return loss.sum(dim=(-1,-2,-3))
+
+def loss_MSEA(p_true, p_pred):
+    MSE.to(p_pred.device)
+    #return MSE(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
+    gap_true = p_true[DCfg.gapRng]
+    gap_pred = p_pred[DCfg.gapRng]
+    allMSEs = torch.zeros((gap_true.shape[0],9,gap_true.shape[-2],gap_true.shape[-1]), device=p_pred.device) + 1e10
+    for id2 in [-1,0,1] :
+        for id3 in [-1,0,1] :
+            allMSEs[:,[(id3+1)*3+(id2+1)],
+                      max(0,id2) : gap_true.shape[2] + min(0,id2),
+                      max(0,id3) : gap_true.shape[3] + min(0,id3)] = \
+                MSE( gap_true[:,:,max(0,id2) : gap_true.shape[2] + min(0,id2),
+                                  max(0,id3) : gap_true.shape[3] + min(0,id3)] ,
+                     gap_pred[:,:,max(0,id2)-id2 : gap_true.shape[2] + min(0,id2)-id2,
+                                  max(0,id3)-id3 : gap_true.shape[3] + min(0,id3)-id3] )
+    minMSE = allMSEs.min(dim=1, keepdim=True)
+    return minMSE.sum(dim=(-1,-2,-3))
 
 def loss_MSEN(p_true, p_pred):
     rawLoss = loss_MSE(p_true, p_pred)
     stds = 1e-7 +  calculateNorm(p_true)[0].view([-1])
     return rawLoss / stds**2
+
+def loss_MSENorm(p_true, p_pred):
+    n_true, norms = normalizeImages(p_true)
+    n_pred = (p_pred - norms[1]) / norms[2]
+    return loss_MSE(n_true, n_pred)
+
+def loss_MSEBrick(p_true, p_pred):
+    b_true = generator.stripe2bricks(p_true)
+    b_pred = generator.stripe2bricks(p_pred)
+    n_true, norms = normalizeImages(b_true)
+    n_pred = (b_pred - norms[2]) / norms[1]
+    bLosses = loss_MSE(n_true, n_pred)
+    sLosses = bLosses.view(p_true.shape[0], -1).mean(dim=1)
+    return sLosses
+
 
 def loss_SMSE(p_true, p_pred):
     mseLoss = MSE(p_true[DCfg.gapRng], p_pred[DCfg.gapRng])
@@ -1107,6 +1163,26 @@ def loss_EAGLE(p_true, p_pred):
     return loss
 
 
+sobelKernelXY = torch.tensor([[[[-1, 0, 1],
+                                [-2, 0, 2],
+                                [-1, 0, 1]]], # x
+                              [[[ 1, 2, 1],
+                                [ 0, 0, 0],
+                                [-1,-2,-1]]], # y
+                             ], dtype=torch.float32)
+
+def loss_ABSGRD(p_true, p_pred):
+    global sobelKernelXY
+    p_true, _ = unsqeeze4dim(p_true)
+    p_pred, _ = unsqeeze4dim(p_pred)
+    sobelKernelXY = sobelKernelXY.to(p_pred.device)
+    grad_true = torch.nn.functional.conv2d(p_true, sobelKernelXY, padding=1)
+    grad_pred = torch.nn.functional.conv2d(p_pred, sobelKernelXY, padding=1)
+    agrd_true = torch.square(grad_true).sum(dim=1, keepdim=True)
+    agrd_pred = torch.square(grad_pred).sum(dim=1, keepdim=True)
+    return torch.abs(agrd_true - agrd_pred).sum(dim=(-1,-2,-3))
+
+
 @dataclass
 class Metrics:
     calculate : callable
@@ -1116,6 +1192,7 @@ class Metrics:
 metrices = {
     'Adv'    : Metrics(loss_Adv_Gen, 0, 0),
     'MSE'    : Metrics(loss_MSE,     1, 1),
+    'MSEC'   : Metrics(loss_MSEC,     1, 1),
     #'SMSE'   : Metrics(loss_SMSE,    1, 1),
     'MSEN'   : Metrics(loss_MSEN,    1, 1),
     'L1L'    : Metrics(loss_L1L,     1, 1),
@@ -1126,6 +1203,7 @@ metrices = {
     'COR'    : Metrics(loss_COR,     1, 1),
     'HIST'   : Metrics(loss_HIST,    1, 1),
     'EAGLE'  : Metrics(loss_EAGLE,   1, 1),
+    'ABSGRD' : Metrics(loss_ABSGRD,  1, 1),
 }
 
 # Gap 2 metrices
@@ -1190,22 +1268,23 @@ def transformGT(images):
 
 def loss_Gen(p_true, p_pred):
     global metrices, minMetrices, maxMetrices
-    loss = torch.zeros( (p_true.shape[0]), device=p_true.device )
+    myDev = p_pred.device
+    p_true = p_true.to(myDev)
+    losses = []
     sumweights = 0
     individualLosses = {}
     p_true = transformGT(p_true)
     for key, metrics in metrices.items():
         if metrics.norm > 0 :
             with torch.set_grad_enabled( metrics.weight > 0 ) :
-                thisLoss = metrics.calculate(p_true, p_pred) / metrics.norm
+                thisLoss = metrics.calculate(p_true, p_pred).to(myDev) / metrics.norm
+                losses.append(thisLoss * metrics.weight)
+                sumweights += metrics.weight
                 individualLosses[key] = thisLoss.sum().item()
                 updateExtremes(thisLoss, key, p_true, p_pred)
-                if  metrics.weight > 0 :
-                    loss += metrics.weight * thisLoss.to(p_true.device)
-                    sumweights += metrics.weight
         else :
             individualLosses[key] = p_true.shape[0]
-    loss /= sumweights
+    loss = sum(losses) / sumweights
     updateExtremes(loss, 'loss', p_true, p_pred)
     return loss.sum() , individualLosses
 
@@ -1284,14 +1363,13 @@ def summarizeMe(toSumm, onPrep=True):
 
         batchSplit = TCfg.batchSplit if TCfg.batchSplit > 1 else 1
         subBatchSize = nofIm // batchSplit
-        fakeImages = images.clone()
         for i in range(batchSplit) :
             subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
             subImages = images[subRange,...]
-            subFakeImages = generator.preFill(subImages) \
+            subFakeImages = generator.lowResProc(subImages) \
                                 if onPrep else \
                             generator.generateImages(subImages)
-            if metrices['Adv'].weight > 0 :
+            if 'Adv' in metrices and metrices['Adv'].weight > 0 :
                 disLoss, probs = loss_Dis(subImages, subFakeImages)
                 sumAcc.lossD += disLoss.item()
                 sumAcc.predReal += probs[:subBatchSize,0].sum().item()
@@ -1325,7 +1403,7 @@ def generateDisplay(inp=None, boxes=None) :
 
     genImages = images.clone()
     with torch.no_grad() :
-        preImages = generator.preFill(images).to(imDevice)
+        preImages = generator.lowResProc(images).to(imDevice)
         genPatches = generator.forward(images).to(imDevice)
         genImages[DCfg.gapRng] = genPatches[DCfg.gapRng]
     hGap = DCfg.gapW // 2
@@ -1383,56 +1461,63 @@ def calculateNorm(images) :
     toRet = torch.std_mean( noGapImages, dim=(-1,-2), keepdim=True )
     return toRet[0], toRet[1]
 
+epoch=initIfNew('epoch', 0)
+imer = initIfNew('iter', 0)
+minGEpoch = initIfNew('minGEpoch')
+minGLoss = initIfNew('lastGLoss')
+startFrom = initIfNew('startFrom', 0)
 
-def saveCheckPoint(path, epoch, iterations, minGEpoch, lastGLoss,
-                   generator, discriminator,
-                   optimizerGen=None, optimizerDis=None,
-                   schedulerGen=None, schedulerDis=None,
-                   startFrom=0, interimRes=TrainResClass()) :
+
+def saveCheckPoint(path, epoch=epoch, imer=imer, interimRes=TrainResClass()) :
+    global  minGEpoch, minGLoss, generator, discriminator, optimizers_G, optimizers_D
     checkPoint = {}
     checkPoint['epoch'] = epoch
-    checkPoint['iterations'] = iterations
+    checkPoint['iterations'] = imer
     checkPoint['minGEpoch'] = minGEpoch
-    checkPoint['lastGLoss'] = lastGLoss
+    checkPoint['lastGLoss'] = minGLoss
     checkPoint['startFrom'] = startFrom
     checkPoint['generator'] = generator.state_dict()
     if discriminator is not None :
         checkPoint['discriminator'] = discriminator.state_dict()
-    if not optimizerGen is None :
-        checkPoint['optimizerGen'] = optimizerGen.state_dict()
-    if not schedulerGen is None :
-        checkPoint['schedulerGen'] = schedulerGen.state_dict()
-    if not optimizerDis is None :
-        checkPoint['optimizerDis'] = optimizerDis.state_dict()
-    if not schedulerDis is None :
-        checkPoint['schedulerDis'] = schedulerDis.state_dict()
+    for idx, optim in enumerate(optimizers_G) :
+        checkPoint[f"optimizerGen_{idx}"] = optim.state_dict()
+    for idx, optim in enumerate(optimizers_D) :
+        checkPoint[f"optimizerDis_{idx}"] = optim.state_dict()
     checkPoint['resAcc'] = interimRes
     torch.save(checkPoint, path)
 
 
-def loadCheckPoint(path, generator, discriminator,
-                   optimizerGen=None, optimizerDis=None,
-                   schedulerGen=None, schedulerDis=None) :
+def loadCheckPoint(path) :
+    global minGEpoch, minGLoss, generator, discriminator, optimizers_G, optimizers_D
     checkPoint = torch.load(path, map_location='cpu', weights_only=False)
     epoch = checkPoint['epoch']
     iterations = checkPoint['iterations']
     minGEpoch = checkPoint['minGEpoch']
-    lastGLoss = checkPoint['lastGLoss']
+    minGLoss = checkPoint['lastGLoss']
     startFrom = checkPoint['startFrom'] if 'startFrom' in checkPoint else 0
     generator.load_state_dict(checkPoint['generator'])
     if discriminator is not None :
         discriminator.load_state_dict(checkPoint['discriminator'])
-    if not optimizerGen is None :
-        optimizerGen.load_state_dict(checkPoint['optimizerGen'])
-    if not schedulerGen is None :
-        schedulerGen.load_state_dict(checkPoint['schedulerGen'])
-    if not optimizerDis is None :
-        optimizerDis.load_state_dict(checkPoint['optimizerDis'])
-    if not schedulerDis is None :
-        schedulerDis.load_state_dict(checkPoint['schedulerDis'])
+    for idx, optim in enumerate(optimizers_G) :
+        key = f"optimizerGen_{idx}"
+        if key in checkPoint :
+            try : optim.load_state_dict(checkPoint[key])
+            except :
+                print("Failed to load optimizer " + key)
+                continue
+        else :
+            print("No optimizer " + key + " in chekpoint")
+    for idx, optim in enumerate(optimizers_D) :
+        key = f"optimizerDis_{idx}"
+        if key in checkPoint :
+            try : optim.load_state_dict(checkPoint[key])
+            except :
+                print("Failed to load optimizer " + key)
+                continue
+        else :
+            print("No optimizer " + key + " in chekpoint")
     interimRes = checkPoint['resAcc'] if 'resAcc' in checkPoint else TrainResClass()
-
-    return epoch, iterations, minGEpoch, lastGLoss, startFrom, interimRes
+    return epoch, iterations, minGEpoch, minGLoss, startFrom, interimRes
 
 
 def restoreCheckpoint(path=None, logDir=None) :
@@ -1446,13 +1531,30 @@ def restoreCheckpoint(path=None, logDir=None) :
         except : pass
         return 0, 0, 0, None, 0, TrainResClass()
     else :
-        return loadCheckPoint(path, generator, discriminator, optimizer_G, optimizer_D)
+        return loadCheckPoint(path)
 
 
 def saveModels(path="") :
     save_model(generator, model_path = ( path if path else f"model_{TCfg.exec}" ) + "_gen.pt" )
     if discriminator is not None :
         save_model(discriminator, model_path = ( path if path else f"model_{TCfg.exec}" ) + "_dis.pt"  )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1464,6 +1566,32 @@ def doTrainDis(locals) :
 
 def doTrainGen(locals) :
     return True
+
+
+lrCoeff = 1
+minimal_criteria = None
+def updateCriteria(saveMe=True) :
+    global minimal_criteria, lrCoeff
+    image = refImages[[2],...]
+    box = refBoxes[2]
+    rng = np.s_[0, 0, box : box + DCfg.sinoSh[-1], DCfg.gapRngX]
+    with torch.no_grad() :
+        genImage = generator.forward(image).to(image.device)
+        crit =  MSE(genImage[rng], image[rng]).mean().item() / metrices['MSE'].norm
+        writer.add_scalars("Aux", {'Crit': crit}, imer)
+        if minimal_criteria is None or (crit < minimal_criteria) :
+            minimal_criteria = crit
+            print(f"New best criteria: {crit:.3e}.")
+            if saveMe :
+                #lrCoeff = 1
+                saveCheckPoint(f"checkPoint_{TCfg.exec}_mini.pth", epoch=epoch-1, imer=imer)
+                preImage = generator.lowResProc(image).to(image.device)
+                svImage = torch.cat( [ normalizeImages(img)[0].cpu() for img in
+                                      ( image, preImage, genImage, genImage-preImage, image - genImage ) ] , dim=-1 )
+                tifffile.imwrite(f"mini_{TCfg.exec}.tif", svImage[0,0,...].transpose(-1,-2).numpy())
+    return crit
+
+
 
 def train_step(allImages):
     global skipGen, skipDis
@@ -1482,10 +1610,11 @@ def train_step(allImages):
         subBatchSize = nofIm // batchSplit
 
         # train discriminator
-        if metrices['Adv'].weight > 0 :
+        if 'Adv' in metrices and  metrices['Adv'].weight > 0 :
             if repeatDis :
                 for _ in range(repeatDis) :
-                    optimizer_D.zero_grad(set_to_none=False)
+                    for optim in optimizers_D :
+                        optim.zero_grad(set_to_none=False)
                     for i in range(batchSplit) :
                         subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
                         subImages = images[subRange,...]
@@ -1500,8 +1629,9 @@ def train_step(allImages):
                         if doTrainDis(locals()) :
                             disLoss = disLoss / subBatchSize
                             disLoss.backward()
-                    optimizer_D.step()
-                    optimizer_D.zero_grad(set_to_none=True)
+                    for optim in optimizers_G :
+                        optim.step()
+                        optim.zero_grad(set_to_none=True)
             else :
                 with torch.no_grad() : # create fake images to be descriminated
                     for i in range(batchSplit) :
@@ -1513,7 +1643,6 @@ def train_step(allImages):
                         trainRes.predFake += probs[subBatchSize:,0].sum().item()
                         trainRes.lossD += disLoss.item()
 
-
         # train generator
         for _ in range(repeatGen) :
             for optim in optimizers_G :
@@ -1521,7 +1650,8 @@ def train_step(allImages):
             for i in range(batchSplit) :
                 subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
                 subImages = images[subRange,...]
-                subFakeImages = generator.fillTheGap(subImages, torch.zeros_like(subImages[generator.cfg.gapRng]))
+                with torch.no_grad():
+                    subFakeImages = generator.fillTheGap(subImages, torch.zeros_like(subImages[generator.cfg.gapRng]))
                 subFakeImages = generator.generateImages(subFakeImages)
                 genLoss, indLosses = loss_Gen(subImages, subFakeImages)
                 trainRes.lossG += genLoss.item() / repeatGen
@@ -1534,15 +1664,12 @@ def train_step(allImages):
                 optim.step()
                 optim.zero_grad(set_to_none=True)
 
+    if minimal_criteria is not None :
+        updateCriteria()
+
     return trainRes
 
 
-epoch=initIfNew('epoch', 0)
-iter = initIfNew('iter', 0)
-imer = initIfNew('iter', 0)
-minGEpoch = initIfNew('minGEpoch')
-minGLoss = initIfNew('lastGLoss')
-startFrom = initIfNew('startFrom', 0)
 
 def beforeEachEpoch(locals) :
     return
@@ -1559,9 +1686,12 @@ def afterReport(locals) :
 trainLoader=None
 testLoader=None
 resAcc = TrainResClass()
+revert_minimal_criteria = None
+correlatedCriteriaFile = None
 
 def train(savedCheckPoint):
-    global epoch, minGLoss, minGEpoch, iter, startFrom, imer, resAcc
+    global epoch, minGLoss, minGEpoch, startFrom, imer, resAcc
+    global minimal_criteria, revert_minimal_criteria, correlatedCriteriaFile, lrCoeff
     global trainLoader, testLoader, testSet, refImages, minMetrices, maxMetrices
     lastGLoss = minGLoss
 
@@ -1580,17 +1710,28 @@ def train(savedCheckPoint):
         updAcc = TrainResClass()
         _ = trackExtremes()
 
-
         for it , data in tqdm.tqdm(enumerate(trainLoader), total=int(len(trainLoader))):
             if startFrom :
                 startFrom -= 1
                 continue
-            iter += 1
             images = data[0]
             imer += images.shape[0]
+
+            if correlatedCriteriaFile is not None :
+                critBefore = updateCriteria(saveMe=False)
+
             trainRes = train_step(images)
             resAcc += trainRes
             updAcc += trainRes
+
+            if correlatedCriteriaFile is not None :
+                critAfter= updateCriteria(saveMe=False)
+                if critAfter < critBefore :
+                    with open(correlatedCriteriaFile, 'a') as f :
+                        print(f"# {critBefore-critAfter:.6e}", file=f)
+                        prnData = torch.stack(data[1]).transpose(0,1)
+                        for row in range(prnData.shape[0]) :
+                            print(prnData[row,...].numpy(), file=f)
 
             #if True:
             if time.time() - lastUpdateTime > 60  or imer == images.shape[0]:
@@ -1669,13 +1810,23 @@ def train(savedCheckPoint):
                 _ = trackExtremes()
 
             if time.time() - lastSaveTime > 3600 :
+
                 lastSaveTime = time.time()
-                saveCheckPoint(savedCheckPoint+"_hourly.pth",
-                               epoch-1, imer, minGEpoch, minGLoss,
-                               generator, discriminator,
-                               optimizer_G, optimizer_D,
-                               startFrom=it, interimRes=resAcc)
+                saveCheckPoint(savedCheckPoint+"_hourly.pth", epoch=epoch-1, imer=imer, interimRes=resAcc)
                 saveModels(f"model_{TCfg.exec}_hourly")
+
+                if minimal_criteria is not None :
+                    if revert_minimal_criteria is not None :
+                        sv_lr = schedulers_G[0].get_last_lr()[0] / TCfg.learningRateG
+                        #createOptimizers()
+                        freeGPUmem()
+                        _ = restoreCheckpoint(f"checkPoint_{TCfg.exec}_mini.pth")
+                        freeGPUmem()
+                        for optim in optimizers_G :
+                            torch.optim.lr_scheduler.LambdaLR(optim, lambda epoch:sv_lr).step()
+                        freeGPUmem()
+                    #elif revert_minimal_criteria is not None :
+                    #    revert_minimal_criteria = minimal_criteria
 
 
         print(resAcc)
@@ -1719,10 +1870,7 @@ def train(savedCheckPoint):
             minGEpoch = epoch
         saveModels()
         os.system(f"mv {savedCheckPoint}.pth {savedCheckPoint}_previous.pth")
-        saveCheckPoint(savedCheckPoint+".pth",
-                       epoch, imer, minGEpoch, minGLoss,
-                       generator, discriminator,
-                       optimizer_G, optimizer_D)
+        saveCheckPoint(savedCheckPoint+".pth", epoch=epoch, imer=imer)
         if minGEpoch == epoch :
             os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_best.pth")
             os.system(f"cp {savedCheckPoint}_previous.pth {savedCheckPoint}_beforebest.pth")
@@ -1738,6 +1886,9 @@ def train(savedCheckPoint):
 
 
 def freeGPUmem() :
+    gc.collect()
+    with torch.no_grad():
+        torch.cuda.empty_cache()
     gc.collect()
     with torch.no_grad():
         torch.cuda.empty_cache()
