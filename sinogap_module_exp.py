@@ -38,6 +38,7 @@ import tqdm
 import torchmetrics.image
 #import ssim
 from eagle_loss import Eagle_Loss
+from convnext_perceptual_loss import ConvNextPerceptualLoss, ConvNextType
 
 
 def initIfNew(var, val=None) :
@@ -1156,16 +1157,15 @@ class DiscriminatorTemplate(SubDiscriminatorTemplate):
         # stripes linear link
         return self.stripeDiscriminator.lastTouch(stripe_dwTrainTail[-1])
 
-
     def forward(self, images):
 
         # preform inputs
-        stripeIn = images
-        stripeIn = normalizeImages(stripeIn)[0].to(self.stripeDiscriminator.device())
+        stripeIn = images.to(self.stripeDiscriminator.device())
+        stripeIn = normalizeImages(stripeIn)[0]
         stripe_dwTrain = [stripeIn,]
 
-        bricksIn = stripe2bricks(images)
-        bricksIn = normalizeImages(bricksIn)[0].to(self.bricksDiscriminator.device())
+        bricksIn = stripe2bricks(images).to(self.bricksDiscriminator.device())
+        bricksIn = normalizeImages(bricksIn)[0]
         bricks_dwTrain = [bricksIn,]
 
         stripeBricked_dwTrain = [torch.empty((bricksIn.shape[0],0,bricksIn.shape[2],bricksIn.shape[3])),]
@@ -1340,11 +1340,11 @@ def loss_MSEL(p_true, p_pred):
 def loss_MSECT(p_true, p_pred):
     e_true = - torch.log(torch.where(p_true>1e-07,p_true,1e-07))
     f_true = torch.fft.rfft(e_true, dim=-1)
-    f_true *= torch.arange(f_pred.shape[-1]).view(1,1,1,-1)
+    f_true *= 1 + torch.arange(f_true.shape[-1]).view(1,1,1,-1).to(f_true.device)
     e_true = torch.fft.irfft(f_true, dim=-1)
     e_pred = - torch.log(torch.where(p_pred>1e-07,p_pred,1e-07))
     f_pred = torch.fft.rfft(e_pred, dim=-1)
-    f_pred *= torch.arange(f_pred.shape[-1]).view(1,1,1,-1)
+    f_pred *= 1 + torch.arange(f_pred.shape[-1]).view(1,1,1,-1).to(f_pred.device)
     e_pred = torch.fft.irfft(f_pred, dim=-1)
     return loss_MSE(e_true, e_pred)
 
@@ -1435,6 +1435,21 @@ def loss_EAGLE(p_true, p_pred):
     return loss
 
 
+CNP = None
+def loss_CNP(p_true, p_pred):
+    global CNP
+    if CNP is None :
+        CNP = ConvNextPerceptualLoss(
+            model_type=ConvNextType.BASE,
+            feature_layers=[0, 2, 4, 6, 8, 10, 12, 14], # Max index is 14 here
+            use_gram=False,
+            device=p_pred.device,
+            layer_weight_decay=0.99
+        )
+    return CNP(p_pred.to(CNP.device), p_true.to(CNP.device))
+
+
+
 sobelKernelXY = torch.tensor([[[[-1, 0, 1],
                                 [-2, 0, 2],
                                 [-1, 0, 1]]], # x
@@ -1520,20 +1535,20 @@ def loss_Gen(p_true, p_pred):
     global metrices, minMetrices, maxMetrices
     myDev = p_pred.device
     p_true = p_true.to(myDev)
-    losses = []
+    losses = torch.tensor(0.0, requires_grad=True, device=myDev)
     sumweights = 0
     individualLosses = {}
     for key, metrics in metrices.items():
         if metrics.norm > 0 :
             with torch.set_grad_enabled( metrics.weight > 0 ) :
                 thisLoss = metrics.calculate(p_true, p_pred).to(myDev) / metrics.norm
-                losses.append(thisLoss * metrics.weight)
-                sumweights += metrics.weight
-                individualLosses[key] = thisLoss.sum().item()
-                updateExtremes(thisLoss, key, p_true, p_pred)
+            losses = losses + thisLoss * metrics.weight
+            sumweights += metrics.weight
+            individualLosses[key] = thisLoss.detach().sum().item()
+            updateExtremes(thisLoss, key, p_true, p_pred)
         else :
             individualLosses[key] = p_true.shape[0]
-    loss = sum(losses) / sumweights
+    loss = losses / sumweights
     updateExtremes(loss, 'loss', p_true, p_pred)
     return loss.sum() , individualLosses
 
@@ -1816,25 +1831,63 @@ def doTrainGen(locals) :
     return True
 
 
-lrCoeff = 1
-minimal_criteria = None
-def updateCriteria(saveMe=True) :
-    global minimal_criteria, lrCoeff
+
+def criteriaToFollow() :
     image = refImages[[2],...]
     box = refBoxes[2]
     rng = np.s_[0, 0, box : box + DCfg.sinoSh[-1], DCfg.gapRngX]
     with torch.no_grad() :
         genImage = generator.forward(image).to(image.device)
-        crit =  MSE(genImage[rng], image[rng]).mean().item() / metrices['MSE'].norm
-        writer.add_scalars("Aux", {'Crit': crit}, imer)
-        if minimal_criteria is None or (crit < minimal_criteria) :
-            minimal_criteria = crit
-            print(f"New best criteria: {crit:.3e}.")
-            if saveMe :
-                #lrCoeff = 1
+        crit =  MSE(genImage[rng], image[rng]).sum().item() / metrices['MSE'].norm
+    return crit
+
+@dataclass
+class Follower:
+    index : tuple = ()
+    deltaScore : float = 0
+    ratioScore : float = 0
+    tests : int = 0
+    def deltaAverage(self) : return self.deltaScore / self.tests if self.tests else 0
+    def ratioAverage(self) : return self.ratioScore / self.tests if self.tests else 0
+
+followers = None
+mixedInFollowers = 0
+
+def mixInFollowers(data) :
+    global followers, mixedInFollowers
+    if followers is None or not mixedInFollowers or not len(followers):
+        return data
+
+
+
+
+
+
+    return data
+
+def dealWithTheFollowers(images, indeces, criteriaBefore, criteriaAfter) :
+    if followers is None :
+        return
+
+
+
+lrCoeff = 1
+minimal_criteria = None
+def updateCriteria(saveMe=True) :
+    global minimal_criteria, lrCoeff
+    crit = criteriaToFollow()
+    writer.add_scalars("Aux", {'Crit': crit}, imer)
+    if minimal_criteria is None or (crit < minimal_criteria) :
+        print(f"New best criteria: {crit:.3e}.")
+        minimal_criteria = crit
+        image = refImages[[2],...]
+        if saveMe :
+            with torch.no_grad() :
+                genImage = generator.forward(image).to(image.device)
                 saveCheckPoint(f"checkPoint_{TCfg.exec}_mini.pth", epoch=epoch-1, imer=imer)
-                preImage = generator.lowResProc(image).to(image.device)
-                svImage = torch.cat( [ normalizeImages(img)[0].cpu() for img in
+                with torch.no_grad() :
+                    preImage = generator.lowResProc(image).to(image.device)
+                    svImage = torch.cat( [ normalizeImages(img)[0].detach().cpu() for img in
                                       ( image, preImage, genImage, genImage-preImage, image - genImage ) ] , dim=-1 )
                 tifffile.imwrite(f"mini_{TCfg.exec}.tif", svImage[0,0,...].transpose(-1,-2).numpy())
     return crit
@@ -1842,7 +1895,7 @@ def updateCriteria(saveMe=True) :
 
 
 def train_step(allImages):
-    global skipGen, skipDis
+    global skipGen, skipDis, followers
 
     trainRes = TrainResClass()
     allImages, _ = unsqeeze4dim(allImages)
@@ -1912,6 +1965,8 @@ def train_step(allImages):
                 optim.step()
                 optim.zero_grad(set_to_none=True)
 
+
+
     if minimal_criteria is not None :
         updateCriteria()
 
@@ -1934,7 +1989,7 @@ def afterReport(locals) :
     return
 
 def preTransformImage(images):
-    return images
+    return images.to(generator.device())
 
 trainLoader=None
 testLoader=None
@@ -1944,7 +1999,7 @@ correlatedCriteriaFile = None
 
 def train(savedCheckPoint, epochSize=None):
     global epoch, minGLoss, minGEpoch, startFrom, imer, resAcc
-    global minimal_criteria, revert_minimal_criteria, correlatedCriteriaFile, lrCoeff
+    global minimal_criteria, lrCoeff, followers
     global trainLoader, testLoader, testSet, refImages, minMetrices, maxMetrices
     lastGLoss = minGLoss
 
@@ -1972,26 +2027,23 @@ def train(savedCheckPoint, epochSize=None):
             if startFrom :
                 startFrom -= 1
                 continue
+
+            if followers is not None :
+                data = mixInFollowers(data)
+                criteriaBefore = criteriaToFollow()
             images = data[0]
             images = preTransformImage(images)
             imer += images.shape[0]
 
-            if correlatedCriteriaFile is not None :
-                critBefore = updateCriteria(saveMe=False)
-
-            #freeGPUmem()
+            # acrtual training
             trainRes = train_step(images)
             resAcc += trainRes
             updAcc += trainRes
 
-            if correlatedCriteriaFile is not None :
-                critAfter= updateCriteria(saveMe=False)
-                if critAfter < critBefore :
-                    with open(correlatedCriteriaFile, 'a') as f :
-                        print(f"# {critBefore-critAfter:.6e}", file=f)
-                        prnData = torch.stack(data[1]).transpose(0,1)
-                        for row in range(prnData.shape[0]) :
-                            print(prnData[row,...].numpy(), file=f)
+            if followers is not None :
+                criteriaAfter = criteriaToFollow()
+                dealWithTheFollowers(images, data[1], criteriaBefore, criteriaAfter)
+
 
             #if True:
             if time.time() - lastUpdateTime > 60  or imer == images.shape[0]:
