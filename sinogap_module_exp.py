@@ -1440,7 +1440,7 @@ def loss_CNP(p_true, p_pred):
     global CNP
     if CNP is None :
         CNP = ConvNextPerceptualLoss(
-            model_type=ConvNextType.BASE,
+            model_type=ConvNextType.LARGE,
             feature_layers=[0, 2, 4, 6, 8, 10, 12, 14], # Max index is 14 here
             use_gram=False,
             device=p_pred.device,
@@ -1835,10 +1835,11 @@ def doTrainGen(locals) :
 def criteriaToFollow() :
     image = refImages[[2],...]
     box = refBoxes[2]
-    rng = np.s_[0, 0, box : box + DCfg.sinoSh[-1], DCfg.gapRngX]
+    #rng = np.s_[0, 0, box : box + DCfg.sinoSh[-1], DCfg.gapRngX]
+    rng = np.s_[0, 0, box : box + DCfg.sinoSh[-1], :]
     with torch.no_grad() :
         genImage = generator.forward(image).to(image.device)
-        crit =  MSE(genImage[rng], image[rng]).sum().item() / metrices['MSE'].norm
+        crit = loss_CNP(genImage[rng], image[rng]).sum().item() / metrices['CNP'].norm
     return crit
 
 @dataclass
