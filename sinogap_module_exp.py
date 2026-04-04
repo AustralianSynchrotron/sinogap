@@ -1835,11 +1835,11 @@ def doTrainGen(locals) :
 def criteriaToFollow() :
     image = refImages[[2],...]
     box = refBoxes[2]
-    #rng = np.s_[0, 0, box : box + DCfg.sinoSh[-1], DCfg.gapRngX]
-    rng = np.s_[0, 0, box : box + DCfg.sinoSh[-1], :]
+    rng = np.s_[0, 0, box : box + DCfg.sinoSh[-1], DCfg.gapRngX]
+    #rng = np.s_[0, 0, box : box + DCfg.sinoSh[-1], :]
     with torch.no_grad() :
         genImage = generator.forward(image).to(image.device)
-        crit = loss_CNP(genImage[rng], image[rng]).sum().item() / metrices['CNP'].norm
+        crit = L1L(genImage[rng], image[rng]).sum().item() / metrices['L1L'].norm
     return crit
 
 @dataclass
