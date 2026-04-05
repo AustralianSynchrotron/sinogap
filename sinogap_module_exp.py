@@ -1358,6 +1358,17 @@ def loss_L1L(p_true, p_pred):
     L1L.to(p_true.device)
     return L1L(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
 
+def loss_L1LL(p_true, p_pred):
+    l_true = p_true.view(-1,p_pred.shape[1],1,p_pred.shape[-1])
+    l_pred = p_pred.view(-1,p_pred.shape[1],1,p_pred.shape[-1])
+    n_true, norms = normalizeImages(l_true)
+    n_pred = (l_pred - norms[2]) / norms[1]
+    lLosses = loss_L1L(n_true, n_pred)
+    sLosses = lLosses.view(p_true.shape[0], -1).mean(dim=1)
+    return sLosses
+
+
+
 def loss_L1LN(p_true, p_pred):
     rawLoss = loss_L1L(p_true, p_pred)
     stds = 1e-7 + calculateNorm(p_true)[0].view([-1])
@@ -1553,6 +1564,8 @@ def loss_Gen(p_true, p_pred):
     return loss.sum() , individualLosses
 
 def loss_Dis(p_true, p_pred):
+    myDev = p_pred.device
+    p_true = p_true.to(myDev)
     advRes = loss_Adv_Dis(p_true, p_pred)
     return advRes[0].sum() / ( 2 * metrices['Adv'].norm ) , advRes[1]
 
