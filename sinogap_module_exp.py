@@ -1899,6 +1899,7 @@ def updateCriteria(saveMe=True) :
             with torch.no_grad() :
                 genImage = generator.forward(image).to(image.device)
                 saveCheckPoint(f"checkPoint_{TCfg.exec}_mini.pth", epoch=epoch-1, imer=imer)
+                save_model(generator, f"model_{TCfg.exec}_gen_mini.pth")
                 with torch.no_grad() :
                     preImage = generator.lowResProc(image).to(image.device)
                     svImage = torch.cat( [ normalizeImages(img)[0].detach().cpu() for img in
