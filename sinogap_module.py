@@ -666,7 +666,7 @@ class SubGeneratorTemplate(nn.Module):
         self.fcLink = None
 
     def device(self):
-        return next(self.lastTouch.parameters()).device
+        return next(self.parameters()).device
 
     def encblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=1) :
         if norm is None :
@@ -866,6 +866,7 @@ class GeneratorTemplate(SubGeneratorTemplate):
 
     def lowResProc(self, images) :
         images, orgDims = unsqeeze4dim(images)
+        images = images.to(self.device())
         if self.cfg.gapW == 2:
             gap = torch.cat( [ ( 2*images[:,0:1,:,[self.cfg.gapRngX.start-1]] + images[:,0:1,:,[self.cfg.gapRngX.stop]   ] ) / 3,
                                ( 2*images[:,0:1,:,[self.cfg.gapRngX.stop]   ] + images[:,0:1,:,[self.cfg.gapRngX.start-1]] ) / 3,
@@ -888,6 +889,7 @@ class GeneratorTemplate(SubGeneratorTemplate):
     def forward(self, images):
 
         # channel 0
+        images = images.to(self.device())
         preImages = self.lowResProc(images)
         preFilledImages = self.fillTheGap(images, preImages)
         preFilledImages, norms = normalizeImages(preFilledImages)
@@ -1383,7 +1385,7 @@ def summarizeMe(toSumm, onPrep=True):
     with torch.no_grad() :
         if isinstance(toSumm, torch.utils.data.DataLoader) :
             for it , data in tqdm.tqdm(enumerate(toSumm), total=int(len(toSumm))):
-                summarizeImages(data[0])
+                summarizeImages(data[0].to(sg.generator.device()))
         elif isinstance(toSumm, torch.Tensor) :
             summarizeImages(toSumm)
         else :
@@ -1689,6 +1691,10 @@ resAcc = TrainResClass()
 revert_minimal_criteria = None
 correlatedCriteriaFile = None
 
+def preTransformImage(images):
+    return images.to(generator.device())
+
+
 def train(savedCheckPoint):
     global epoch, minGLoss, minGEpoch, startFrom, imer, resAcc
     global minimal_criteria, revert_minimal_criteria, correlatedCriteriaFile, lrCoeff
@@ -1715,6 +1721,7 @@ def train(savedCheckPoint):
                 startFrom -= 1
                 continue
             images = data[0]
+            images = preTransformImage(images)
             imer += images.shape[0]
 
             if correlatedCriteriaFile is not None :
