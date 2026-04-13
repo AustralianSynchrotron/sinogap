@@ -1460,6 +1460,34 @@ def loss_CNP(p_true, p_pred):
     return CNP(p_pred.to(CNP.device), p_true.to(CNP.device))
 
 
+def loss_CNPL(p_true, p_pred):
+    global CNP
+    if CNP is None :
+        CNP = ConvNextPerceptualLoss(
+            model_type=ConvNextType.LARGE,
+            feature_layers=[0, 2, 4, 6, 8, 10, 12, 14], # Max index is 14 here
+            use_gram=False,
+            device=p_pred.device,
+            layer_weight_decay=0.99
+        )
+    with torch.no_grad() :
+        l_true = p_true.view(-1,p_pred.shape[1],1,p_pred.shape[-1])
+        l_true, norms = normalizeImages(l_true)
+        l_true = l_true.view(p_true.shape)
+    l_pred = p_pred.view(-1,p_pred.shape[1],1,p_pred.shape[-1])
+    l_pred = (l_pred - norms[2]) / norms[1]
+    l_pred = l_pred.view(p_pred.shape)
+    return loss_CNP(l_pred, l_true)
+
+
+
+def loss_LR(p_true, p_pred) :
+    lr_pred = torch.nn.functional.interpolate(p_pred, scale_factor=0.5, mode='area')
+    with torch.no_grad() :
+        lr_true = torch.nn.functional.interpolate(p_true.to(p_pred.device), scale_factor=0.5, mode='area')
+        lr_true = generator.lowResGenerator.generateImages(lr_true.detach())
+    return MSE(lr_pred[generator.lowResGenerator.cfg.gapRng], lr_true[generator.lowResGenerator.cfg.gapRng]).sum(dim=(-1,-2,-3))
+
 
 sobelKernelXY = torch.tensor([[[[-1, 0, 1],
                                 [-2, 0, 2],
@@ -1641,7 +1669,7 @@ def summarizeMe(toSumm, onPrep=True):
         subBatchSize = nofIm // batchSplit
         for i in range(batchSplit) :
             subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
-            subImages = images[subRange,...]
+            subImages = preTransformImage(images[subRange,...])
             subFakeImages = generator.lowResProc(subImages) \
                                 if onPrep else \
                             generator.generateImages(subImages)
