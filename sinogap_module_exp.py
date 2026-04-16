@@ -2204,6 +2204,11 @@ def train(savedCheckPoint, epochSize=None):
         generator.eval()
         print("Reference images in eval mode:")
         displayImages()
+
+        saveModels()
+        os.system(f"mv {savedCheckPoint}.pth {savedCheckPoint}_previous.pth")
+        saveCheckPoint(savedCheckPoint+".pth", epoch=epoch, imer=imer)
+
         try :
             resTest = summarizeMe(testLoader, False)
             resTest *= 1/resTest.nofIm
@@ -2227,10 +2232,6 @@ def train(savedCheckPoint, epochSize=None):
         if minGLoss is None or minGLoss == 0 or lastGLoss < minGLoss :
             minGLoss = lastGLoss
             minGEpoch = epoch
-        saveModels()
-        os.system(f"mv {savedCheckPoint}.pth {savedCheckPoint}_previous.pth")
-        saveCheckPoint(savedCheckPoint+".pth", epoch=epoch, imer=imer)
-        if minGEpoch == epoch :
             os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_best.pth")
             os.system(f"cp {savedCheckPoint}_previous.pth {savedCheckPoint}_beforebest.pth")
             #saveModels(f"model_{TCfg.exec}_B")
