@@ -720,6 +720,13 @@ def fillTheGap(images, gap) :
 
 
 
+
+
+
+
+
+
+
 class SubTemplate(nn.Module):
 
     def __init__(self, gapW, brick):
@@ -767,8 +774,6 @@ class SubTemplate(nn.Module):
 
     def forward(self, images):
         raise Exception("this is not for direct use")
-
-
 
 
 
@@ -1250,7 +1255,7 @@ def loss_Adv_Gen(p_true, p_pred):
     loss_pred, predictions_pred = loss_Adv(p_pred, False)
     advWeights = ( (predictions_true+1e-7) / (predictions_pred+1e-7) ) -  1
     writer.add_scalars("Aux", {'Adversiry': advWeights.mean()}, imer)
-    return loss_pred * advWeights
+    return loss_pred , advWeights
 
 def loss_Adv_Dis(p_true, p_pred):
     loss_true, predictions_true = loss_Adv(p_true, True)
@@ -1579,10 +1584,20 @@ def loss_Gen(p_true, p_pred):
     individualLosses = {}
     for key, metrics in metrices.items():
         if metrics.norm > 0 :
+            #with torch.set_grad_enabled( metrics.weight > 0 ) :
+            #    thisLoss = metrics.calculate(p_true, p_pred).to(myDev) / metrics.norm
+            #losses = losses + thisLoss * metrics.weight
+            #sumweights += metrics.weight
             with torch.set_grad_enabled( metrics.weight > 0 ) :
-                thisLoss = metrics.calculate(p_true, p_pred).to(myDev) / metrics.norm
-            losses = losses + thisLoss * metrics.weight
-            sumweights += metrics.weight
+                returnFromLoss = metrics.calculate(p_true, p_pred)
+                if isinstance(returnFromLoss, tuple) :
+                    thisLoss = returnFromLoss[1].to(myDev) * returnFromLoss[0].to(myDev) / metrics.norm
+                    weightModifiers = returnFromLoss[1]
+                else :
+                    thisLoss = returnFromLoss.to(myDev) / metrics.norm
+                    weightModifiers = torch.tensor(1.0, requires_grad=False, device=myDev)
+            losses = losses + thisLoss * weightModifiers * metrics.weight
+            sumweights = sumweights + metrics.weight * weightModifiers.sum()
             individualLosses[key] = thisLoss.detach().sum().item()
             updateExtremes(thisLoss, key, p_true, p_pred)
         else :
@@ -1591,11 +1606,24 @@ def loss_Gen(p_true, p_pred):
     updateExtremes(loss, 'loss', p_true, p_pred)
     return loss.sum() , individualLosses
 
+
 def loss_Dis(p_true, p_pred):
     myDev = p_pred.device
     p_true = p_true.to(myDev)
     advRes = loss_Adv_Dis(p_true, p_pred)
     return advRes[0].sum() / ( 2 * metrices['Adv'].norm ) , advRes[1]
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -2088,7 +2116,7 @@ def train(savedCheckPoint, epochSize=None):
                 dealWithTheFollowers(images, data[1], criteriaBefore, criteriaAfter)
 
 
-            #if True:
+            # Per minute update:
             if time.time() - lastUpdateTime > 60  or imer == images.shape[0]:
 
                 # generate previews
@@ -2164,6 +2192,7 @@ def train(savedCheckPoint, epochSize=None):
                 updAcc = TrainResClass()
                 #_ = trackExtremes()
 
+            # Per hour save:
             if time.time() - lastSaveTime > 3600 :
 
                 lastSaveTime = time.time()
@@ -2184,6 +2213,7 @@ def train(savedCheckPoint, epochSize=None):
                     #    revert_minimal_criteria = minimal_criteria
 
 
+        # summary of the epoch
         print(resAcc)
         resAcc *= 1/resAcc.nofIm
         for key in resAcc.metrices.keys() :
@@ -2198,17 +2228,35 @@ def train(savedCheckPoint, epochSize=None):
                                #,'Pre':trainRes.predGen
                                }, epoch )
 
-        generator.train()
-        print("Reference images in train mode:")
-        displayImages()
-        generator.eval()
-        print("Reference images in eval mode:")
-        displayImages()
+        # reference views after epoch
+        def overview():
+            with torch.no_grad() :
+                probs_ref = []
+                progs_gen = []
+                for idx in range(refImages.shape[0]) :
+                    probs_ref.append(discriminator.forward(refImages[[idx],...]).view(-1).item())
+                    progs_gen.append(discriminator.forward(generator.generateImages(refImages[[idx],...])).view(-1).item())
+                print(probs_ref)
+                print(progs_gen)
+                displayImages()
+        try :
+            generator.train()
+            print("Reference images in train mode:")
+            overview()
+            generator.eval()
+            print("Reference images in eval mode:")
+            overview()
+        except Exception as e:
+            print(e)
+            continue
 
+
+        # save current models
         saveModels()
         os.system(f"mv {savedCheckPoint}.pth {savedCheckPoint}_previous.pth")
         saveCheckPoint(savedCheckPoint+".pth", epoch=epoch, imer=imer)
 
+        # post-epoch test summary
         try :
             resTest = summarizeMe(testLoader, False)
             resTest *= 1/resTest.nofIm
@@ -2223,11 +2271,10 @@ def train(savedCheckPoint, epochSize=None):
                     ,'Gen':resTest.predFake
                     }, epoch )
         except Exception as e:
+            print(e)
             continue
 
-        #generator.train()
-
-
+        # saving if test is the best so far
         lastGLoss = resTest.lossG # Rec_test
         if minGLoss is None or minGLoss == 0 or lastGLoss < minGLoss :
             minGLoss = lastGLoss
@@ -2236,6 +2283,7 @@ def train(savedCheckPoint, epochSize=None):
             os.system(f"cp {savedCheckPoint}_previous.pth {savedCheckPoint}_beforebest.pth")
             #saveModels(f"model_{TCfg.exec}_B")
 
+        # reset and other post-epoch actions
         resAcc = TrainResClass()
         afterEachEpoch(locals())
         print("Epoch completed.\n")
