@@ -1249,10 +1249,13 @@ def loss_Adv(images, truth):
     BCE.to(images.device)
     return BCE(predictions, labels)[...,0], predictions
 
+weightedAdversarialLoss = True
 def loss_Adv_Gen(p_true, p_pred):
-    global imer
-    loss_true, predictions_true = loss_Adv(p_true, True)
+    global imer, weightedAdversarialLoss
     loss_pred, predictions_pred = loss_Adv(p_pred, False)
+    if not weightedAdversarialLoss :
+        return loss_pred
+    loss_true, predictions_true = loss_Adv(p_true, True)
     advWeights = ( (predictions_true+1e-7) / (predictions_pred+1e-7) ) -  1
     writer.add_scalars("Aux", {'Adversiry': advWeights.mean()}, imer)
     return loss_pred , advWeights
@@ -2231,13 +2234,14 @@ def train(savedCheckPoint, epochSize=None):
         # reference views after epoch
         def overview():
             with torch.no_grad() :
-                probs_ref = []
-                progs_gen = []
-                for idx in range(refImages.shape[0]) :
-                    probs_ref.append(discriminator.forward(refImages[[idx],...]).view(-1).item())
-                    progs_gen.append(discriminator.forward(generator.generateImages(refImages[[idx],...])).view(-1).item())
-                print(probs_ref)
-                print(progs_gen)
+                if 'Adv' in metrices and  metrices['Adv'].weight > 0 :
+                    probs_ref = []
+                    progs_gen = []
+                    for idx in range(refImages.shape[0]) :
+                        probs_ref.append(discriminator.forward(refImages[[idx],...]).view(-1).item())
+                        progs_gen.append(discriminator.forward(generator.generateImages(refImages[[idx],...])).view(-1).item())
+                    print(probs_ref)
+                    print(progs_gen)
                 displayImages()
         try :
             generator.train()
