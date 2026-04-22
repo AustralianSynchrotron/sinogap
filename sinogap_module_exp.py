@@ -1946,13 +1946,14 @@ def dealWithTheFollowers(images, indeces, criteriaBefore, criteriaAfter) :
 
 lrCoeff = 1
 minimal_criteria = None
+last_criteria = None
 def updateCriteria(saveMe=True) :
-    global minimal_criteria, lrCoeff
-    crit = criteriaToFollow()
-    writer.add_scalars("Aux", {'Crit': crit}, imer)
-    if minimal_criteria is None or (crit < minimal_criteria) :
-        print(f"New best criteria: {crit:.3e}.")
-        minimal_criteria = crit
+    global minimal_criteria, last_criteria, lrCoeff
+    last_criteria = criteriaToFollow()
+    writer.add_scalars("Aux", {'Crit': last_criteria}, imer)
+    if minimal_criteria is None or (last_criteria < minimal_criteria) :
+        print(f"New best criteria: {last_criteria:.6e}.")
+        minimal_criteria = last_criteria
         image = refImages[[2],...]
         if saveMe :
             with torch.no_grad() :
@@ -1964,7 +1965,7 @@ def updateCriteria(saveMe=True) :
                     svImage = torch.cat( [ normalizeImages(img)[0].detach().cpu() for img in
                                       ( image, preImage, genImage, genImage-preImage, image - genImage ) ] , dim=-1 )
                 tifffile.imwrite(f"mini_{TCfg.exec}.tif", svImage[0,0,...].transpose(-1,-2).numpy())
-    return crit
+    return last_criteria
 
 
 
@@ -2035,8 +2036,14 @@ def train_step(allImages):
                 genLoss = genLoss / subBatchSize
                 if doTrainGen(locals()) :
                     genLoss.backward()
+            crit_before = criteriaToFollow()
             for optim in optimizers_G :
                 optim.step()
+            crit_after = criteriaToFollow()
+            if crit_after < crit_before : # do it again
+                for optim in optimizers_G :
+                    optim.step()
+            for optim in optimizers_G :
                 optim.zero_grad(set_to_none=True)
 
 
