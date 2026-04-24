@@ -36,7 +36,7 @@ import tifffile
 import tqdm
 
 import torchmetrics.image
-#import ssim
+import ssim
 from eagle_loss import Eagle_Loss
 from convnext_perceptual_loss import ConvNextPerceptualLoss, ConvNextType
 
@@ -1393,9 +1393,9 @@ def loss_SSIM(p_true, p_pred):
     SSIM.to(p_pred.device)
     return (1 - SSIM( p_true.to(p_pred.device), p_pred ) ) / 2
 
-#MSSSIM = ssim.MS_SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
-MSSSIM = torchmetrics.image.MultiScaleStructuralSimilarityIndexMeasure(
-    data_range=2.0, kernel_size=1, gaussian_kernel=False, reduction = None)
+MSSSIM = ssim.MS_SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
+#MSSSIM = torchmetrics.image.MultiScaleStructuralSimilarityIndexMeasure(
+#    data_range=2.0, kernel_size=1, gaussian_kernel=False, reduction = None)
 def loss_MSSSIM(p_true, p_pred):
     p_true, _ = unsqeeze4dim(p_true.to(p_pred.device))
     p_pred, _ = unsqeeze4dim(p_pred)
@@ -1945,10 +1945,11 @@ def dealWithTheFollowers(images, indeces, criteriaBefore, criteriaAfter) :
 
 
 lrCoeff = 1
+save_minimal = True
 minimal_criteria = None
 last_criteria = None
 def updateCriteria(saveMe=True) :
-    global minimal_criteria, last_criteria, lrCoeff
+    global minimal_criteria, last_criteria
     last_criteria = criteriaToFollow()
     writer.add_scalars("Aux", {'Crit': last_criteria}, imer)
     if minimal_criteria is None or (last_criteria < minimal_criteria) :
@@ -1970,7 +1971,7 @@ def updateCriteria(saveMe=True) :
 
 
 def train_step(allImages):
-    global skipGen, skipDis, followers
+    global skipGen, skipDis, followers, save_minimal
 
     trainRes = TrainResClass()
     allImages, _ = unsqeeze4dim(allImages)
@@ -2036,20 +2037,14 @@ def train_step(allImages):
                 genLoss = genLoss / subBatchSize
                 if doTrainGen(locals()) :
                     genLoss.backward()
-            crit_before = criteriaToFollow()
             for optim in optimizers_G :
                 optim.step()
-            crit_after = criteriaToFollow()
-            if crit_after < crit_before : # do it again
-                for optim in optimizers_G :
-                    optim.step()
-            for optim in optimizers_G :
                 optim.zero_grad(set_to_none=True)
 
 
 
     if minimal_criteria is not None :
-        updateCriteria()
+        updateCriteria(save_minimal)
 
     del genLoss
     del indLosses
@@ -2099,19 +2094,23 @@ def train(savedCheckPoint, epochSize=None):
         updAcc = TrainResClass()
         #_ = trackExtremes()
 
+        prev_data = None
         total = len(trainLoader)
         if epochSize is not None :
             total = min(total,epochSize)
         for it , data in tqdm.tqdm(enumerate(trainLoader), total=total):
             if epochSize is not None and resAcc.nofIm >= epochSize * TCfg.batchSize :
                 break
-            if startFrom :
-                startFrom -= 1
-                continue
 
-            if followers is not None :
-                data = mixInFollowers(data)
+            if prev_data is not None :
+                data = prev_data
+                criteriaBefore = criteriaAfter
+            else :
                 criteriaBefore = criteriaToFollow()
+
+            #if followers is not None :
+            #    data = mixInFollowers(data)
+            #    criteriaBefore = criteriaToFollow()
             images = data[0]
             images = preTransformImage(images)
             imer += images.shape[0]
@@ -2121,9 +2120,13 @@ def train(savedCheckPoint, epochSize=None):
             resAcc += trainRes
             updAcc += trainRes
 
-            if followers is not None :
-                criteriaAfter = criteriaToFollow()
-                dealWithTheFollowers(images, data[1], criteriaBefore, criteriaAfter)
+
+            criteriaAfter = criteriaToFollow()
+            #prev_data = None if (prev_data is not None or criteriaAfter > criteriaBefore ) else data
+            ### prev_data = None if criteriaAfter > criteriaBefore else data
+            #if followers is not None :
+            #    criteriaAfter = criteriaToFollow()
+            #    dealWithTheFollowers(images, data[1], criteriaBefore, criteriaAfter)
 
 
             # Per minute update:
@@ -2222,77 +2225,78 @@ def train(savedCheckPoint, epochSize=None):
                     #elif revert_minimal_criteria is not None :
                     #    revert_minimal_criteria = minimal_criteria
 
-
-        # summary of the epoch
-        print(resAcc)
-        resAcc *= 1/resAcc.nofIm
-        for key in resAcc.metrices.keys() :
-            if metrices[key].norm > 0 :
-                writer.add_scalars("Metrices per epoch", {key : resAcc.metrices[key],}, epoch )
-        writer.add_scalars("Losses per epoch",{'Gen': resAcc.lossG,}, epoch )
-        if discriminator is not None :
-            writer.add_scalars("Losses per epoch",{'Dis': resAcc.lossD}, epoch )
-            writer.add_scalars("Probs per epoch",
-                               {'Ref':resAcc.predReal
-                               ,'Gen':resAcc.predFake
-                               #,'Pre':trainRes.predGen
-                               }, epoch )
-
-        # reference views after epoch
-        def overview():
-            with torch.no_grad() :
-                if 'Adv' in metrices and  metrices['Adv'].weight > 0 :
-                    probs_ref = []
-                    progs_gen = []
-                    for idx in range(refImages.shape[0]) :
-                        probs_ref.append(discriminator.forward(refImages[[idx],...]).view(-1).item())
-                        progs_gen.append(discriminator.forward(generator.generateImages(refImages[[idx],...])).view(-1).item())
-                    print(probs_ref)
-                    print(progs_gen)
-                displayImages()
-        try :
-            generator.train()
-            print("Reference images in train mode:")
-            overview()
-            generator.eval()
-            print("Reference images in eval mode:")
-            overview()
-        except Exception as e:
-            print(e)
-            continue
-
-
-        # save current models
-        saveModels()
-        os.system(f"mv {savedCheckPoint}.pth {savedCheckPoint}_previous.pth")
-        saveCheckPoint(savedCheckPoint+".pth", epoch=epoch, imer=imer)
-
-        # post-epoch test summary
-        try :
-            resTest = summarizeMe(testLoader, False)
-            resTest *= 1/resTest.nofIm
-            for key in resTest.metrices.keys() :
+        # Per epoch update:
+        if True :
+            # summary of the epoch
+            print(resAcc)
+            resAcc *= 1/resAcc.nofIm
+            for key in resAcc.metrices.keys() :
                 if metrices[key].norm > 0 :
-                    writer.add_scalars("Metrices epoch test", {key : resTest.metrices[key],}, epoch )
-            writer.add_scalars("Losses epoch test",{'Gen': resTest.lossG}, epoch )
+                    writer.add_scalars("Metrices per epoch", {key : resAcc.metrices[key],}, epoch )
+            writer.add_scalars("Losses per epoch",{'Gen': resAcc.lossG,}, epoch )
             if discriminator is not None :
-                writer.add_scalars("Losses epoch test",{'Dis': resTest.lossD}, epoch )
-                writer.add_scalars("Probs epoch test",
-                    {'Ref':resTest.predReal
-                    ,'Gen':resTest.predFake
-                    }, epoch )
-        except Exception as e:
-            print(e)
-            continue
+                writer.add_scalars("Losses per epoch",{'Dis': resAcc.lossD}, epoch )
+                writer.add_scalars("Probs per epoch",
+                                   {'Ref':resAcc.predReal
+                                   ,'Gen':resAcc.predFake
+                                   #,'Pre':trainRes.predGen
+                                   }, epoch )
 
-        # saving if test is the best so far
-        lastGLoss = resTest.lossG # Rec_test
-        if minGLoss is None or minGLoss == 0 or lastGLoss < minGLoss :
-            minGLoss = lastGLoss
-            minGEpoch = epoch
-            os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_best.pth")
-            os.system(f"cp {savedCheckPoint}_previous.pth {savedCheckPoint}_beforebest.pth")
-            #saveModels(f"model_{TCfg.exec}_B")
+            # reference views after epoch
+            def overview():
+                with torch.no_grad() :
+                    if 'Adv' in metrices and  metrices['Adv'].weight > 0 :
+                        probs_ref = []
+                        progs_gen = []
+                        for idx in range(refImages.shape[0]) :
+                            probs_ref.append(discriminator.forward(refImages[[idx],...]).view(-1).item())
+                            progs_gen.append(discriminator.forward(generator.generateImages(refImages[[idx],...])).view(-1).item())
+                        print(probs_ref)
+                        print(progs_gen)
+                    displayImages()
+            try :
+                generator.train()
+                print("Reference images in train mode:")
+                overview()
+                generator.eval()
+                print("Reference images in eval mode:")
+                overview()
+            except Exception as e:
+                print(e)
+                continue
+
+
+            # save current models
+            saveModels()
+            os.system(f"mv {savedCheckPoint}.pth {savedCheckPoint}_previous.pth")
+            saveCheckPoint(savedCheckPoint+".pth", epoch=epoch, imer=imer)
+
+            # post-epoch test summary
+            try :
+                resTest = summarizeMe(testLoader, False)
+                resTest *= 1/resTest.nofIm
+                for key in resTest.metrices.keys() :
+                    if metrices[key].norm > 0 :
+                        writer.add_scalars("Metrices epoch test", {key : resTest.metrices[key],}, epoch )
+                writer.add_scalars("Losses epoch test",{'Gen': resTest.lossG}, epoch )
+                if discriminator is not None :
+                    writer.add_scalars("Losses epoch test",{'Dis': resTest.lossD}, epoch )
+                    writer.add_scalars("Probs epoch test",
+                        {'Ref':resTest.predReal
+                        ,'Gen':resTest.predFake
+                        }, epoch )
+            except Exception as e:
+                print(e)
+                continue
+
+            # saving if test is the best so far
+            lastGLoss = resTest.lossG # Rec_test
+            if minGLoss is None or minGLoss == 0 or lastGLoss < minGLoss :
+                minGLoss = lastGLoss
+                minGEpoch = epoch
+                os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_best.pth")
+                os.system(f"cp {savedCheckPoint}_previous.pth {savedCheckPoint}_beforebest.pth")
+                #saveModels(f"model_{TCfg.exec}_B")
 
         # reset and other post-epoch actions
         resAcc = TrainResClass()
