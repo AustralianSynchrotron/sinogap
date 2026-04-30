@@ -1463,7 +1463,7 @@ def loss_CNP(p_true, p_pred):
             feature_layers=[0, 2, 4, 6, 8, 10, 12, 14], # Max index is 14 here
             use_gram=False,
             device=p_pred.device,
-            layer_weight_decay=0.99
+            layer_weight_decay=1
         )
     return CNP(p_pred.to(CNP.device), p_true.to(CNP.device))
 
@@ -1947,26 +1947,29 @@ def dealWithTheFollowers(images, indeces, criteriaBefore, criteriaAfter) :
 lrCoeff = 1
 save_minimal = True
 minimal_criteria = None
+saved_criteria = None
 last_criteria = None
 def updateCriteria(saveMe=True) :
-    global minimal_criteria, last_criteria
+    global minimal_criteria, last_criteria, saved_criteria
     last_criteria = criteriaToFollow()
     writer.add_scalars("Aux", {'Crit': last_criteria}, imer)
     if minimal_criteria is None or (last_criteria < minimal_criteria) :
         print(f"New best criteria: {last_criteria:.6e}.")
         minimal_criteria = last_criteria
-        image = refImages[[2],...]
-        if saveMe :
+        if saveMe and (saved_criteria is None or minimal_criteria < 0.998 * saved_criteria) :
+            image = refImages[[2],...]
             with torch.no_grad() :
                 genImage = generator.forward(image).to(image.device)
-                saveCheckPoint(f"checkPoint_{TCfg.exec}_mini.pth", epoch=epoch-1, imer=imer)
-                save_model(generator, f"model_{TCfg.exec}_gen_mini.pt")
-                with torch.no_grad() :
-                    preImage = generator.lowResProc(image).to(image.device)
-                    svImage = torch.cat( [ normalizeImages(img)[0].detach().cpu() for img in
-                                      ( image, preImage, genImage, genImage-preImage, image - genImage ) ] , dim=-1 )
-                tifffile.imwrite(f"mini_{TCfg.exec}.tif", svImage[0,0,...].transpose(-1,-2).numpy())
+                preImage = generator.lowResProc(image).to(image.device)
+                svImage = torch.cat( [ normalizeImages(img)[0].detach().cpu() for img in
+                                  ( image, preImage, genImage, genImage-preImage, image - genImage ) ] , dim=-1 )
+            saveCheckPoint(f"checkPoint_{TCfg.exec}_mini.pth", epoch=epoch-1, imer=imer)
+            save_model(generator, f"model_{TCfg.exec}_gen_mini.pt")
+            tifffile.imwrite(f"mini_{TCfg.exec}.tif", svImage[0,0,...].transpose(-1,-2).numpy())
+            saved_criteria = minimal_criteria
     return last_criteria
+
+
 
 
 
@@ -1986,42 +1989,28 @@ def train_step(allImages):
         batchSplit = TCfg.batchSplit if TCfg.batchSplit > 1 else 1
         subBatchSize = nofIm // batchSplit
 
-        # train discriminator
-        if 'Adv' in metrices and  metrices['Adv'].weight > 0 :
-            if repeatDis :
-                for _ in range(repeatDis) :
-                    for optim in optimizers_D :
-                        optim.zero_grad(set_to_none=False)
-                    for i in range(batchSplit) :
-                        subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
-                        subImages = images[subRange,...]
-                        with torch.no_grad() : # create fake images to be descriminated
-                            subFakeImages = generator.generateImages(subImages)
-                        #subImages.requires_grad = True
-                        #subFakeImages.requires_grad = True
-                        disLoss, probs = loss_Dis(subImages, subFakeImages)
-                        trainRes.predReal += probs[:subBatchSize,0].sum().item() / repeatDis
-                        trainRes.predFake += probs[subBatchSize:,0].sum().item() / repeatDis
-                        trainRes.lossD += disLoss.item() / repeatDis
-                        if doTrainDis(locals()) :
-                            disLoss = disLoss / subBatchSize
-                            disLoss.backward()
-                    for optim in optimizers_D :
-                        optim.step()
-                        optim.zero_grad(set_to_none=True)
-            else :
+        def trainDiscriminator() :
+            for optim in optimizers_D :
+                optim.zero_grad(set_to_none=False)
+            for i in range(batchSplit) :
+                subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
+                subImages = images[subRange,...]
                 with torch.no_grad() : # create fake images to be descriminated
-                    for i in range(batchSplit) :
-                        subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
-                        subImages = images[subRange,...]#.clone().detach()
-                        subFakeImages = generator.generateImages(subImages)
-                        disLoss, probs = loss_Dis(subImages, subFakeImages.detach())
-                        trainRes.predReal += probs[:subBatchSize,0].sum().item()
-                        trainRes.predFake += probs[subBatchSize:,0].sum().item()
-                        trainRes.lossD += disLoss.item()
+                    subFakeImages = generator.generateImages(subImages)
+                #subImages.requires_grad = True
+                #subFakeImages.requires_grad = True
+                disLoss, probs = loss_Dis(subImages, subFakeImages)
+                trainRes.predReal += probs[:subBatchSize,0].sum().item() / repeatDis
+                trainRes.predFake += probs[subBatchSize:,0].sum().item() / repeatDis
+                trainRes.lossD += disLoss.item() / repeatDis
+                if doTrainDis(locals()) :
+                    disLoss = disLoss / subBatchSize
+                    disLoss.backward()
+            for optim in optimizers_D :
+                optim.step()
+                optim.zero_grad(set_to_none=True)
 
-        # train generator
-        for _ in range(repeatGen) :
+        def trainGenerator() :
             for optim in optimizers_G :
                 optim.zero_grad(set_to_none=False)
             for i in range(batchSplit) :
@@ -2042,12 +2031,31 @@ def train_step(allImages):
                 optim.zero_grad(set_to_none=True)
 
 
+        # train discriminator
+        if 'Adv' in metrices and  metrices['Adv'].weight > 0 :
+            if repeatDis > 0 :
+                for _ in range(repeatDis) :
+                    trainDiscriminator()
+            else :
+                with torch.no_grad() : # create fake images to be descriminated
+                    for i in range(batchSplit) :
+                        subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
+                        subImages = images[subRange,...]#.clone().detach()
+                        subFakeImages = generator.generateImages(subImages)
+                        disLoss, probs = loss_Dis(subImages, subFakeImages.detach())
+                        trainRes.predReal += probs[:subBatchSize,0].sum().item()
+                        trainRes.predFake += probs[subBatchSize:,0].sum().item()
+                        trainRes.lossD += disLoss.item()
+
+        # train generator
+        if repeatGen > 0 :
+            for _ in range(repeatGen) :
+                trainGenerator()
+
 
     if minimal_criteria is not None :
         updateCriteria(save_minimal)
 
-    del genLoss
-    del indLosses
     return trainRes
 
 
@@ -2082,6 +2090,12 @@ def train(savedCheckPoint, epochSize=None):
     lastUpdateTime = time.time()
     lastSaveTime = time.time()
 
+    prev_data = None
+    initLRs = { sched : sched.get_last_lr()[0] / TCfg.learningRateG for sched in schedulers_G }
+    repCounter = 0
+    localMinima = 1e100
+    localMinimaIter = 0
+
     while TCfg.nofEpochs is None or epoch <= TCfg.nofEpochs :
         epoch += 1
         beforeEachEpoch(epoch)
@@ -2094,7 +2108,6 @@ def train(savedCheckPoint, epochSize=None):
         updAcc = TrainResClass()
         #_ = trackExtremes()
 
-        prev_data = None
         total = len(trainLoader)
         if epochSize is not None :
             total = min(total,epochSize)
@@ -2121,16 +2134,43 @@ def train(savedCheckPoint, epochSize=None):
             updAcc += trainRes
 
 
-            criteriaAfter = criteriaToFollow()
-            #prev_data = None if (prev_data is not None or criteriaAfter > criteriaBefore ) else data
-            ### prev_data = None if criteriaAfter > criteriaBefore else data
-            #if followers is not None :
-            #    criteriaAfter = criteriaToFollow()
-            #    dealWithTheFollowers(images, data[1], criteriaBefore, criteriaAfter)
+            if followers is not None or localMinimaIter > 200 :
+                prev_data = None
+                repCounter = 0
+                localMinima = 1e100
+            else :
+                criteriaAfter = criteriaToFollow()
+                if criteriaAfter < criteriaBefore  :
+                    if repCounter == 0 :
+                        prev_data = data
+                        initLRs = { sched : sched.get_last_lr()[0] / TCfg.learningRateG for sched in schedulers_G }
+                        for sched in schedulers_G :
+                            #sched.gamma = 1-0.01
+                            torch.optim.lr_scheduler.LambdaLR(sched.optimizer, lambda epoch: initLRs[sched]/2).step()
+                    repCounter += 1
+                    localMinimaIter += 1
+                    if criteriaAfter < localMinima :
+                        localMinima = criteriaAfter
+                        localMinimaIter = 0
+                elif repCounter and ( criteriaAfter < localMinima * 1.005 ) :
+                    repCounter += 1
+                    localMinimaIter += 1
+                else :
+                    prev_data = None
+                    if repCounter > 0 :
+                        localMinima = 1e100
+                        for sched in schedulers_G :
+                            #sched.gamma = 1-0.002
+                            torch.optim.lr_scheduler.LambdaLR(sched.optimizer, lambda epoch: initLRs[sched]).step()
+                    repCounter = 0
+                    localMinimaIter = 0
+                if repCounter == 10 :
+                    _= load_model(generator, f"model_{TCfg.exec}_gen_mini.pt")
+
 
 
             # Per minute update:
-            if time.time() - lastUpdateTime > 60  or imer == images.shape[0]:
+            if time.time() - lastUpdateTime > 60  or imer == images.shape[0] :
 
                 # generate previews
                 #generator.eval()
