@@ -1488,6 +1488,24 @@ def loss_CNPL(p_true, p_pred):
     return loss_CNP(l_pred, l_true)
 
 
+def loss_CNPR(p_true, p_pred):
+    global CNP
+    if CNP is None :
+        CNP = ConvNextPerceptualLoss(
+            model_type=ConvNextType.LARGE,
+            feature_layers=[0, 2, 4, 6, 8, 10, 12, 14], # Max index is 14 here
+            use_gram=False,
+            device=p_pred.device,
+            layer_weight_decay=1
+        )
+    delta = p_pred[DCfg.gapRng].to(CNP.device) - p_true[DCfg.gapRng].to(CNP.device)
+    delta = normalizeImages(delta)[0]
+    return CNP(delta, torch.randn_like(delta) )
+
+
+
+
+
 
 def loss_LR(p_true, p_pred) :
     lr_pred = torch.nn.functional.interpolate(p_pred, scale_factor=0.5, mode='area')
@@ -2059,11 +2077,13 @@ def train_step(allImages):
     return trainRes
 
 
-
 def beforeEachEpoch(locals) :
     return
 
 def afterEachEpoch(locals) :
+    return
+
+def beforeEpochReport(locals) :
     return
 
 def beforeReport(locals) :
@@ -2143,10 +2163,10 @@ def train(savedCheckPoint, epochSize=None):
                 if criteriaAfter < criteriaBefore  :
                     if repCounter == 0 :
                         prev_data = data
-                        initLRs = { sched : sched.get_last_lr()[0] / TCfg.learningRateG for sched in schedulers_G }
-                        for sched in schedulers_G :
-                            #sched.gamma = 1-0.01
-                            torch.optim.lr_scheduler.LambdaLR(sched.optimizer, lambda epoch: initLRs[sched]/2).step()
+                        #initLRs = { sched : sched.get_last_lr()[0] / TCfg.learningRateG for sched in schedulers_G }
+                        #for sched in schedulers_G :
+                        #    #sched.gamma = 1-0.01
+                        #    torch.optim.lr_scheduler.LambdaLR(sched.optimizer, lambda epoch: initLRs[sched]/2).step()
                     repCounter += 1
                     localMinimaIter += 1
                     if criteriaAfter < localMinima :
@@ -2159,9 +2179,9 @@ def train(savedCheckPoint, epochSize=None):
                     prev_data = None
                     if repCounter > 0 :
                         localMinima = 1e100
-                        for sched in schedulers_G :
-                            #sched.gamma = 1-0.002
-                            torch.optim.lr_scheduler.LambdaLR(sched.optimizer, lambda epoch: initLRs[sched]).step()
+                        #for sched in schedulers_G :
+                        #    #sched.gamma = 1-0.002
+                        #    torch.optim.lr_scheduler.LambdaLR(sched.optimizer, lambda epoch: initLRs[sched]).step()
                     repCounter = 0
                     localMinimaIter = 0
                 if repCounter == 10 :
@@ -2267,6 +2287,9 @@ def train(savedCheckPoint, epochSize=None):
 
         # Per epoch update:
         if True :
+
+            beforeEpochReport(locals())
+
             # summary of the epoch
             print(resAcc)
             resAcc *= 1/resAcc.nofIm
@@ -2303,7 +2326,7 @@ def train(savedCheckPoint, epochSize=None):
                 overview()
             except Exception as e:
                 print(e)
-                continue
+                #continue
 
 
             # save current models
