@@ -1403,6 +1403,14 @@ def loss_MSSSIM(p_true, p_pred):
     MSSSIM.to(p_pred.device)
     return (1 - MSSSIM( p_true, p_pred ) ) / 2
 
+def loss_MRSSIM(p_true, p_pred):
+    dd = p_pred[DCfg.gapRng] - p_true[DCfg.gapRng].to(p_pred.device)
+    delta = torch.zeros_like(p_pred)
+    delta[DCfg.gapRng] = normalizeImages(dd)[0]
+    randd = torch.zeros_like(p_pred)
+    randd[DCfg.gapRng] = torch.randn_like(dd)
+    return loss_MSSSIM(delta, randd)
+
 SSC = torchmetrics.image.SpatialCorrelationCoefficient(window_size=3)
 def loss_SCC(p_true, p_pred):
     SSC.to(p_pred.device)
@@ -1489,18 +1497,12 @@ def loss_CNPL(p_true, p_pred):
 
 
 def loss_CNPR(p_true, p_pred):
-    global CNP
-    if CNP is None :
-        CNP = ConvNextPerceptualLoss(
-            model_type=ConvNextType.LARGE,
-            feature_layers=[0, 2, 4, 6, 8, 10, 12, 14], # Max index is 14 here
-            use_gram=False,
-            device=p_pred.device,
-            layer_weight_decay=1
-        )
-    delta = p_pred[DCfg.gapRng].to(CNP.device) - p_true[DCfg.gapRng].to(CNP.device)
-    delta = normalizeImages(delta)[0]
-    return CNP(delta, torch.randn_like(delta) )
+    dd = p_pred[DCfg.gapRng] - p_true[DCfg.gapRng].to(p_pred.device)
+    delta = torch.zeros_like(p_pred)
+    delta[DCfg.gapRng] = normalizeImages(dd)[0]
+    randd = torch.zeros_like(p_pred)
+    randd[DCfg.gapRng] = torch.randn_like(dd)
+    return CNP(delta,  randd)
 
 
 
