@@ -1994,7 +1994,7 @@ def updateCriteria(saveMe=True) :
 
 
 def train_step(allImages):
-    global skipGen, skipDis, followers, save_minimal
+    global skipGen, skipDis, followers, save_minimal, repeatDis, repeatGen
 
     trainRes = TrainResClass()
     allImages, _ = unsqeeze4dim(allImages)
@@ -2078,6 +2078,11 @@ def train_step(allImages):
 
     return trainRes
 
+def beforeTrain(locals) :
+    return
+
+def afterTrain(locals) :
+    return
 
 def beforeEachEpoch(locals) :
     return
@@ -2151,7 +2156,9 @@ def train(savedCheckPoint, epochSize=None):
             imer += images.shape[0]
 
             # acrtual training
+            beforeTrain(locals())
             trainRes = train_step(images)
+            afterTrain(locals())
             resAcc += trainRes
             updAcc += trainRes
 
@@ -2271,6 +2278,7 @@ def train(savedCheckPoint, epochSize=None):
             if time.time() - lastSaveTime > 3600 :
 
                 lastSaveTime = time.time()
+                os.system(f"mv {savedCheckPoint}_hourly.pth {savedCheckPoint}_hourly_previous.pth")
                 saveCheckPoint(savedCheckPoint+"_hourly.pth", epoch=epoch-1, imer=imer, interimRes=resAcc)
                 saveModels(f"model_{TCfg.exec}_hourly")
 
