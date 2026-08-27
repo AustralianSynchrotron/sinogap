@@ -1,4 +1,5 @@
 
+#from email import encoders
 from re import sub
 from weakref import ref
 import IPython
@@ -39,6 +40,10 @@ import torchmetrics.image
 import ssim
 from eagle_loss import Eagle_Loss
 from convnext_perceptual_loss import ConvNextPerceptualLoss, ConvNextType
+import pytorch_amfill
+from torchmetrics.regression import PearsonCorrCoef
+from torchmetrics import ConcordanceCorrCoef
+from torchmetrics.functional import concordance_corrcoef
 
 
 def initIfNew(var, val=None) :
@@ -74,6 +79,7 @@ global TCfg
 TCfg = initIfNew('TCfg')
 
 
+
 @dataclass
 class DCfgClass:
     gapW : int
@@ -84,12 +90,14 @@ class DCfgClass:
     gapRng : type(np.s_[:]) = field(repr = True, init = False)
     readSh : tuple = field(repr = True, init = False)
     def __post_init__(self):
-        self.readSh : tuple = (128 if self.brick else None ,128)
-        self.sinoSh = ( (8 if self.brick else 256) * self.gapW , 8*self.gapW )
-        self.gapSh = (self.sinoSh[0],self.gapW)
+        self.readSh : tuple = (128 if self.brick else None , 7*16)
+        self.sinoSh = ( (8 if self.brick else 256) * self.gapW , 7*self.gapW )
+        self.gapSh = (self.sinoSh[0], self.gapW)
         self.gapRngX = np.s_[ self.sinoSh[1]//2 - self.gapW//2 : self.sinoSh[1]//2 + self.gapW//2 ]
         self.gapRng = np.s_[...,self.gapRngX]
 DCfg = initIfNew('DCfg')
+
+
 
 
 def eprint(*args, **kwargs):
@@ -648,25 +656,28 @@ def squeezeOrg(tens, orgDims):
         tens = tens.squeeze(0)
     return tens
 
-def stripe2bricks(stripes) :
+def stripe2bricks(stripes, ratio=32) :
     width = stripes.shape[-1]
+    #if hight is None :
+    #    hight = width
+    hight = stripes.shape[-2] // ratio
     channels = stripes.shape[1]
-    bricks = stripes.unfold(-2,width,width//2).permute(0,2,1,4,3).reshape(-1,channels,width,width)
+    bricks = stripes.unfold(-2,hight,hight//2).permute(0,2,1,4,3).reshape(-1,channels,hight,width)
     return  bricks
 
+
 brickMasks = {}
-def bricks2stripe(bricks, ratio=None) :
+def bricks2stripe(bricks, ratio=32) :
     global brickMasks
-    if ratio is None:
-        ratio = DCfg.sinoSh[-2] // DCfg.sinoSh[-1]
     nofIm = bricks.shape[0] // (2*ratio-1)
     width = bricks.shape[-1]
+    hight = bricks.shape[-2]
     channels = bricks.shape[1]
-    myMask = brickMasks[width].to(bricks.device)
+    myMask = brickMasks[hight].repeat(1,width).unsqueeze(0).unsqueeze(0).to(bricks.device)
     bricks = myMask * bricks
-    stripesOrg = bricks.view(nofIm,-1,channels,width,width)[:, ::2,...].transpose(1,2).reshape((nofIm,channels,-1,width))
-    stripesAux = bricks.view(nofIm,-1,channels,width,width)[:,1::2,...].transpose(1,2).reshape((nofIm,channels,-1,width))
-    edge = width//2
+    stripesOrg = bricks.view(nofIm,-1,channels,hight,width)[:, ::2,...].transpose(1,2).reshape((nofIm,channels,-1,width))
+    stripesAux = bricks.view(nofIm,-1,channels,hight,width)[:,1::2,...].transpose(1,2).reshape((nofIm,channels,-1,width))
+    edge = hight//2
     stripes = torch.cat([ stripesOrg[:,:,:edge,:] / myMask[:,:,:edge,:],
                           stripesOrg[:,:,edge:-edge,:] + stripesAux,
                           stripesOrg[:,:,-edge:,:] / myMask[:,:,-edge:,:]
@@ -674,7 +685,9 @@ def bricks2stripe(bricks, ratio=None) :
                         dim=-2)
     return stripes
 
+
 def createBrickMasks():
+    global brickMasks
     brickMasks = {}
     brickLen = DCfg.sinoSh[-2]
     while brickLen >= 2 :
@@ -682,8 +695,8 @@ def createBrickMasks():
         halfLine = torch.tensor(halfLine, dtype=torch.float32)
         halfLine /= brickLen//2
         line = torch.cat( (halfLine, halfLine.flip(0)), dim=0)
-        myMask = line.view(-1,1).repeat(1,brickLen)
-        myMask = myMask.unsqueeze(0).unsqueeze(0) # add batch and channel dims
+        myMask = line.view(-1,1)#.repeat(1,brickLen)
+        #myMask = myMask.unsqueeze(0).unsqueeze(0) # add batch and channel dims
         brickMasks[brickLen] = myMask
         brickLen //= 2
     return brickMasks
@@ -715,6 +728,8 @@ def fillTheGap(images, gap) :
     return gapped
 
 
+def firstDevice(model):
+    return next(model.parameters()).device
 
 
 
@@ -729,22 +744,19 @@ def fillTheGap(images, gap) :
 
 class SubTemplate(nn.Module):
 
-    def __init__(self, gapW, brick):
+    def __init__(self, gapW, brick, inChannels, baseChannels, otherChannels, layers, outerKernel=3):
         super().__init__()
         self.cfg = DCfgClass(gapW, brick)
-        self.baseChannels = None
-        self.baseChannelsOther = None
-        self.lastTouch = None
-        self.batchNorm = False
+        self.inChannels = inChannels
+        self.baseChannels = baseChannels
+        self.otherChannels = otherChannels
+        self.entrance = None if inChannels == baseChannels else \
+            self.encblock(self.inChannels, self.baseChannels, stride=1, norm=False,
+                          kernel=outerKernel, padding=(outerKernel-1)//2 )
+        self.encoders = self.createEncoders(layers)
 
-    def device(self):
-        return next(self.parameters()).device
 
-    def encblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=1) :
-        if norm is None :
-            norm = self.batchNorm
-        #chIn = chIn*self.baseChannels if chIn >= 0 else -chIn
-        #chOut = chOut*self.baseChannels if chOut >= 0 else -chOut
+    def encblock(self, chIn, chOut, kernel, stride=1, norm=True, padding=1) :
         layers = []
         layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias = not norm,
                                 padding=padding, padding_mode='reflect')  )
@@ -754,23 +766,36 @@ class SubTemplate(nn.Module):
         fillWheights(layers)
         return torch.nn.Sequential(*layers)
 
-    def groundFloor(self, mult, kernel, stride=1) :
-        block1 = self.encblock(self.inChannels,
-                               self.baseChannels,
-                               kernel=kernel, stride=1, norm=False)
-        block2 = self.encblock(self.baseChannels+self.baseChannelsOther,
-                               mult*self.baseChannels,
-                               kernel=kernel, stride=stride, norm=self.batchNorm)
+
+    def encFloor(self, chIn, mult, kernel, stride=1, norm=True, padding=1) :
+        firstPadding = (kernel[0]//2, kernel[1]//2) if isinstance(kernel, tuple) else kernel//2
+        block1 = self.encblock( int(chIn*(self.baseChannels+self.otherChannels)),
+                               int(chIn*self.baseChannels),
+                               kernel, stride=1, norm=norm, padding=firstPadding)
+        block2 = self.encblock( int(chIn*(self.baseChannels+self.otherChannels)),
+                               int(chIn*self.baseChannels*mult),
+                               kernel, stride=stride, norm=norm, padding=padding)
         return (block1, block2)
 
-    def encFloor(self, chIn, mult, kernel, stride=1, norm=None, other=1) :
-        block1 = self.encblock( chIn*(self.baseChannels + other * self.baseChannelsOther),
-                               chIn*self.baseChannels,
-                               kernel, stride=1, norm=norm)
-        block2 = self.encblock( chIn*(self.baseChannels + other * self.baseChannelsOther),
-                               int(chIn*self.baseChannels*mult),
-                               kernel, stride=stride, norm=norm)
-        return (block1, block2)
+
+    def createEncoders(self, layers) :
+        encoders = nn.ModuleList([])
+        for layer in layers:
+            encoders.extend( self.encFloor(layer[0], mult=layer[1], kernel=layer[2], stride=layer[3], padding=layer[4]) )
+        return encoders
+
+
+    def postEncoderShape(self, encoders=None, inShape=None) :
+        if encoders is None :
+            encoders = self.encoders
+        if inShape is None :
+            inShape = (1, self.inChannels, *self.cfg.sinoSh)
+        smpl = torch.zeros(inShape)
+        for encoder in encoders :
+            smpl = torch.zeros((1, encoder[0].in_channels, *smpl.shape[2:]))
+            smpl = encoder(smpl)
+        return smpl.shape
+
 
     def forward(self, images):
         raise Exception("this is not for direct use")
@@ -779,62 +804,25 @@ class SubTemplate(nn.Module):
 
 class SubGeneratorTemplate(SubTemplate):
 
-
-    def __init__(self, gapW, brick, batchNorm=True, inChannels=1):
-        super().__init__(gapW, brick)
+    def __init__(self, gapW, brick, inChannels, baseChannels, otherChannels, layers, outerKernel=3):
+        super().__init__(gapW, brick, inChannels, baseChannels, otherChannels, layers, outerKernel=outerKernel)
         self.lowResGenerator = None
-        self.inChannels = inChannels
         self.amplitude = 4
-        self.batchNorm = batchNorm
+        self.decoders = self.createDecoders(layers)
+        self.lastTouch = None if inChannels == baseChannels else \
+                         nn.Sequential(
+                             nn.Conv2d(self.baseChannels+self.otherChannels + self.inChannels, 1, outerKernel,
+                                       bias=True, padding=(outerKernel-1)//2),
+                             nn.Tanh(),
+                         )
 
 
-    def zeroOthers(self) :
-        self.requires_grad_(False)
-        smpl = torch.zeros((1, self.inChannels, *self.cfg.sinoSh))
-        for encoder in self.encoders :
-            otherChannels = smpl.shape[1]
-            encoder[0].weight[:,otherChannels:,...] = 0
-            smpl = torch.zeros((1, encoder[0].in_channels, *smpl.shape[2:]),
-                               device=encoder[0].weight.device)
-            smpl = encoder(smpl)
-        for decoder in self.decoders :
-            otherChannels = 2*smpl.shape[1]
-            decoder[0].weight[otherChannels:,...] = 0
-            smpl = torch.zeros((1, decoder[0].in_channels, *smpl.shape[2:]),
-                               device=encoder[0].weight.device)
-            smpl = decoder(smpl)
-        otherChannels = smpl.shape[1] + self.inChannels
-        self.lastTouch[0].weight[:,otherChannels:,...]=0
-
-
-    def createAttic(self, encoders) :
-        smpl = torch.zeros((1, self.inChannels, *self.cfg.sinoSh))
-        for encoder in encoders :
-            smpl = torch.zeros((1, encoder[0].in_channels, *smpl.shape[2:]))
-            smpl = encoder(smpl)
-        encSh = smpl.shape
-        linChannels = math.prod(encSh)
-        toRet = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(linChannels, linChannels),
-            nn.LeakyReLU(0.2),
-            nn.Linear(linChannels, linChannels),
-            nn.LeakyReLU(0.2),
-            nn.Unflatten(1, encSh[1:]),
-        )
-        return toRet
-
-
-    def decblock(self, chIn, chOut, kernel, stride=1, norm=None, padding=1, outputPadding=None) :
-        if norm is None :
-            norm = self.batchNorm
+    def decblock(self, chIn, chOut, kernel, stride=1, norm=True, padding=1, outputPadding=None) :
         if outputPadding is None :
             if isinstance(stride, int) :
                 outputPadding = stride - 1
             else :
                 outputPadding = tuple( strd - 1 for strd in stride )
-        #chIn = chIn*self.baseChannels if chIn >= 0 else -chIn
-        #chOut = chOut*self.baseChannels if chOut >= 0 else -chOut
         layers = []
         layers.append( nn.ConvTranspose2d(chIn, chOut, kernel, stride=stride, bias = not norm,
                                           padding=padding, padding_mode='zeros', output_padding=outputPadding) )
@@ -845,22 +833,29 @@ class SubGeneratorTemplate(SubTemplate):
         return torch.nn.Sequential(*layers)
 
 
-    def decFloor(self, chOut, reduce, kernel, stride=1, norm=None, other=1) :
-        block1 = self.decblock( int(reduce*2*chOut*(self.baseChannels + other * self.baseChannelsOther)),
-                                chOut*self.baseChannels,
-                                kernel, stride=stride, norm=self.batchNorm)
-        block2 = self.decblock( 2*chOut*(self.baseChannels + other * self.baseChannelsOther),
-                                chOut*self.baseChannels,
-                                kernel, stride=1, norm=norm)
+    def decFloor(self, chOut, reduce, kernel, stride=1, norm=True, padding=1) :
+        block1 = self.decblock( int(reduce*2*chOut*(self.baseChannels + self.otherChannels)),
+                                int(chOut*self.baseChannels),
+                                kernel, stride=stride, norm=norm, padding=padding)
+        secondPadding = (kernel[0]//2, kernel[1]//2) if isinstance(kernel, tuple) else kernel//2
+        block2 = self.decblock( int(2*chOut*(self.baseChannels + self.otherChannels)),
+                                int(chOut*self.baseChannels),
+                                kernel, stride=1, norm=norm, padding=secondPadding)
         return (block1, block2)
 
 
-    def createBasement(self, chIn) :
+    def createDecoders(self, layers) :
+        decoders = nn.ModuleList([])
+        for layer in reversed(layers):
+            decoders.extend( self.decFloor(layer[0], reduce=layer[1], kernel=layer[2], stride=layer[3], padding=layer[4]) )
+        return decoders
+
+
+    def createLastTouch(self) :
         toRet = nn.Sequential(
-            nn.Conv2d(chIn*(self.baseChannels+self.baseChannelsOther)+self.inChannels, 1, 1),
+            nn.Conv2d(self.baseChannels+self.otherChannels+self.inChannels, 1, 1),
             nn.Tanh(),
         )
-        fillWheights(toRet)
         return toRet
 
 
@@ -903,21 +898,86 @@ class SubGeneratorTemplate(SubTemplate):
         return torch.cat( (images, latentChannels), dim=1 )
 
 
+    def forward(self, images):
+        raise Exception("this is not for direct use")
+
+
+class GeneratorTemplate(nn.Module):
+
+    def __init__(self, gapW, inChannels, stripeChannels, bricksChannels, layers, outerKernel=3):
+        super().__init__()
+        self.cfg = DCfgClass(gapW, False)
+        self.bricksGenerator = SubGeneratorTemplate(gapW, True,  inChannels, bricksChannels, stripeChannels, layers, outerKernel=outerKernel)
+        self.stripeGenerator = SubGeneratorTemplate(gapW, False, inChannels, stripeChannels, bricksChannels, layers, outerKernel=outerKernel)
+        deepChans = self.stripeGenerator.postEncoderShape()[1]
+        deepLayers = [
+            (1,   1/2, 3    , 1, (1,0)),
+            (1/2, 1/2, (3,1), 1, (1,0)),
+            (1/4, 1/2, (3,1), 1, (1,0)),
+            (1/8, 1/2, (3,1), 1, (1,0)),
+        ]
+        self.deepGenerator = SubGeneratorTemplate(4, False, deepChans, deepChans, 0, deepLayers)
+        self.createLink()
+
+
+    def device(self):
+        return next(self.parameters()).device
+
+
+    def createLink(self) :
+
+        bricksSh = self.bricksGenerator.postEncoderShape()
+        bricksSz = math.prod(bricksSh[1:])
+        self.bricksGenerator.link = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(bricksSz, bricksSz//2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(bricksSz//2, bricksSz),
+            nn.LeakyReLU(0.2),
+            nn.Unflatten(1, bricksSh[1:]),
+        )
+
+        encSh = self.stripeGenerator.postEncoderShape()
+        chansSz = math.prod(encSh[1:])
+        midChans = chansSz * encSh[1] // 2048
+        self.stripeGenerator.link = nn.Sequential(
+            nn.Conv1d(in_channels=chansSz, out_channels=midChans, kernel_size=1, groups=encSh[1]),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(in_channels=midChans, out_channels=chansSz, kernel_size=1, groups=encSh[1]),
+            nn.LeakyReLU(0.2),
+        )
+
+        deepSh = self.deepGenerator.postEncoderShape(inShape=encSh)
+        deepSz = math.prod(deepSh[1:])
+        self.deepGenerator.link = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(deepSz, deepSz),
+            nn.LeakyReLU(0.2),
+            nn.Linear(deepSz, deepSz),
+            nn.LeakyReLU(0.2),
+            nn.Unflatten(1, deepSh[1:]),
+        )
+
+
     def lowResProc(self, images) :
         images, orgDims = unsqeeze4dim(images)
-        images = images.to(self.device())
+        images = images.to(firstDevice(self))
         if self.cfg.gapW == 2:
-            gap = torch.cat( [ ( 2*images[:,0:1,:,[self.cfg.gapRngX.start-1]] + images[:,0:1,:,[self.cfg.gapRngX.stop]   ] ) / 3,
-                               ( 2*images[:,0:1,:,[self.cfg.gapRngX.stop]   ] + images[:,0:1,:,[self.cfg.gapRngX.start-1]] ) / 3,
-                             ],
-                             dim=-1
-                           )
-            res = fillTheGap(images, gap)
-            #res = images.clone()
-            #res[...,self.cfg.gapRngX.start]  = ( 2*images[:,[0],:,self.cfg.gapRngX.start-1] + images[:,[0],:,self.cfg.gapRngX.stop] ) / 3
-            #res[...,self.cfg.gapRngX.stop-1] = ( 2*images[:,[0],:,self.cfg.gapRngX.stop] + images[:,[0],:,self.cfg.gapRngX.start-1] ) / 3
+            with torch.no_grad() :
+                gap = torch.cat( [ ( 2*images[:,0:1,:,[self.cfg.gapRngX.start-1]] + images[:,0:1,:,[self.cfg.gapRngX.stop]   ] ) / 3,
+                                   ( 2*images[:,0:1,:,[self.cfg.gapRngX.stop]   ] + images[:,0:1,:,[self.cfg.gapRngX.start-1]] ) / 3,
+                                 ],
+                                 dim=-1
+                               )
+                res = fillTheGap(images, gap)
         elif self.lowResGenerator is None :
-            res = images
+            images = images.to(firstDevice(self))
+            with torch.no_grad() :
+                res = images.clone().detach()
+                mask = torch.ones_like(res, dtype=torch.bool)
+                mask[self.cfg.gapRng] = 0
+                res[self.cfg.gapRng] = 0
+                res = pytorch_amfill.ops.amfill(res, mask)
         else :
             preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
             res = self.lowResGenerator.forward(preImages)
@@ -929,82 +989,35 @@ class SubGeneratorTemplate(SubTemplate):
         return fillTheGap(images, self.forward(images)[:,[0],...])
 
 
-    def forward(self, images):
-        #raise Exception("this is not for direct use")
+    def forwardLink(self, images, bricks):
 
-        # preform inputs
-        lrImages = self.lowResProc(images)
-        filledImages = fillTheGap(images.to(lrImages.device), lrImages[:,[0],...])
-        if self.lowResGenerator is None :
-            imgsIn = filledImages.to(self.device())
-        else :
-            imgsIn = torch.cat( [ img.to(self.device()) for img in (
-                                    filledImages,
-                                    lrImages
-                                )  ], dim=1)
-        imgsIn, norms = normalizeImages(imgsIn)
-        imgsIn = self.addLatent(imgsIn)
-        dwTrain = [imgsIn,]
 
+        tDev = firstDevice(self.stripeGenerator.link)
+        postChans = self.stripeGenerator.link( images.to(tDev).view(images.shape[0], -1, 1) ).view(images.shape)
+
+        dwTrain = [images.to(firstDevice(self.deepGenerator)),]
         # encoding
-        for level, encoder in enumerate(self.encoders):
-            inSh = dwTrain[-1].shape
-            otherChannels = encoder[0].weight.shape[1] - dwTrain[-1].shape[1]
-            imgsI = torch.cat( [dwTrain[-1],
-                                torch.zeros((inSh[0], otherChannels, inSh[2], inSh[3]), device=self.device())
-                               ], dim=1 )
-            dwTrain.append( encoder( imgsI ) )
-        # bricks linear link
-        mid = self.fcLink(dwTrain[-1])
+        for level, encoder in enumerate(self.deepGenerator.encoders) :
+            dwTrain.append( encoder(dwTrain[-1]) )
+        mid = self.deepGenerator.link(dwTrain[-1])
         upTrain = [mid,]
         # decoding
-        for level, decoder in enumerate( self.decoders) :
-            inSh = upTrain[-1].shape
-            otherChannels = decoder[0].weight.shape[0] - upTrain[-1].shape[1] - dwTrain[-1-level].shape[1]
-            imgsI = torch.cat( [ img.to(self.device()) for img in (
+        for level, decoder in enumerate( self.deepGenerator.decoders) :
+            imgsI = torch.cat( [ img.to(firstDevice(self.deepGenerator)) for img in (
                                     upTrain[-1],
-                                    dwTrain[-1-level],
-                                    torch.zeros((inSh[0], otherChannels, inSh[2], inSh[3]))
+                                    dwTrain[-1-level]
                                 ) ], dim=1)
             upTrain.append( decoder(imgsI) )
+            if not math.isfinite(decoder[1].running_var.mean().item()) :
+                raise("Infinite bn.")
+        postDeep = upTrain[-1].to(postChans.device)
 
-        # last touches
-        inSh = upTrain[-1].shape
-        otherChannels = self.lastTouch[0].weight.shape[1] - upTrain[-1].shape[1] - imgsIn.shape[1]
-        imgsI = torch.cat( [ img.to(self.device()) for img in (
-                upTrain[-1],
-                imgsIn,
-                torch.zeros((inSh[0], otherChannels, inSh[2], inSh[3]))
-            ) ], dim=1 )
-        results = self.lastTouch(imgsI) * self.amplitude
-        results = reNormalizeImages(results, norms, stdOnly=True)
+        postImages = postChans + postDeep
 
-        # final result
-        results = lrImages + results.to(lrImages.device)
-        return results
+        postBricks = self.bricksGenerator.link(bricks)
 
+        return postImages, postBricks
 
-
-class GeneratorTemplate(SubGeneratorTemplate):
-
-    def __init__(self, gapW, batchNorm=True):
-        super().__init__(gapW, False, batchNorm)
-        self.brickGenerator = None
-        self.stipeGenerator = None
-
-
-    def procTail(self, stripe_starter, bricksStriped_starter,
-                       bricks_starter, stripeBricked_starter) :
-        stripe_dwTrainTail = [stripe_starter,]
-        for encoder in self.stripeGenerator.tailEncoders  :
-            stripe_dwTrainTail.append(encoder(stripe_dwTrainTail[-1]))
-        # stripes linear link
-        stripe_mid = self.stripeGenerator.fcLink(stripe_dwTrainTail[-1])
-        stripe_upTrainTail = [stripe_mid,]
-        # stripes tail decoders
-        for level, decoder in enumerate(self.stripeGenerator.tailDecoders) :
-            stripe_upTrainTail.append( decoder( torch.cat( (stripe_upTrainTail[-1], stripe_dwTrainTail[-1-level]), dim=1 ) ) )
-        return stripe_upTrainTail[-1]
 
 
     def forward(self, images):
@@ -1014,88 +1027,83 @@ class GeneratorTemplate(SubGeneratorTemplate):
         lrImages = self.lowResProc(images)
         filledImages = fillTheGap(images.to(lrImages.device), lrImages[:,[0],...])
         if self.lowResGenerator is None :
-            stripeIn = filledImages.to(self.stripeGenerator.device())
+            stripeIn = filledImages.to(firstDevice(self.stripeGenerator))
         else :
-            stripeIn = torch.cat( [ img.to(self.stripeGenerator.device()) for img in (
+            stripeIn = torch.cat( [ img.to(firstDevice(self.stripeGenerator)) for img in (
                                     filledImages,
                                     lrImages
                                 )  ], dim=1)
         stripeIn, stripe_norms = normalizeImages(stripeIn)
-        #lrImagesNormalized = stripeIn[:,[-1],...]
         stripeIn = self.stripeGenerator.addLatent(stripeIn)
-        stripe_dwTrain = [stripeIn,]
+        stripe_dwTrain = [ self.stripeGenerator.entrance(stripeIn),]
+        stripeBricked_dwTrain = [stripe2bricks(stripe_dwTrain[-1]),]
 
         lrImagesBricked = stripe2bricks(lrImages)
         filledImagesBricked = stripe2bricks(filledImages)
         if self.lowResGenerator is None :
-            bricksIn = lrImagesBricked.to(self.brickGenerator.device())
+            bricksIn = lrImagesBricked.to(firstDevice(self.bricksGenerator))
         else :
-            bricksIn = torch.cat( [ img.to(self.brickGenerator.device()) for img in (
+            bricksIn = torch.cat( [ img.to(firstDevice(self.bricksGenerator)) for img in (
                                     filledImagesBricked,
                                     lrImagesBricked
                                 ) ], dim=1)
         bricksIn, bricks_norms = normalizeImages(bricksIn)
-        #lrImagesBrickedNormalized = bricksIn[:,[-1],...]
-        bricksIn = self.brickGenerator.addLatent(bricksIn)
-        bricks_dwTrain = [bricksIn,]
-
-        stripeBricked_dwTrain = [torch.empty((bricksIn.shape[0],0,bricksIn.shape[2],bricksIn.shape[3])),]
-        bricksStriped_dwTrain = [torch.empty((stripeIn.shape[0],0,stripeIn.shape[2],stripeIn.shape[3])),]
+        bricksIn = self.bricksGenerator.addLatent(bricksIn)
+        bricks_dwTrain = [ self.bricksGenerator.entrance(bricksIn), ]
+        bricksStriped_dwTrain = [bricks2stripe(bricks_dwTrain[-1]),]
 
         # encoding
-        for level, (brick_encoder, stripe_encoder) in enumerate( zip(self.brickGenerator.encoders, self.stripeGenerator.headEncoders) ):
-
-            bricksI = torch.cat( [ bricks_dwTrain[-1], stripeBricked_dwTrain[-1].to(self.brickGenerator.device()) ], dim=1 )
+        for level, (brick_encoder, stripe_encoder) in enumerate( zip(self.bricksGenerator.encoders, self.stripeGenerator.encoders) ):
+            bricksI = torch.cat( [bricks_dwTrain[-1],
+                                  stripeBricked_dwTrain[-1].to(firstDevice(self.bricksGenerator))
+                                 ], dim=1 )
             bricks_dwTrain.append( brick_encoder( bricksI ) )
-            bricksStriped_dwTrain.append( bricks2stripe(bricks_dwTrain[-1]) )
-
-            stripeI = torch.cat( [ stripe_dwTrain[-1], bricksStriped_dwTrain[-2].to(self.stripeGenerator.device()) ], dim=1 )
+            stripeI = torch.cat( [stripe_dwTrain[-1],
+                                  bricksStriped_dwTrain[-1].to(firstDevice(self.stripeGenerator))
+                                 ], dim=1 )
             stripe_dwTrain.append( stripe_encoder(stripeI))
+            bricksStriped_dwTrain.append( bricks2stripe(bricks_dwTrain[-1]) )
             stripeBricked_dwTrain.append( stripe2bricks(stripe_dwTrain[-1]) )
 
-        # bricks linear link
-        bricks_mid = self.brickGenerator.fcLink(bricks_dwTrain[-1])
 
-        # stripes tail
-        tailed = self.procTail(stripe_dwTrain[-1], bricksStriped_dwTrain[-1],
-                               bricks_dwTrain[-1], stripeBricked_dwTrain[-1], )
-
+        # linking
+        stripe_mid, bricks_mid = self.forwardLink(stripe_dwTrain[-1], bricks_dwTrain[-1])
         bricks_upTrain = [bricks_mid,]
-        stripe_upTrain = [tailed,]
-        # decoding
-        for level, (brick_decoder, stripe_decoder) in enumerate( zip(self.brickGenerator.decoders, self.stripeGenerator.headDecoders) ):
+        stripe_upTrain = [stripe_mid,]
 
-            bricksI = torch.cat( [ img.to(self.brickGenerator.device()) for img in (
+        # decoding
+        for level, (brick_decoder, stripe_decoder) in enumerate( zip(self.bricksGenerator.decoders,
+                                                                     self.stripeGenerator.decoders) ):
+            bricksI = torch.cat( [ img.to(firstDevice(self.bricksGenerator)) for img in (
                                     bricks_upTrain[-1],
                                     bricks_dwTrain[-1-level],
                                     stripe2bricks(stripe_upTrain[-1]),
                                     stripeBricked_dwTrain[-1-level]
                                 ) ], dim=1)
-            bricks_upTrain.append( brick_decoder(bricksI) )
-
-            stripeI = torch.cat( [ img.to(self.stripeGenerator.device()) for img in (
+            stripeI = torch.cat( [ img.to(firstDevice(self.stripeGenerator)) for img in (
                                     stripe_upTrain[-1],
                                     stripe_dwTrain[-1-level],
-                                    bricks2stripe(bricks_upTrain[-2]),
+                                    bricks2stripe(bricks_upTrain[-1]),
                                     bricksStriped_dwTrain[-1-level],
                                 ) ] , dim=1)
+            bricks_upTrain.append( brick_decoder(bricksI) )
             stripe_upTrain.append( stripe_decoder(stripeI) )
 
         # last touches
-        stripeI = torch.cat( [ img.to(self.stripeGenerator.device()) for img in (
+        stripeI = torch.cat( [ img.to(firstDevice(self.stripeGenerator)) for img in (
                 stripe_upTrain[-1],
-                stripeIn,
                 bricks2stripe(bricks_upTrain[-1]),
+                stripeIn,
             ) ], dim=1 )
         stripe_results = self.stripeGenerator.lastTouch(stripeI) * self.stripeGenerator.amplitude
         stripe_results = reNormalizeImages(stripe_results, stripe_norms, stdOnly=True)
 
-        bricksI = torch.cat( [ img.to(self.brickGenerator.device()) for img in (
+        bricksI = torch.cat( [ img.to(firstDevice(self.bricksGenerator)) for img in (
                 bricks_upTrain[-1],
-                bricksIn,
                 stripe2bricks(stripe_upTrain[-1]),
+                bricksIn,
             ) ], dim=1 )
-        bricks_results = self.brickGenerator.lastTouch(bricksI) * self.brickGenerator.amplitude
+        bricks_results = self.bricksGenerator.lastTouch(bricksI) * self.bricksGenerator.amplitude
         bricks_results = reNormalizeImages(bricks_results, bricks_norms, stdOnly=True)
         bricks_results = bricks2stripe(bricks_results)
 
@@ -1115,7 +1123,7 @@ class SubDiscriminatorTemplate(SubTemplate):
     def __init__(self, gapW, brick):
         super().__init__(gapW, brick)
         self.baseChannels = None
-        self.baseChannelsOther = None
+        self.otherChannels = None
         self.inChannels = 1
 
 
@@ -1165,11 +1173,11 @@ class DiscriminatorTemplate(SubDiscriminatorTemplate):
     def forward(self, images):
 
         # preform inputs
-        stripeIn = images.to(self.stripeDiscriminator.device())
+        stripeIn = images.to(firstDevice(self.stripeDiscriminator))
         stripeIn = normalizeImages(stripeIn)[0]
         stripe_dwTrain = [stripeIn,]
 
-        bricksIn = stripe2bricks(images).to(self.bricksDiscriminator.device())
+        bricksIn = stripe2bricks(images).to(firstDevice(self.bricksDiscriminator))
         bricksIn = normalizeImages(bricksIn)[0]
         bricks_dwTrain = [bricksIn,]
 
@@ -1179,11 +1187,11 @@ class DiscriminatorTemplate(SubDiscriminatorTemplate):
         # encoding
         for level, (brick_encoder, stripe_encoder) in enumerate( zip(self.bricksDiscriminator.encoders, self.stripeDiscriminator.headEncoders) ):
 
-            bricksI = torch.cat( [ bricks_dwTrain[-1], stripeBricked_dwTrain[-1].to(self.bricksDiscriminator.device()) ], dim=1 )
+            bricksI = torch.cat( [ bricks_dwTrain[-1], stripeBricked_dwTrain[-1].to(firstDevice(self.bricksDiscriminator)) ], dim=1 )
             bricks_dwTrain.append( brick_encoder( bricksI ) )
             bricksStriped_dwTrain.append( bricks2stripe(bricks_dwTrain[-1]) )
 
-            stripeI = torch.cat( [ stripe_dwTrain[-1], bricksStriped_dwTrain[-2].to(self.stripeDiscriminator.device()) ], dim=1 )
+            stripeI = torch.cat( [ stripe_dwTrain[-1], bricksStriped_dwTrain[-2].to(firstDevice(self.stripeDiscriminator)) ], dim=1 )
             stripe_dwTrain.append( stripe_encoder(stripeI))
             stripeBricked_dwTrain.append( stripe2bricks(stripe_dwTrain[-1]) )
 
@@ -1431,7 +1439,22 @@ def loss_COR(p_true, p_pred):
     cor = (d_true*d_pred).sum(dim=(-1,-2))
     dist = 1 - cor / (d_true**2).sum(dim=(-1,-2))
     return torch.abs(dist.squeeze(1))
-    #return 1 - cor / torch.sqrt( ( (p_true-means)**2 ).sum(dim=(-1,-2)) * ( (p_pred-means)**2 ).sum(dim=(-1,-2)) + 1e-7 )
+
+
+#concordance = ConcordanceCorrCoef()
+def loss_CCC(p_true, p_pred):
+    return 1 - concordance_corrcoef(p_pred[DCfg.gapRng].flatten(start_dim=1).swapdims(0,1),
+                                    p_true[DCfg.gapRng].flatten(start_dim=1).swapdims(0,1))
+
+def loss_CCL(p_true, p_pred):
+    l_true = p_true.view(-1,p_pred.shape[1],1,p_pred.shape[-1])
+    l_pred = p_pred.view(-1,p_pred.shape[1],1,p_pred.shape[-1])
+    n_true, norms = normalizeImages(l_true)
+    n_pred = (l_pred - norms[2]) / norms[1]
+    n_true = n_true.view(p_true.shape)
+    n_pred = n_pred.view(p_pred.shape)
+    lLosses = loss_CCC(n_true, n_pred)
+    return lLosses
 
 def loss_STD(p_true, p_pred):
     p_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
@@ -1461,7 +1484,6 @@ def loss_EAGLE(p_true, p_pred):
     EAGLE.to(p_true.device)
     return loss
 
-
 CNP = None
 def loss_CNP(p_true, p_pred):
     global CNP
@@ -1473,8 +1495,16 @@ def loss_CNP(p_true, p_pred):
             device=p_pred.device,
             layer_weight_decay=1
         )
+    sh=p_true.shape
+    if sh[-1] < 32 :
+        ppd = (32 - sh[-1])//2
+        p_true = fn.pad(p_true, (ppd,ppd,0,0), mode='reflect')
+        p_pred = fn.pad(p_pred, (ppd,ppd,0,0), mode='reflect')
+    if sh[-2] < 32 :
+        ppd = (32 - sh[-2])//2
+        p_true = fn.pad(p_true, (0,0,ppd,ppd), mode='reflect')
+        p_pred = fn.pad(p_pred, (0,0,ppd,ppd), mode='reflect')
     return CNP(p_pred.to(CNP.device), p_true.to(CNP.device))
-
 
 def loss_CNPL(p_true, p_pred):
     global CNP
@@ -1495,7 +1525,6 @@ def loss_CNPL(p_true, p_pred):
     l_pred = l_pred.view(p_pred.shape)
     return loss_CNP(l_pred, l_true)
 
-
 def loss_CNPR(p_true, p_pred):
     dd = p_pred[DCfg.gapRng] - p_true[DCfg.gapRng].to(p_pred.device)
     delta = torch.zeros_like(p_pred)
@@ -1504,18 +1533,12 @@ def loss_CNPR(p_true, p_pred):
     randd[DCfg.gapRng] = torch.randn_like(dd)
     return CNP(delta,  randd)
 
-
-
-
-
-
 def loss_LR(p_true, p_pred) :
     lr_pred = torch.nn.functional.interpolate(p_pred, scale_factor=0.5, mode='area')
     with torch.no_grad() :
         lr_true = torch.nn.functional.interpolate(p_true.to(p_pred.device), scale_factor=0.5, mode='area')
         lr_true = generator.lowResGenerator.generateImages(lr_true.detach())
     return MSE(lr_pred[generator.lowResGenerator.cfg.gapRng], lr_true[generator.lowResGenerator.cfg.gapRng]).sum(dim=(-1,-2,-3))
-
 
 sobelKernelXY = torch.tensor([[[[-1, 0, 1],
                                 [-2, 0, 2],
@@ -1524,7 +1547,6 @@ sobelKernelXY = torch.tensor([[[[-1, 0, 1],
                                 [ 0, 0, 0],
                                 [-1,-2,-1]]], # y
                              ], dtype=torch.float32)
-
 def loss_ABSGRD(p_true, p_pred):
     global sobelKernelXY
     p_true, _ = unsqeeze4dim(p_true)
@@ -1535,6 +1557,7 @@ def loss_ABSGRD(p_true, p_pred):
     agrd_true = grad_true / (p_true+1e-7)
     agrd_pred = grad_pred / (p_pred+1e-7)
     return MSE(agrd_true[DCfg.gapRng], agrd_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
+
 
 
 @dataclass
@@ -1559,7 +1582,6 @@ metrices = {
     'EAGLE'  : Metrics(loss_EAGLE,   1, 1),
     'ABSGRD' : Metrics(loss_ABSGRD,  1, 1),
 }
-
 
 minMetrices = None
 maxMetrices = None
@@ -1595,7 +1617,6 @@ def updateExtremes(vector, key, p_true, p_pred) :
             minMetrices[key] = (vector[pos].item(),
                                 p_true[pos,...].clone().detach(),
                                 p_pred[pos,...].clone().detach() )
-
 
 
 def loss_Gen(p_true, p_pred):
@@ -1792,8 +1813,8 @@ def displayImages(inp=None, boxes=None) :
     for curim in range(nofIm) :
         if not DCfg.brick :
             plotImage(genImages[curim,0,...].transpose(-1,-2).cpu().numpy())
-        vmin = views[curim,0:3,...].min()
-        vmax = views[curim,0:3,...].max()
+        vmin = views[curim,[0,2],...].min()
+        vmax = views[curim,[0,2],...].max()
         plt.figure(frameon=False)
         for id in range(3) :
             plt.subplot(1, 4, id + 1)
@@ -1924,14 +1945,28 @@ def doTrainGen(locals) :
 
 
 
+def monitor_per_batch() :
+    image = refImages[[2],...]
+    box = refBoxes[2]
+    rng = np.s_[[0], [0], box : box + DCfg.sinoSh[-1], ... ]
+    #rng = np.s_[0, 0, box : box + DCfg.sinoSh[-1], :]
+    with torch.no_grad() :
+        p_true = image[rng]
+        genImage = generator.forward(image).to(image.device)
+        p_pred = genImage[rng]
+        for key, metrics in metrices.items():
+            thisLoss = metrics.calculate(p_true, p_pred).detach().sum().item() / metrics.norm
+            writer.add_scalars(f"Monitor{key}", {"VAL": thisLoss}, imer)
+
+
 def criteriaToFollow() :
     image = refImages[[2],...]
     box = refBoxes[2]
-    rng = np.s_[0, 0, box : box + DCfg.sinoSh[-1], DCfg.gapRngX]
+    rng = np.s_[[0], [0], box : box + DCfg.sinoSh[-1], : ]
     #rng = np.s_[0, 0, box : box + DCfg.sinoSh[-1], :]
     with torch.no_grad() :
         genImage = generator.forward(image).to(image.device)
-        crit = L1L(genImage[rng], image[rng]).sum().item() / metrices['L1L'].norm
+        crit = loss_CCC( image[rng], genImage[rng]).sum().item() / metrices['CCC'].norm
     return crit
 
 @dataclass
@@ -1969,10 +2004,11 @@ save_minimal = True
 minimal_criteria = None
 saved_criteria = None
 last_criteria = None
-def updateCriteria(saveMe=True) :
+def updateCriteria(saveMe=True, logMe=True) :
     global minimal_criteria, last_criteria, saved_criteria
     last_criteria = criteriaToFollow()
-    writer.add_scalars("Aux", {'Crit': last_criteria}, imer)
+    if logMe :
+        writer.add_scalars("Aux", {'Crit': last_criteria}, imer)
     if minimal_criteria is None or (last_criteria < minimal_criteria) :
         print(f"New best criteria: {last_criteria:.6e}.")
         minimal_criteria = last_criteria
@@ -1988,6 +2024,7 @@ def updateCriteria(saveMe=True) :
             tifffile.imwrite(f"mini_{TCfg.exec}.tif", svImage[0,0,...].transpose(-1,-2).numpy())
             saved_criteria = minimal_criteria
     return last_criteria
+
 
 
 
@@ -2100,7 +2137,7 @@ def afterReport(locals) :
     return
 
 def preTransformImage(images):
-    return images.to(generator.device())
+    return images.to(firstDevice(generator))
 
 trainLoader=None
 testLoader=None
@@ -2157,7 +2194,13 @@ def train(savedCheckPoint, epochSize=None):
 
             # acrtual training
             beforeTrain(locals())
-            trainRes = train_step(images)
+            try :
+                trainRes = train_step(images)
+            except Exception as e:
+                print(e)
+                print(data[1])
+                raise e
+
             afterTrain(locals())
             resAcc += trainRes
             updAcc += trainRes
@@ -2203,17 +2246,18 @@ def train(savedCheckPoint, epochSize=None):
 
                 # generate previews
                 #generator.eval()
+                rndIndeces = random.sample(range(images.shape[0]), 2) if images.shape[0] > 1 else 0
                 if None in [ minMetrices, maxMetrices ] or \
                    not 'loss' in minMetrices or not 'loss' in maxMetrices or \
                    None in [ minMetrices['loss'], maxMetrices['loss'] ] :
-                    extImages = images[random.sample(range(images.shape[0]), 2),...]
+                    extImages = images[ rndIndeces ,...]
                 else :
                     extImages = torch.stack((maxMetrices['loss'][1],minMetrices['loss'][1]))
                 extViews, extGen, _ = generateDisplay(extImages)
                 extViews = extViews.detach().cpu().numpy()
                 refViews, genImages, _ = generateDisplay()
                 refViews = refViews.detach().cpu().numpy()
-                rndIndeces = random.sample(range(images.shape[0]), 2)
+                rndIndeces = random.sample(range(images.shape[0]), 2) if images.shape[0] > 1 else 0
                 rndViews, rndGen, _ = generateDisplay(images[rndIndeces,...])
                 rndViews = rndViews.detach().cpu().numpy()
                 #generator.train()
