@@ -39,6 +39,7 @@ import torchmetrics.image
 import ssim
 from eagle_loss import Eagle_Loss
 from convnext_perceptual_loss import ConvNextPerceptualLoss, ConvNextType
+from torchmetrics.functional import concordance_corrcoef
 
 
 def initIfNew(var, val=None) :
@@ -1257,7 +1258,6 @@ def loss_Adv_Gen(p_true, p_pred):
         return loss_pred
     loss_true, predictions_true = loss_Adv(p_true, True)
     advWeights = ( (predictions_true+1e-7) / (predictions_pred+1e-7) ) -  1
-    writer.add_scalars("Aux", {'Adversiry': advWeights.mean()}, imer)
     return loss_pred , advWeights
 
 def loss_Adv_Dis(p_true, p_pred):
@@ -1384,8 +1384,8 @@ def loss_L1LN(p_true, p_pred):
 
 
 #SSIM = ssim.SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
-SSIM = torchmetrics.image.StructuralSimilarityIndexMeasure(
-    data_range=2.0, kernel_size=1, reduction = None)
+#SSIM = torchmetrics.image.StructuralSimilarityIndexMeasure(
+#    data_range=2.0, kernel_size=1, reduction = None)
 def loss_SSIM(p_true, p_pred):
     p_true, _ = unsqeeze4dim(p_true)
     p_pred, _ = unsqeeze4dim(p_pred)
@@ -1393,7 +1393,7 @@ def loss_SSIM(p_true, p_pred):
     SSIM.to(p_pred.device)
     return (1 - SSIM( p_true.to(p_pred.device), p_pred ) ) / 2
 
-MSSSIM = ssim.MS_SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
+#MSSSIM = ssim.MS_SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
 #MSSSIM = torchmetrics.image.MultiScaleStructuralSimilarityIndexMeasure(
 #    data_range=2.0, kernel_size=1, gaussian_kernel=False, reduction = None)
 def loss_MSSSIM(p_true, p_pred):
@@ -1411,12 +1411,12 @@ def loss_MRSSIM(p_true, p_pred):
     randd[DCfg.gapRng] = torch.randn_like(dd)
     return loss_MSSSIM(delta, randd)
 
-SSC = torchmetrics.image.SpatialCorrelationCoefficient(window_size=3)
+#SSC = torchmetrics.image.SpatialCorrelationCoefficient(window_size=3)
 def loss_SCC(p_true, p_pred):
     SSC.to(p_pred.device)
     return 1 / ( 1e-7 + SSC(p_true[DCfg.gapRng].to(p_pred.device), p_pred[DCfg.gapRng]) )
 
-TV = torchmetrics.image.TotalVariation(reduction = None)
+#TV = torchmetrics.image.TotalVariation(reduction = None)
 def loss_TV(p_true, p_pred):
     TV.to(p_pred.device)
     return TV(p_true[DCfg.gapRng].to(p_pred.device) - p_pred[DCfg.gapRng])
@@ -1432,6 +1432,24 @@ def loss_COR(p_true, p_pred):
     dist = 1 - cor / (d_true**2).sum(dim=(-1,-2))
     return torch.abs(dist.squeeze(1))
     #return 1 - cor / torch.sqrt( ( (p_true-means)**2 ).sum(dim=(-1,-2)) * ( (p_pred-means)**2 ).sum(dim=(-1,-2)) + 1e-7 )
+
+
+#concordance = ConcordanceCorrCoef()
+def loss_CCC(p_true, p_pred):
+    return 1 - concordance_corrcoef(p_pred[DCfg.gapRng].flatten(start_dim=1).swapdims(0,1),
+                                    p_true[DCfg.gapRng].flatten(start_dim=1).swapdims(0,1))
+
+
+def loss_CCL(p_true, p_pred):
+    l_true = p_true.view(-1,p_pred.shape[1],1,p_pred.shape[-1])
+    l_pred = p_pred.view(-1,p_pred.shape[1],1,p_pred.shape[-1])
+    n_true, norms = normalizeImages(l_true)
+    n_pred = (l_pred - norms[2]) / norms[1]
+    n_true = n_true.view(p_true.shape)
+    n_pred = n_pred.view(p_pred.shape)
+    lLosses = loss_CCC(n_true, n_pred)
+    return lLosses
+
 
 def loss_STD(p_true, p_pred):
     p_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
@@ -1453,7 +1471,7 @@ def loss_HIST(p_true, p_pred):
         toRet.append( img_loss )
     return torch.stack(toRet)
 
-EAGLE = Eagle_Loss(patch_size=3)
+#EAGLE = Eagle_Loss(patch_size=3)
 def loss_EAGLE(p_true, p_pred):
     p_true, _ = unsqeeze4dim(p_true)
     p_pred, _ = unsqeeze4dim(p_pred)
