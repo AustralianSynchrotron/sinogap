@@ -44,6 +44,7 @@ import pytorch_amfill
 from torchmetrics.regression import PearsonCorrCoef
 from torchmetrics import ConcordanceCorrCoef
 from torchmetrics.functional import concordance_corrcoef
+from CBAM import cbam as cb
 
 
 def initIfNew(var, val=None) :
@@ -365,11 +366,6 @@ def createWriter(logDir, addToExisting=False) :
 writer = initIfNew('writer')
 
 
-class DevicePlace:
-    def __call__(self, x):
-        return x.to(TCfg.device)
-
-
 
 class StripesFromHDF :
 
@@ -468,7 +464,6 @@ class StripesFromHDFs :
                 self.shuffle = shuffle
                 self.transform = transform
                 self.oblTransform = transforms.Compose( [transforms.ToTensor(),
-                                                         #DevicePlace(),
                                                          transforms.Resize(DCfg.sinoSh)] )
             def __len__(self):
                 return int(self.container.__len__() * self.expose)
@@ -556,7 +551,7 @@ def createReferences(tSet, majorIdx = 0) :
             transforms.Resize(DCfg.sinoSh),
             #transforms.Normalize(mean=(0.5), std=(1))
     ])
-    refImages = torch.empty((len(examples), 1, *DCfg.sinoSh), dtype=torch.float32).to(TCfg.device)
+    refImages = torch.empty((len(examples), 1, *DCfg.sinoSh), dtype=torch.float32)#.to(TCfg.device)
     refBoxes = []
     for idx, ex in enumerate(examples) :
         if DCfg.readSh[0] is None :
@@ -569,7 +564,7 @@ def createReferences(tSet, majorIdx = 0) :
         refImages[idx,0,...] = mytransforms(data)
 
 
-    refNoises = torch.randn((refImages.shape[0],TCfg.latentDim)).to(TCfg.device)
+    refNoises = torch.randn((refImages.shape[0],TCfg.latentDim))#.to(TCfg.device)
     return refImages, refNoises, refBoxes
 refImages = initIfNew('refImages')
 refNoises = initIfNew('refNoises')
@@ -756,32 +751,34 @@ class SubTemplate(nn.Module):
         self.encoders = self.createEncoders(layers)
 
 
-    def encblock(self, chIn, chOut, kernel, stride=1, norm=True, padding=1) :
+    def encblock(self, chIn, chOut, kernel, stride=1, norm=True, padding=1, cbam=False) :
         layers = []
         layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias = not norm,
                                 padding=padding, padding_mode='reflect')  )
         if norm :
             layers.append(nn.BatchNorm2d(chOut))
+        if cbam :
+            layers.append(cb.CBAM(chOut, 1))
         layers.append(nn.LeakyReLU(0.2))
         fillWheights(layers)
         return torch.nn.Sequential(*layers)
 
 
-    def encFloor(self, chIn, mult, kernel, stride=1, norm=True, padding=1) :
+    def encFloor(self, chIn, mult, kernel, stride=1, norm=True, padding=1, cbam=False) :
         firstPadding = (kernel[0]//2, kernel[1]//2) if isinstance(kernel, tuple) else kernel//2
         block1 = self.encblock( int(chIn*(self.baseChannels+self.otherChannels)),
                                int(chIn*self.baseChannels),
-                               kernel, stride=1, norm=norm, padding=firstPadding)
+                               kernel, stride=1, norm=norm, padding=firstPadding, cbam=cbam)
         block2 = self.encblock( int(chIn*(self.baseChannels+self.otherChannels)),
                                int(chIn*self.baseChannels*mult),
-                               kernel, stride=stride, norm=norm, padding=padding)
+                               kernel, stride=stride, norm=norm, padding=padding, cbam=cbam)
         return (block1, block2)
 
 
     def createEncoders(self, layers) :
         encoders = nn.ModuleList([])
         for layer in layers:
-            encoders.extend( self.encFloor(layer[0], mult=layer[1], kernel=layer[2], stride=layer[3], padding=layer[4]) )
+            encoders.extend( self.encFloor(layer[0], mult=layer[1], kernel=layer[2], stride=layer[3], padding=layer[4], cbam=layer[5]) )
         return encoders
 
 
@@ -809,15 +806,10 @@ class SubGeneratorTemplate(SubTemplate):
         self.lowResGenerator = None
         self.amplitude = 4
         self.decoders = self.createDecoders(layers)
-        self.lastTouch = None if inChannels == baseChannels else \
-                         nn.Sequential(
-                             nn.Conv2d(self.baseChannels+self.otherChannels + self.inChannels, 1, outerKernel,
-                                       bias=True, padding=(outerKernel-1)//2),
-                             nn.Tanh(),
-                         )
+        self.lastTouch = None if inChannels == baseChannels else self.createLastTouch()
 
 
-    def decblock(self, chIn, chOut, kernel, stride=1, norm=True, padding=1, outputPadding=None) :
+    def decblock(self, chIn, chOut, kernel, stride=1, norm=True, padding=1, outputPadding=None, cbam=False) :
         if outputPadding is None :
             if isinstance(stride, int) :
                 outputPadding = stride - 1
@@ -828,26 +820,28 @@ class SubGeneratorTemplate(SubTemplate):
                                           padding=padding, padding_mode='zeros', output_padding=outputPadding) )
         if norm :
             layers.append(nn.BatchNorm2d(chOut))
+        if cbam :
+            layers.append(cb.CBAM(chOut, 1))
         layers.append(nn.LeakyReLU(0.2))
         fillWheights(layers)
         return torch.nn.Sequential(*layers)
 
 
-    def decFloor(self, chOut, reduce, kernel, stride=1, norm=True, padding=1) :
+    def decFloor(self, chOut, reduce, kernel, stride=1, norm=True, padding=1, cbam=False) :
         block1 = self.decblock( int(reduce*2*chOut*(self.baseChannels + self.otherChannels)),
                                 int(chOut*self.baseChannels),
-                                kernel, stride=stride, norm=norm, padding=padding)
+                                kernel, stride=stride, norm=norm, padding=padding, cbam=cbam)
         secondPadding = (kernel[0]//2, kernel[1]//2) if isinstance(kernel, tuple) else kernel//2
         block2 = self.decblock( int(2*chOut*(self.baseChannels + self.otherChannels)),
                                 int(chOut*self.baseChannels),
-                                kernel, stride=1, norm=norm, padding=secondPadding)
+                                kernel, stride=1, norm=norm, padding=secondPadding, cbam=cbam)
         return (block1, block2)
 
 
     def createDecoders(self, layers) :
         decoders = nn.ModuleList([])
         for layer in reversed(layers):
-            decoders.extend( self.decFloor(layer[0], reduce=layer[1], kernel=layer[2], stride=layer[3], padding=layer[4]) )
+            decoders.extend( self.decFloor(layer[0], reduce=layer[1], kernel=layer[2], stride=layer[3], padding=layer[4], cbam=layer[5]) )
         return decoders
 
 
@@ -911,10 +905,10 @@ class GeneratorTemplate(nn.Module):
         self.stripeGenerator = SubGeneratorTemplate(gapW, False, inChannels, stripeChannels, bricksChannels, layers, outerKernel=outerKernel)
         deepChans = self.stripeGenerator.postEncoderShape()[1]
         deepLayers = [
-            (1,   1/2, 3    , 1, (1,0)),
-            (1/2, 1/2, (3,1), 1, (1,0)),
-            (1/4, 1/2, (3,1), 1, (1,0)),
-            (1/8, 1/2, (3,1), 1, (1,0)),
+            (1,   1/2, 3    , 1, (1,0), False),
+            (1/2, 1/2, (3,1), 1, (1,0), False),
+            (1/4, 1/2, (3,1), 1, (1,0), False),
+            (1/8, 1/2, (3,1), 1, (1,0), False),
         ]
         self.deepGenerator = SubGeneratorTemplate(4, False, deepChans, deepChans, 0, deepLayers)
         self.createLink()
@@ -961,8 +955,8 @@ class GeneratorTemplate(nn.Module):
 
     def lowResProc(self, images) :
         images, orgDims = unsqeeze4dim(images)
-        images = images.to(firstDevice(self))
         if self.cfg.gapW == 2:
+            images = images.to(firstDevice(self))
             with torch.no_grad() :
                 gap = torch.cat( [ ( 2*images[:,0:1,:,[self.cfg.gapRngX.start-1]] + images[:,0:1,:,[self.cfg.gapRngX.stop]   ] ) / 3,
                                    ( 2*images[:,0:1,:,[self.cfg.gapRngX.stop]   ] + images[:,0:1,:,[self.cfg.gapRngX.start-1]] ) / 3,
@@ -979,6 +973,7 @@ class GeneratorTemplate(nn.Module):
                 res[self.cfg.gapRng] = 0
                 res = pytorch_amfill.ops.amfill(res, mask)
         else :
+            images = images.to(firstDevice(self.lowResGenerator))
             preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
             res = self.lowResGenerator.forward(preImages)
             res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
@@ -1008,11 +1003,9 @@ class GeneratorTemplate(nn.Module):
                                     dwTrain[-1-level]
                                 ) ], dim=1)
             upTrain.append( decoder(imgsI) )
-            if not math.isfinite(decoder[1].running_var.mean().item()) :
-                raise("Infinite bn.")
         postDeep = upTrain[-1].to(postChans.device)
 
-        postImages = postChans + postDeep
+        postImages = postChans + postDeep.to(postChans.device)
 
         postBricks = self.bricksGenerator.link(bricks)
 
@@ -1441,6 +1434,25 @@ def loss_COR(p_true, p_pred):
     return torch.abs(dist.squeeze(1))
 
 
+def loss_CNV(p_true, p_pred):
+    d_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
+    d_pred, _ = unsqeeze4dim(p_pred[DCfg.gapRng])
+    cor = (d_true*d_pred).sum(dim=(-1,-2))
+    dist = 1 - cor / (d_true**2).sum(dim=(-1,-2))
+    return torch.abs(dist.squeeze(1))
+
+
+def loss_COR(p_true, p_pred):
+    d_true, _ = unsqeeze4dim(p_true[DCfg.gapRng])
+    d_pred, _ = unsqeeze4dim(p_pred[DCfg.gapRng])
+    means = torch.mean(d_true, dim=(-1,-2), keepdim=True)
+    d_true = d_true - means
+    d_pred = d_pred - means
+    cor = (d_true*d_pred).sum(dim=(-1,-2))
+    dist = 1 - cor / (d_true**2).sum(dim=(-1,-2))
+    return torch.abs(dist.squeeze(1))
+
+
 #concordance = ConcordanceCorrCoef()
 def loss_CCC(p_true, p_pred):
     return 1 - concordance_corrcoef(p_pred[DCfg.gapRng].flatten(start_dim=1).swapdims(0,1),
@@ -1813,8 +1825,8 @@ def displayImages(inp=None, boxes=None) :
     for curim in range(nofIm) :
         if not DCfg.brick :
             plotImage(genImages[curim,0,...].transpose(-1,-2).cpu().numpy())
-        vmin = views[curim,[0,2],...].min()
-        vmax = views[curim,[0,2],...].max()
+        vmin = views[curim,0:3,...].min()
+        vmax = views[curim,0:3,...].max()
         plt.figure(frameon=False)
         for id in range(3) :
             plt.subplot(1, 4, id + 1)
@@ -2194,13 +2206,7 @@ def train(savedCheckPoint, epochSize=None):
 
             # acrtual training
             beforeTrain(locals())
-            try :
-                trainRes = train_step(images)
-            except Exception as e:
-                print(e)
-                print(data[1])
-                raise e
-
+            trainRes = train_step(images)
             afterTrain(locals())
             resAcc += trainRes
             updAcc += trainRes

@@ -365,11 +365,6 @@ def createWriter(logDir, addToExisting=False) :
 writer = initIfNew('writer')
 
 
-class DevicePlace:
-    def __call__(self, x):
-        return x.to(TCfg.device)
-
-
 
 class StripesFromHDF :
 
@@ -468,7 +463,6 @@ class StripesFromHDFs :
                 self.shuffle = shuffle
                 self.transform = transform
                 self.oblTransform = transforms.Compose( [transforms.ToTensor(),
-                                                         #DevicePlace(),
                                                          transforms.Resize(DCfg.sinoSh)] )
             def __len__(self):
                 return int(self.container.__len__() * self.expose)
@@ -556,7 +550,7 @@ def createReferences(tSet, majorIdx = 0) :
             transforms.Resize(DCfg.sinoSh),
             #transforms.Normalize(mean=(0.5), std=(1))
     ])
-    refImages = torch.empty((len(examples), 1, *DCfg.sinoSh), dtype=torch.float32).to(TCfg.device)
+    refImages = torch.empty((len(examples), 1, *DCfg.sinoSh), dtype=torch.float32)#.to(TCfg.device)
     refBoxes = []
     for idx, ex in enumerate(examples) :
         if DCfg.readSh[0] is None :
@@ -569,7 +563,7 @@ def createReferences(tSet, majorIdx = 0) :
         refImages[idx,0,...] = mytransforms(data)
 
 
-    refNoises = torch.randn((refImages.shape[0],TCfg.latentDim)).to(TCfg.device)
+    refNoises = torch.randn((refImages.shape[0],TCfg.latentDim))#.to(TCfg.device)
     return refImages, refNoises, refBoxes
 refImages = initIfNew('refImages')
 refNoises = initIfNew('refNoises')
@@ -956,8 +950,8 @@ class GeneratorTemplate(nn.Module):
 
     def lowResProc(self, images) :
         images, orgDims = unsqeeze4dim(images)
-        images = images.to(firstDevice(self))
         if self.cfg.gapW == 2:
+            images = images.to(firstDevice(self))
             with torch.no_grad() :
                 gap = torch.cat( [ ( 2*images[:,0:1,:,[self.cfg.gapRngX.start-1]] + images[:,0:1,:,[self.cfg.gapRngX.stop]   ] ) / 3,
                                    ( 2*images[:,0:1,:,[self.cfg.gapRngX.stop]   ] + images[:,0:1,:,[self.cfg.gapRngX.start-1]] ) / 3,
@@ -974,6 +968,7 @@ class GeneratorTemplate(nn.Module):
                 res[self.cfg.gapRng] = 0
                 res = pytorch_amfill.ops.amfill(res, mask)
         else :
+            images = images.to(firstDevice(self.lowResGenerator))
             preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
             res = self.lowResGenerator.forward(preImages)
             res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
@@ -1005,7 +1000,7 @@ class GeneratorTemplate(nn.Module):
             upTrain.append( decoder(imgsI) )
         postDeep = upTrain[-1].to(postChans.device)
 
-        postImages = postChans + postDeep
+        postImages = postChans + postDeep.to(postChans.device)
 
         postBricks = self.bricksGenerator.link(bricks)
 
