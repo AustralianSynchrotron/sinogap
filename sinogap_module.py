@@ -521,7 +521,7 @@ class StripesFromHDFs :
         for base in bases :
             print(f"Loading train set {len(self.collection)+1} of {len(bases)}: " + base + " ... ", end="")
             self.collection.append(
-                StripesFromHDF(f"{base}.hdf@/data", f"{base}.mask++.tif", exclusive) )
+                StripesFromHDF(f"{base}.hdf{hdfDelimiter}/data", f"{base}.mask++.tif", exclusive) )
             print("Done")
 
     def __getitem__(self, index=None):
