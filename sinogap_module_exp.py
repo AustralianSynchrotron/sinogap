@@ -739,7 +739,7 @@ def firstDevice(model):
 
 class SubTemplate(nn.Module):
 
-    def __init__(self, gapW, brick, inChannels, baseChannels, otherChannels, layers, outerKernel=3):
+    def __init__(self, gapW, brick, inChannels, baseChannels, otherChannels, layers, outerKernel=3, cbam=False):
         super().__init__()
         self.cfg = DCfgClass(gapW, brick)
         self.inChannels = inChannels
@@ -747,7 +747,7 @@ class SubTemplate(nn.Module):
         self.otherChannels = otherChannels
         self.entrance = None if inChannels == baseChannels else \
             self.encblock(self.inChannels, self.baseChannels, stride=1, norm=False,
-                          kernel=outerKernel, padding=(outerKernel-1)//2 )
+                          kernel=outerKernel, padding=(outerKernel-1)//2, cbam=cbam )
         self.encoders = self.createEncoders(layers)
 
 
@@ -757,9 +757,9 @@ class SubTemplate(nn.Module):
                                 padding=padding, padding_mode='reflect')  )
         if norm :
             layers.append(nn.BatchNorm2d(chOut))
+        layers.append(nn.LeakyReLU(0.2))
         if cbam :
             layers.append(cb.CBAM(chOut, 1))
-        layers.append(nn.LeakyReLU(0.2))
         fillWheights(layers)
         return torch.nn.Sequential(*layers)
 
@@ -801,8 +801,8 @@ class SubTemplate(nn.Module):
 
 class SubGeneratorTemplate(SubTemplate):
 
-    def __init__(self, gapW, brick, inChannels, baseChannels, otherChannels, layers, outerKernel=3):
-        super().__init__(gapW, brick, inChannels, baseChannels, otherChannels, layers, outerKernel=outerKernel)
+    def __init__(self, gapW, brick, inChannels, baseChannels, otherChannels, layers, outerKernel=3, cbam=False):
+        super().__init__(gapW, brick, inChannels, baseChannels, otherChannels, layers, outerKernel=outerKernel, cbam=cbam)
         self.lowResGenerator = None
         self.amplitude = 4
         self.decoders = self.createDecoders(layers)
@@ -820,9 +820,9 @@ class SubGeneratorTemplate(SubTemplate):
                                           padding=padding, padding_mode='zeros', output_padding=outputPadding) )
         if norm :
             layers.append(nn.BatchNorm2d(chOut))
+        layers.append(nn.LeakyReLU(0.2))
         if cbam :
             layers.append(cb.CBAM(chOut, 1))
-        layers.append(nn.LeakyReLU(0.2))
         fillWheights(layers)
         return torch.nn.Sequential(*layers)
 
@@ -898,11 +898,11 @@ class SubGeneratorTemplate(SubTemplate):
 
 class GeneratorTemplate(nn.Module):
 
-    def __init__(self, gapW, inChannels, stripeChannels, bricksChannels, layers, outerKernel=3):
+    def __init__(self, gapW, inChannels, stripeChannels, bricksChannels, layers, outerKernel=3, cbam=False):
         super().__init__()
         self.cfg = DCfgClass(gapW, False)
-        self.bricksGenerator = SubGeneratorTemplate(gapW, True,  inChannels, bricksChannels, stripeChannels, layers, outerKernel=outerKernel)
-        self.stripeGenerator = SubGeneratorTemplate(gapW, False, inChannels, stripeChannels, bricksChannels, layers, outerKernel=outerKernel)
+        self.bricksGenerator = SubGeneratorTemplate(gapW, True,  inChannels, bricksChannels, stripeChannels, layers, outerKernel=outerKernel, cbam=cbam)
+        self.stripeGenerator = SubGeneratorTemplate(gapW, False, inChannels, stripeChannels, bricksChannels, layers, outerKernel=outerKernel, cbam=cbam)
         deepChans = self.stripeGenerator.postEncoderShape()[1]
         deepLayers = [
             (1,   1/2, 3    , 1, (1,0), False),
@@ -1377,11 +1377,15 @@ def loss_L1LL(p_true, p_pred):
     return sLosses
 
 
-
 def loss_L1LN(p_true, p_pred):
     rawLoss = loss_L1L(p_true, p_pred)
     stds = 1e-7 + calculateNorm(p_true)[0].view([-1])
     return rawLoss / stds
+
+def loss_L4L(p_true, p_pred):
+    diff = p_true[DCfg.gapRng] - p_pred[DCfg.gapRng]
+    l4Loss = torch.pow(diff, 4)
+    return l4Loss.sum(dim=(-1,-2,-3))
 
 
 #SSIM = ssim.SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
