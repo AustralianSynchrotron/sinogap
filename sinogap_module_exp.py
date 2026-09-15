@@ -44,7 +44,6 @@ import pytorch_amfill
 from torchmetrics.regression import PearsonCorrCoef
 from torchmetrics import ConcordanceCorrCoef
 from torchmetrics.functional import concordance_corrcoef
-from CBAM import cbam as cb
 
 
 def initIfNew(var, val=None) :
@@ -302,14 +301,71 @@ def goodForMmap(trgH5F, data) :
         return offset, data.id.dtype
 
 
+
+
+hdfDelimiter = '@' # delimiter between filename and dataset path
+
+
+def residesInMemory(hdfName) :
+    mmapPrefixes = ["/dev/shm",]
+    if "CTAS_MMAP_PATH" in os.environ :
+        mmapPrefixes.extend(os.environ["CTAS_MMAP_PATH"].split(':'))
+    hdfName = os.path.realpath(hdfName)
+    for mmapPrefix in mmapPrefixes :
+        if hdfName.startswith(mmapPrefix) :
+            return True
+    return False
+
+
+def mmapMeIfYouCan(trgH5F, data, mode='r+') :
+    if not residesInMemory(trgH5F.filename) :
+        return None
+    fileSize = trgH5F.id.get_filesize()
+    offset = data.id.get_offset()
+    dtype = data.id.dtype
+    plist = data.id.get_create_plist()
+    if offset is None \
+    or offset < 0 \
+    or not plist.get_layout() in (h5d.CONTIGUOUS, h5d.COMPACT) \
+    or plist.get_external_count() \
+    or plist.get_nfilters() \
+    or fileSize - offset < math.prod(data.shape) * data.dtype.itemsize :
+        return None
+    # now all is ready
+    dataN = np.memmap(trgH5F.filename, shape=data.shape, dtype=dtype, mode=mode, offset=offset)
+    data = dataN
+    trgH5F.close()
+    #plist = trgH5F.id.get_access_plist()
+    #fileno = trgH5F.id.get_vfd_handle(plist)
+    #dataM = mmap.mmap(fileno, fileSize, offset=offset, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
+    return data
+
+
 def getInData(inputString, verbose=False, preread=False):
-    nameSplit = inputString.split(':')
-    if len(nameSplit) == 1 : # tiff image
-        data = loadImage(nameSplit[0])
-        data = np.expand_dims(data, 1)
-        return data
+    """
+    Function accesses a dataset from read-only HDF5 file and returns it.
+
+    If file resides in memory (or in one of the the paths from the CTAS_MMAP_PATH environment variable)
+    this function tries to mmap dataset into memory, build numpy array on top of it and returns it.
+    If mmaping is not possible then given dataset is accessed and, if preread is False, is returned as is;
+    with preread=True the dataset is read into into numpy array which is then returned.
+
+    :param inputString: Filename of the HDF5 file and dataset path inside it;
+                        Two components are separated by the delimiter (see below).
+                        F.e. "filename.hdf@/data" (with @ as the delimiter).
+    :param verbose: prints some messages.
+    :param preread: only makes sense for files which cannot be mmapped. If True then dataset is read into
+                    numpy array which is returned. If false h5py.Dataset is returned.
+
+    :return: If file can be mmaped into memory or preread=True, returns numpy array with the dataset.
+             Otherwise h5py.Dataset is returned.
+    """
+
+    global hdfDelimiter
+
+    nameSplit = inputString.split(hdfDelimiter)
     if len(nameSplit) != 2 :
-        raise Exception(f"String \"{inputString}\" does not represent an HDF5 format \"fileName:container\".")
+        raise Exception(f"String \"{inputString}\" does not represent an HDF5 format \"fileName{hdfDelimiter}container\".")
     hdfName = nameSplit[0]
     hdfVolume = nameSplit[1]
     try :
@@ -324,37 +380,73 @@ def getInData(inputString, verbose=False, preread=False):
     sh = data.shape
     if len(sh) != 3 :
         raise Exception(f"Dimensions of the container \"{inputString}\" is not 3: {sh}.")
-    try : # try to mmap hdf5 if it is in memory
-        if not residesInMemory(hdfName) :
-            raise Exception()
-        fileSize = trgH5F.id.get_filesize()
-        offset = data.id.get_offset()
-        dtype = data.id.dtype
-        plist = data.id.get_create_plist()
-        if offset < 0 \
-        or not plist.get_layout() in (h5d.CONTIGUOUS, h5d.COMPACT) \
-        or plist.get_external_count() \
-        or plist.get_nfilters() \
-        or fileSize - offset < math.prod(sh) * data.dtype.itemsize :
-            raise Exception()
-        # now all is ready
-        dataN = np.memmap(hdfName, shape=sh, dtype=dtype, mode='r', offset=offset)
-        data = dataN
-        trgH5F.close()
-        #plist = trgH5F.id.get_access_plist()
-        #fileno = trgH5F.id.get_vfd_handle(plist)
-        #dataM = mmap.mmap(fileno, fileSize, offset=offset, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
-    except :
+    mmaped = mmapMeIfYouCan(trgH5F, data, mode='r')
+    if mmaped is None :
         if preread :
-            dataN = np.empty(data.shape, dtype=np.float32)
-            if verbose :
-                print("Reading input ... ", end="", flush=True)
-            data.read_direct(dataN)
-            if verbose :
-                print("Done.")
-            data = dataN
-            trgH5F.close()
+          dataN = np.empty(data.shape, dtype=np.float32)
+          if verbose :
+              print(f"Reading input \"{inputString}\" of {data.shape} size ... ", end="", flush=True)
+          data.read_direct(dataN)
+          if verbose :
+              print("Done.")
+          data = dataN
+          trgH5F.close()
+    else :
+        data = mmaped
     return data
+
+
+def getOutData(outputString, shape=None, dtype=None, overwrite=False) :
+
+    global hdfDelimiter
+
+    if shape is not None :
+        if len(shape) == 2 :
+            shape = (1,*shape)
+        if len(shape) != 3 :
+            raise Exception(f"Not appropriate output array size {shape}.")
+
+    nameSplit = outputString.split(hdfDelimiter)
+    if len(nameSplit) != 2 :
+        raise Exception(f"String \"{outputString}\" does not represent an HDF5 format \"fileName{hdfDelimiter}container\".")
+    hdfName = nameSplit[0]
+    hdfVolume = nameSplit[1]
+    try :
+        trgH5F =  h5py.File(hdfName,'a', libver='latest')
+    except :
+        raise Exception(f"Failed to open HDF file '{hdfName}'.")
+
+    data = None
+    if hdfVolume in trgH5F :
+        data = trgH5F[hdfVolume]
+        if not overwrite :
+            if shape is not None and data.shape != shape :
+                raise Exception(f"Shape of dataset \"{outputString}\" {data.shape} is not equal to requested {shape}.")
+            if dtype is not None and data.dtype != dtype :
+                raise Exception(f"Data type of dataset \"{outputString}\" {data.dtype} is not equal to requested {dtype}.")
+        elif ( shape is not None and data.shape != shape ) or ( dtype is not None and data.dtype != dtype ) :
+            del trgH5F[hdfVolume]
+            data = None
+    if data is None :
+        if shape is None :
+            raise Exception(f"No dataset \"{outputString}\" exists and no shape was provided to create it.")
+        if dtype is None :
+            raise Exception(f"No dataset \"{outputString}\" exists and no data type was provided to create it.")
+        data = trgH5F.create_dataset(hdfVolume, shape=shape, dtype=dtype)
+        # TODO : check other possible preallocations
+        data[-1,-1,-1]=0
+    mmaped = mmapMeIfYouCan(trgH5F, data, mode='r+')
+    if mmaped is not None :
+        data = mmaped
+    return data
+
+
+def closeOutData(data) :
+    if isinstance(data, isinstance(data, np.memmap)) :
+        data.flush()
+        data._mmap.close()
+    elif isinstance(data, h5py.Dataset) :
+        data.file.close()
 
 
 
@@ -429,7 +521,7 @@ class StripesFromHDFs :
         for base in bases :
             print(f"Loading train set {len(self.collection)+1} of {len(bases)}: " + base + " ... ", end="")
             self.collection.append(
-                StripesFromHDF(f"{base}.hdf:/data", f"{base}.mask++.tif", exclusive) )
+                StripesFromHDF(f"{base}.hdf{hdfDelimiter}/data", f"{base}.mask++.tif", exclusive) )
             print("Done")
 
     def __getitem__(self, index=None):
@@ -739,7 +831,7 @@ def firstDevice(model):
 
 class SubTemplate(nn.Module):
 
-    def __init__(self, gapW, brick, inChannels, baseChannels, otherChannels, layers, outerKernel=3, cbam=False):
+    def __init__(self, gapW, brick, inChannels, baseChannels, otherChannels, layers, outerKernel=3, norms=True):
         super().__init__()
         self.cfg = DCfgClass(gapW, brick)
         self.inChannels = inChannels
@@ -747,38 +839,36 @@ class SubTemplate(nn.Module):
         self.otherChannels = otherChannels
         self.entrance = None if inChannels == baseChannels else \
             self.encblock(self.inChannels, self.baseChannels, stride=1, norm=False,
-                          kernel=outerKernel, padding=(outerKernel-1)//2, cbam=cbam )
-        self.encoders = self.createEncoders(layers)
+                          kernel=outerKernel, padding=(outerKernel-1)//2 )
+        self.encoders = self.createEncoders(layers, norms=norms)
 
 
-    def encblock(self, chIn, chOut, kernel, stride=1, norm=True, padding=1, cbam=False) :
+    def encblock(self, chIn, chOut, kernel, stride=1, norm=True, padding=1) :
         layers = []
         layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias = not norm,
                                 padding=padding, padding_mode='reflect')  )
         if norm :
             layers.append(nn.BatchNorm2d(chOut))
         layers.append(nn.LeakyReLU(0.2))
-        if cbam :
-            layers.append(cb.CBAM(chOut, 1))
         fillWheights(layers)
         return torch.nn.Sequential(*layers)
 
 
-    def encFloor(self, chIn, mult, kernel, stride=1, norm=True, padding=1, cbam=False) :
+    def encFloor(self, chIn, mult, kernel, stride=1, norm=True, padding=1) :
         firstPadding = (kernel[0]//2, kernel[1]//2) if isinstance(kernel, tuple) else kernel//2
         block1 = self.encblock( int(chIn*(self.baseChannels+self.otherChannels)),
                                int(chIn*self.baseChannels),
-                               kernel, stride=1, norm=norm, padding=firstPadding, cbam=cbam)
+                               kernel, stride=1, norm=norm, padding=firstPadding)
         block2 = self.encblock( int(chIn*(self.baseChannels+self.otherChannels)),
                                int(chIn*self.baseChannels*mult),
-                               kernel, stride=stride, norm=norm, padding=padding, cbam=cbam)
+                               kernel, stride=stride, norm=norm, padding=padding)
         return (block1, block2)
 
 
-    def createEncoders(self, layers) :
+    def createEncoders(self, layers, norms=True) :
         encoders = nn.ModuleList([])
         for layer in layers:
-            encoders.extend( self.encFloor(layer[0], mult=layer[1], kernel=layer[2], stride=layer[3], padding=layer[4], cbam=layer[5]) )
+            encoders.extend( self.encFloor(layer[0], mult=layer[1], kernel=layer[2], stride=layer[3], padding=layer[4], norm=norms) )
         return encoders
 
 
@@ -799,17 +889,21 @@ class SubTemplate(nn.Module):
 
 
 
+
+
 class SubGeneratorTemplate(SubTemplate):
 
-    def __init__(self, gapW, brick, inChannels, baseChannels, otherChannels, layers, outerKernel=3, cbam=False):
-        super().__init__(gapW, brick, inChannels, baseChannels, otherChannels, layers, outerKernel=outerKernel, cbam=cbam)
-        self.lowResGenerator = None
+    def __init__(self, gapW, brick, inChannels, baseChannels, otherChannels, layers, outerKernel=3, noiseChannels=0):
+        super().__init__(gapW, brick, inChannels+noiseChannels, baseChannels, otherChannels, layers, outerKernel=outerKernel)
+        self.preGenerator = None
+        self.link = None
         self.amplitude = 4
         self.decoders = self.createDecoders(layers)
         self.lastTouch = None if inChannels == baseChannels else self.createLastTouch()
+        self.noiseInjector = self.createLatentGenerator(noiseChannels) if noiseChannels else None
 
 
-    def decblock(self, chIn, chOut, kernel, stride=1, norm=True, padding=1, outputPadding=None, cbam=False) :
+    def decblock(self, chIn, chOut, kernel, stride=1, norm=True, padding=1, outputPadding=None) :
         if outputPadding is None :
             if isinstance(stride, int) :
                 outputPadding = stride - 1
@@ -821,27 +915,25 @@ class SubGeneratorTemplate(SubTemplate):
         if norm :
             layers.append(nn.BatchNorm2d(chOut))
         layers.append(nn.LeakyReLU(0.2))
-        if cbam :
-            layers.append(cb.CBAM(chOut, 1))
         fillWheights(layers)
         return torch.nn.Sequential(*layers)
 
 
-    def decFloor(self, chOut, reduce, kernel, stride=1, norm=True, padding=1, cbam=False) :
+    def decFloor(self, chOut, reduce, kernel, stride=1, norm=True, padding=1) :
         block1 = self.decblock( int(reduce*2*chOut*(self.baseChannels + self.otherChannels)),
                                 int(chOut*self.baseChannels),
-                                kernel, stride=stride, norm=norm, padding=padding, cbam=cbam)
+                                kernel, stride=stride, norm=norm, padding=padding)
         secondPadding = (kernel[0]//2, kernel[1]//2) if isinstance(kernel, tuple) else kernel//2
         block2 = self.decblock( int(2*chOut*(self.baseChannels + self.otherChannels)),
                                 int(chOut*self.baseChannels),
-                                kernel, stride=1, norm=norm, padding=secondPadding, cbam=cbam)
+                                kernel, stride=1, norm=norm, padding=secondPadding)
         return (block1, block2)
 
 
     def createDecoders(self, layers) :
         decoders = nn.ModuleList([])
         for layer in reversed(layers):
-            decoders.extend( self.decFloor(layer[0], reduce=layer[1], kernel=layer[2], stride=layer[3], padding=layer[4], cbam=layer[5]) )
+            decoders.extend( self.decFloor(layer[0], reduce=layer[1], kernel=layer[2], stride=layer[3], padding=layer[4]) )
         return decoders
 
 
@@ -853,8 +945,8 @@ class SubGeneratorTemplate(SubTemplate):
         return toRet
 
 
-    def createLatentGenerator(self, decoders=None) :
-        latInSh = self.fcLink[-1].unflattened_size[-2:]
+    def createLatentGenerator(self, outChannels, decoders=None) :
+        latInSh = self.postEncoderShape()[-2:]
         latInSh = (1,self.baseChannels,*latInSh)
         latInChannels = math.prod(latInSh)
         toRet = nn.Sequential(
@@ -873,21 +965,16 @@ class SubGeneratorTemplate(SubTemplate):
                                         padding=conv.padding,
                                         outputPadding=conv.output_padding
                                         ) )
-        toRet.append(( self.encblock(self.baseChannels, 1, kernel=1, padding=0, norm=False) ))
+        toRet.append(( self.encblock(self.baseChannels, outChannels, kernel=1, padding=0, norm=False) ))
         fillWheights(toRet)
         return toRet
 
 
     def addLatent(self, images) :
-        if self.inChannels == images.shape[1] :
+        if self.noiseInjector is None :
             return images
-        if isinstance(self.latentGenerator, float) :
-            lSh = list(images.shape)
-            lSh[1] = self.inChannels - lSh[1]
-            latentChannels = self.latentGenerator * torch.randn( lSh, device=images.device )
-        else :
-            latentIn = torch.randn( (images.shape[0], self.latentGenerator[0].in_features), device=images.device )
-            latentChannels = self.latentGenerator(latentIn)
+        latentIn = torch.randn( (images.shape[0], self.noiseInjector[0].in_features), device=images.device )
+        latentChannels = self.noiseInjector(latentIn)
         latentChannels, _ = normalizeImages(latentChannels)
         return torch.cat( (images, latentChannels), dim=1 )
 
@@ -896,22 +983,29 @@ class SubGeneratorTemplate(SubTemplate):
         raise Exception("this is not for direct use")
 
 
+
+
+
 class GeneratorTemplate(nn.Module):
 
-    def __init__(self, gapW, inChannels, stripeChannels, bricksChannels, layers, outerKernel=3, cbam=False):
+    def __init__(self, gapW, inChannels, stripeChannels, bricksChannels, layers, outerKernel=3, noiseChannels=0, links=True):
         super().__init__()
         self.cfg = DCfgClass(gapW, False)
-        self.bricksGenerator = SubGeneratorTemplate(gapW, True,  inChannels, bricksChannels, stripeChannels, layers, outerKernel=outerKernel, cbam=cbam)
-        self.stripeGenerator = SubGeneratorTemplate(gapW, False, inChannels, stripeChannels, bricksChannels, layers, outerKernel=outerKernel, cbam=cbam)
+        self.preGenerator = None
+        self.bricksGenerator = SubGeneratorTemplate(gapW, True,  inChannels, bricksChannels, stripeChannels,
+                                                    layers, outerKernel=outerKernel, noiseChannels=noiseChannels)
+        self.stripeGenerator = SubGeneratorTemplate(gapW, False, inChannels, stripeChannels, bricksChannels,
+                                                    layers, outerKernel=outerKernel, noiseChannels=noiseChannels)
         deepChans = self.stripeGenerator.postEncoderShape()[1]
         deepLayers = [
-            (1,   1/2, 3    , 1, (1,0), False),
-            (1/2, 1/2, (3,1), 1, (1,0), False),
-            (1/4, 1/2, (3,1), 1, (1,0), False),
-            (1/8, 1/2, (3,1), 1, (1,0), False),
+            (1,   1/2, 3    , 1, (1,0)),
+            (1/2, 1/2, (3,1), 1, (1,0)),
+            (1/4, 1/2, (3,1), 1, (1,0)),
+            (1/8, 1/2, (3,1), 1, (1,0)),
         ]
         self.deepGenerator = SubGeneratorTemplate(4, False, deepChans, deepChans, 0, deepLayers)
-        self.createLink()
+        if links :
+            self.createLink()
 
 
     def device(self):
@@ -953,9 +1047,20 @@ class GeneratorTemplate(nn.Module):
         )
 
 
-    def lowResProc(self, images) :
+    def preProc(self, images) :
+        if self.preGenerator is None :
+            return images
         images, orgDims = unsqeeze4dim(images)
-        if self.cfg.gapW == 2:
+        if isinstance(self.preGenerator, GeneratorTemplate) :
+            orgSh = images.shape[-2:]
+            preSh = self.preGenerator.cfg.sinoSh
+            if orgSh != preSh :
+                images = images.to(firstDevice(self.preGenerator))
+                images = torch.nn.functional.interpolate(images, size=preSh, mode='area')
+            res = self.preGenerator.forward(images)
+            if orgSh != preSh :
+                res = torch.nn.functional.interpolate(res, size=orgSh, mode='bilinear')
+        elif self.cfg.gapW == 2:
             images = images.to(firstDevice(self))
             with torch.no_grad() :
                 gap = torch.cat( [ ( 2*images[:,0:1,:,[self.cfg.gapRngX.start-1]] + images[:,0:1,:,[self.cfg.gapRngX.stop]   ] ) / 3,
@@ -964,7 +1069,7 @@ class GeneratorTemplate(nn.Module):
                                  dim=-1
                                )
                 res = fillTheGap(images, gap)
-        elif self.lowResGenerator is None :
+        else :
             images = images.to(firstDevice(self))
             with torch.no_grad() :
                 res = images.clone().detach()
@@ -972,11 +1077,6 @@ class GeneratorTemplate(nn.Module):
                 mask[self.cfg.gapRng] = 0
                 res[self.cfg.gapRng] = 0
                 res = pytorch_amfill.ops.amfill(res, mask)
-        else :
-            images = images.to(firstDevice(self.lowResGenerator))
-            preImages = torch.nn.functional.interpolate(images, scale_factor=0.5, mode='area')
-            res = self.lowResGenerator.forward(preImages)
-            res = torch.nn.functional.interpolate(res, scale_factor=2, mode='bilinear')
         return squeezeOrg(res, orgDims)
 
 
@@ -986,15 +1086,20 @@ class GeneratorTemplate(nn.Module):
 
     def forwardLink(self, images, bricks):
 
-
-        tDev = firstDevice(self.stripeGenerator.link)
-        postChans = self.stripeGenerator.link( images.to(tDev).view(images.shape[0], -1, 1) ).view(images.shape)
+        if self.stripeGenerator.link is None :
+            postChans = images
+        else :
+            tDev = firstDevice(self.stripeGenerator.link)
+            postChans = self.stripeGenerator.link( images.to(tDev).view(images.shape[0], -1, 1) ).view(images.shape)
 
         dwTrain = [images.to(firstDevice(self.deepGenerator)),]
         # encoding
         for level, encoder in enumerate(self.deepGenerator.encoders) :
             dwTrain.append( encoder(dwTrain[-1]) )
-        mid = self.deepGenerator.link(dwTrain[-1])
+        if self.deepGenerator.link is None :
+            mid = dwTrain[-1]
+        else :
+            mid = self.deepGenerator.link(dwTrain[-1])
         upTrain = [mid,]
         # decoding
         for level, decoder in enumerate( self.deepGenerator.decoders) :
@@ -1005,21 +1110,23 @@ class GeneratorTemplate(nn.Module):
             upTrain.append( decoder(imgsI) )
         postDeep = upTrain[-1].to(postChans.device)
 
-        postImages = postChans + postDeep.to(postChans.device)
+        postImages = postChans + postDeep
 
-        postBricks = self.bricksGenerator.link(bricks)
+        if self.bricksGenerator.link is None :
+            postBricks = bricks
+        else :
+            postBricks = self.bricksGenerator.link(bricks)
 
         return postImages, postBricks
-
 
 
     def forward(self, images):
 
 
         # preform inputs
-        lrImages = self.lowResProc(images)
+        lrImages = self.preProc(images)
         filledImages = fillTheGap(images.to(lrImages.device), lrImages[:,[0],...])
-        if self.lowResGenerator is None :
+        if self.preGenerator is None :
             stripeIn = filledImages.to(firstDevice(self.stripeGenerator))
         else :
             stripeIn = torch.cat( [ img.to(firstDevice(self.stripeGenerator)) for img in (
@@ -1033,7 +1140,7 @@ class GeneratorTemplate(nn.Module):
 
         lrImagesBricked = stripe2bricks(lrImages)
         filledImagesBricked = stripe2bricks(filledImages)
-        if self.lowResGenerator is None :
+        if self.preGenerator is None :
             bricksIn = lrImagesBricked.to(firstDevice(self.bricksGenerator))
         else :
             bricksIn = torch.cat( [ img.to(firstDevice(self.bricksGenerator)) for img in (
@@ -1107,97 +1214,89 @@ class GeneratorTemplate(nn.Module):
 
 
 generator = initIfNew('generator')
-lowResGenerators = initIfNew('lowResGenerators', {})
 
 
 
 class SubDiscriminatorTemplate(SubTemplate):
 
-    def __init__(self, gapW, brick):
-        super().__init__(gapW, brick)
-        self.baseChannels = None
-        self.otherChannels = None
-        self.inChannels = 1
+    def __init__(self, gapW, brick, inChannels, baseChannels, otherChannels, layers, body, outerKernel=3, inShape=None):
+        super().__init__(gapW, brick, inChannels, baseChannels, otherChannels, layers, outerKernel=outerKernel, norms=False)
+        if body :
+            self.body = self.createBody(inShape)
 
-
-    def createBody(self, encoders) :
-        smpl = torch.zeros((1, 1, *self.cfg.sinoSh))
-        for encoder in encoders :
-            smpl = torch.zeros((1, encoder[0].in_channels, *smpl.shape[2:]))
-            smpl = encoder(smpl)
-        encSh = smpl.shape
+    def createBody(self, inShape) :
+        encSh = self.postEncoderShape(inShape=inShape)
         leftChannels = math.prod(encSh)
         layers = [nn.Flatten(),]
         while leftChannels > 1 :
             outChannels = max(leftChannels//4, 1)
             layers.append(nn.Linear(leftChannels, outChannels))
-            layers.append(nn.LeakyReLU(0.2))
+            layers.append( nn.Sigmoid() if outChannels == 1 else  nn.LeakyReLU(0.2) )
             leftChannels = outChannels
         return torch.nn.Sequential(*layers)
-
-    def createMixer(self) :
-        ratio = self.cfg.sinoSh[-2] // self.cfg.sinoSh[-1]
-        inChans = 2*ratio
-        return torch.nn.Sequential(
-            nn.Linear(inChans, 1),
-            nn.Sigmoid(),
-        )
 
     def forward(self, images):
         raise Exception("this is not for direct use")
 
 
 
-class DiscriminatorTemplate(SubDiscriminatorTemplate):
+class DiscriminatorTemplate(nn.Module):
 
-    def __init__(self, gapW):
-        super().__init__(gapW, False)
-        self.bricksDiscriminator = None
-        self.stripeDiscriminator = None
+    def __init__(self, gapW, inChannels, stripeChannels, bricksChannels, layers, outerKernel=3):
+        super().__init__()
+        self.cfg = DCfgClass(gapW, False)
+        self.bricksDiscriminator = SubDiscriminatorTemplate(gapW, True,  inChannels, bricksChannels, stripeChannels,
+                                                            layers, body=True, outerKernel=outerKernel)
+        self.stripeDiscriminator = SubDiscriminatorTemplate(gapW, False, inChannels, stripeChannels, bricksChannels,
+                                                            layers, body=False, outerKernel=outerKernel)
+        postStripeShape = self.stripeDiscriminator.postEncoderShape()
+        deepChans = postStripeShape[1]
+        deepLayers = [
+            (1,   1/2, 3    , 1, (1,0)),
+            (1/2, 1/2, (3,1), 1, (1,0)),
+            (1/4, 1/2, (3,1), 1, (1,0)),
+            (1/8, 1/2, (3,1), 1, (1,0)),
+        ]
+        self.deepDiscriminator = SubDiscriminatorTemplate(4, False, deepChans, deepChans, 0, deepLayers,
+                                                          body=True, inShape=postStripeShape)
 
-    def procTail(self, stripe_starter, bricksStriped_starter,
-                       bricks_starter, stripeBricked_starter) :
-        stripe_dwTrainTail = [stripe_starter,]
-        for encoder in self.stripeDiscriminator.tailEncoders  :
-            stripe_dwTrainTail.append(encoder(stripe_dwTrainTail[-1]))
-        # stripes linear link
-        return self.stripeDiscriminator.lastTouch(stripe_dwTrainTail[-1])
 
     def forward(self, images):
 
         # preform inputs
-        stripeIn = images.to(firstDevice(self.stripeDiscriminator))
-        stripeIn = normalizeImages(stripeIn)[0]
-        stripe_dwTrain = [stripeIn,]
+        stripeIn, _ = normalizeImages(images.to(firstDevice(self.stripeDiscriminator)))
+        stripe_dwTrain = [ self.stripeDiscriminator.entrance(stripeIn),]
+        stripeBricked_dwTrain = [stripe2bricks(stripe_dwTrain[-1]),]
 
         bricksIn = stripe2bricks(images).to(firstDevice(self.bricksDiscriminator))
-        bricksIn = normalizeImages(bricksIn)[0]
-        bricks_dwTrain = [bricksIn,]
-
-        stripeBricked_dwTrain = [torch.empty((bricksIn.shape[0],0,bricksIn.shape[2],bricksIn.shape[3])),]
-        bricksStriped_dwTrain = [torch.empty((stripeIn.shape[0],0,stripeIn.shape[2],stripeIn.shape[3])),]
+        bricksIn, _ = normalizeImages(bricksIn)
+        bricks_dwTrain = [ self.bricksDiscriminator.entrance(bricksIn), ]
+        bricksStriped_dwTrain = [bricks2stripe(bricks_dwTrain[-1]),]
 
         # encoding
-        for level, (brick_encoder, stripe_encoder) in enumerate( zip(self.bricksDiscriminator.encoders, self.stripeDiscriminator.headEncoders) ):
-
-            bricksI = torch.cat( [ bricks_dwTrain[-1], stripeBricked_dwTrain[-1].to(firstDevice(self.bricksDiscriminator)) ], dim=1 )
+        for level, (brick_encoder, stripe_encoder) in enumerate( zip(self.bricksDiscriminator.encoders, self.stripeDiscriminator.encoders) ):
+            bricksI = torch.cat( [bricks_dwTrain[-1],
+                                  stripeBricked_dwTrain[-1].to(firstDevice(self.bricksDiscriminator))
+                                 ], dim=1 )
             bricks_dwTrain.append( brick_encoder( bricksI ) )
-            bricksStriped_dwTrain.append( bricks2stripe(bricks_dwTrain[-1]) )
-
-            stripeI = torch.cat( [ stripe_dwTrain[-1], bricksStriped_dwTrain[-2].to(firstDevice(self.stripeDiscriminator)) ], dim=1 )
+            stripeI = torch.cat( [stripe_dwTrain[-1],
+                                  bricksStriped_dwTrain[-1].to(firstDevice(self.stripeDiscriminator))
+                                 ], dim=1 )
             stripe_dwTrain.append( stripe_encoder(stripeI))
+            bricksStriped_dwTrain.append( bricks2stripe(bricks_dwTrain[-1]) )
             stripeBricked_dwTrain.append( stripe2bricks(stripe_dwTrain[-1]) )
 
-        # stripes tail
-        stripe_res = self.procTail(stripe_dwTrain[-1], bricksStriped_dwTrain[-1],
-                               bricks_dwTrain[-1], stripeBricked_dwTrain[-1], )
-        # bricks linear link
-        bricks_res = self.bricksDiscriminator.lastTouch(bricks_dwTrain[-1])
-        bricks_res = bricks_res.view(stripe_res.shape[0],-1)
+        brickResults = self.bricksDiscriminator.body(bricks_dwTrain[-1]).view(images.shape[0],-1).mean(dim=1).view(-1,1)
 
-        results = torch.cat( [stripe_res, bricks_res], dim=1 )
-        results = self.stripeDiscriminator.mixer(results)
-        return results
+        dwTrain = stripe_dwTrain[-1]
+        # deep dive
+        for encoder in self.deepDiscriminator.encoders :
+            dwTrain = encoder(dwTrain)
+        stripeResults = self.deepDiscriminator.body(dwTrain).view(images.shape[0],1)
+
+        return ( brickResults + stripeResults ) / 2
+        #return stripeResults
+
 
 
 
@@ -1258,6 +1357,7 @@ def loss_Adv_Gen(p_true, p_pred):
         return loss_pred
     loss_true, predictions_true = loss_Adv(p_true, True)
     advWeights = ( (predictions_true+1e-7) / (predictions_pred+1e-7) ) -  1
+    advWeights = torch.max(advWeights, 0)
     writer.add_scalars("Aux", {'Adversiry': advWeights.mean()}, imer)
     return loss_pred , advWeights
 
@@ -1377,15 +1477,11 @@ def loss_L1LL(p_true, p_pred):
     return sLosses
 
 
+
 def loss_L1LN(p_true, p_pred):
     rawLoss = loss_L1L(p_true, p_pred)
     stds = 1e-7 + calculateNorm(p_true)[0].view([-1])
     return rawLoss / stds
-
-def loss_L4L(p_true, p_pred):
-    diff = p_true[DCfg.gapRng] - p_pred[DCfg.gapRng]
-    l4Loss = torch.pow(diff, 4)
-    return l4Loss.sum(dim=(-1,-2,-3))
 
 
 #SSIM = ssim.SSIM(data_range=2.0, size_average=False, channel=1, win_size=1)
@@ -1553,8 +1649,8 @@ def loss_LR(p_true, p_pred) :
     lr_pred = torch.nn.functional.interpolate(p_pred, scale_factor=0.5, mode='area')
     with torch.no_grad() :
         lr_true = torch.nn.functional.interpolate(p_true.to(p_pred.device), scale_factor=0.5, mode='area')
-        lr_true = generator.lowResGenerator.generateImages(lr_true.detach())
-    return MSE(lr_pred[generator.lowResGenerator.cfg.gapRng], lr_true[generator.lowResGenerator.cfg.gapRng]).sum(dim=(-1,-2,-3))
+        lr_true = generator.preGenerator.generateImages(lr_true.detach())
+    return MSE(lr_pred[generator.preGenerator.cfg.gapRng], lr_true[generator.preGenerator.cfg.gapRng]).sum(dim=(-1,-2,-3))
 
 sobelKernelXY = torch.tensor([[[[-1, 0, 1],
                                 [-2, 0, 2],
@@ -1758,7 +1854,7 @@ def summarizeMe(toSumm, onPrep=True):
         for i in range(batchSplit) :
             subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
             subImages = preTransformImage(images[subRange,...])
-            subFakeImages = generator.lowResProc(subImages) \
+            subFakeImages = generator.preProc(subImages) \
                                 if onPrep else \
                             generator.generateImages(subImages)
             if 'Adv' in metrices and metrices['Adv'].weight > 0 :
@@ -1795,7 +1891,7 @@ def generateDisplay(inp=None, boxes=None) :
 
     genImages = images.clone()
     with torch.no_grad() :
-        preImages = generator.lowResProc(images).to(imDevice)
+        preImages = generator.preProc(images).to(imDevice)
         genPatches = generator.forward(images).to(imDevice)
         genImages[DCfg.gapRng] = genPatches[DCfg.gapRng]
     hGap = DCfg.gapW // 2
@@ -1967,11 +2063,14 @@ def monitor_per_batch() :
     rng = np.s_[[0], [0], box : box + DCfg.sinoSh[-1], ... ]
     #rng = np.s_[0, 0, box : box + DCfg.sinoSh[-1], :]
     with torch.no_grad() :
-        p_true = image[rng]
+        p_true = image
         genImage = generator.forward(image).to(image.device)
-        p_pred = genImage[rng]
+        p_pred = genImage
         for key, metrics in metrices.items():
-            thisLoss = metrics.calculate(p_true, p_pred).detach().sum().item() / metrics.norm
+            if key == "Adv" :
+                thisLoss = metrics.calculate(p_true, p_pred)[0].detach().sum().item() / metrics.norm
+            else :
+                thisLoss = metrics.calculate(p_true[rng], p_pred[rng]).detach().sum().item() / metrics.norm
             writer.add_scalars(f"Monitor{key}", {"VAL": thisLoss}, imer)
 
 
@@ -2032,7 +2131,7 @@ def updateCriteria(saveMe=True, logMe=True) :
             image = refImages[[2],...]
             with torch.no_grad() :
                 genImage = generator.forward(image).to(image.device)
-                preImage = generator.lowResProc(image).to(image.device)
+                preImage = generator.preProc(image).to(image.device)
                 svImage = torch.cat( [ normalizeImages(img)[0].detach().cpu() for img in
                                   ( image, preImage, genImage, genImage-preImage, image - genImage ) ] , dim=-1 )
             saveCheckPoint(f"checkPoint_{TCfg.exec}_mini.pth", epoch=epoch-1, imer=imer)
