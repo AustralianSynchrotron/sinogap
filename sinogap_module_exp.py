@@ -1333,7 +1333,10 @@ def adjustScheduler(scheduler, iniLr, target) :
 
 
 BCE = nn.BCELoss(reduction='none')
+minBCE  = None # BCE(torch.tensor([TCfg.labelSmoothFac]), torch.tensor([TCfg.labelSmoothFac])).view(-1)[0].item()
+halfBCE = None # BCE(torch.tensor([0.5]), torch.tensor([TCfg.labelSmoothFac])).view(-1)[0].item() - minBCE
 def loss_Adv(images, truth):
+    global minBCE, halfBCE
     if discriminator is None :
         raise Exception("Discriminator is not initialized for adversarial loss.")
     nofIm = images.shape[0]
@@ -1347,19 +1350,15 @@ def loss_Adv(images, truth):
     labels = torch.full((nofIm, 1),  (1 - TCfg.labelSmoothFac ) if truth else TCfg.labelSmoothFac,
                         dtype=torch.float, device=images.device)
     BCE.to(images.device)
-    return BCE(predictions, labels)[...,0], predictions
+    if minBCE is None or halfBCE is None:
+        minBCE  = BCE(torch.tensor([TCfg.labelSmoothFac]), torch.tensor([TCfg.labelSmoothFac])).view(-1)[0].item()
+        halfBCE = BCE(torch.tensor([0.5]), torch.tensor([TCfg.labelSmoothFac])).view(-1)[0].item() - minBCE
+    bces = ( BCE(predictions, labels) - minBCE ) / halfBCE
+    return bces.view(-1), predictions.view(-1)
 
-weightedAdversarialLoss = True
 def loss_Adv_Gen(p_true, p_pred):
-    global imer, weightedAdversarialLoss
-    loss_pred, predictions_pred = loss_Adv(p_pred, False)
-    if not weightedAdversarialLoss :
-        return loss_pred
-    loss_true, predictions_true = loss_Adv(p_true, True)
-    advWeights = ( (predictions_true+1e-7) / (predictions_pred+1e-7) ) -  1
-    advWeights = torch.max(advWeights, 0)
-    writer.add_scalars("Aux", {'Adversiry': advWeights.mean()}, imer)
-    return loss_pred , advWeights
+    loss_pred, _ = loss_Adv(p_pred, True)
+    return loss_pred
 
 def loss_Adv_Dis(p_true, p_pred):
     loss_true, predictions_true = loss_Adv(p_true, True)
@@ -1740,20 +1739,10 @@ def loss_Gen(p_true, p_pred):
     individualLosses = {}
     for key, metrics in metrices.items():
         if metrics.norm > 0 :
-            #with torch.set_grad_enabled( metrics.weight > 0 ) :
-            #    thisLoss = metrics.calculate(p_true, p_pred).to(myDev) / metrics.norm
-            #losses = losses + thisLoss * metrics.weight
-            #sumweights += metrics.weight
             with torch.set_grad_enabled( metrics.weight > 0 ) :
-                returnFromLoss = metrics.calculate(p_true, p_pred)
-                if isinstance(returnFromLoss, tuple) :
-                    thisLoss = returnFromLoss[1].to(myDev) * returnFromLoss[0].to(myDev) / metrics.norm
-                    weightModifiers = returnFromLoss[1]
-                else :
-                    thisLoss = returnFromLoss.to(myDev) / metrics.norm
-                    weightModifiers = torch.tensor(1.0, requires_grad=False, device=myDev)
-            losses = losses + thisLoss * weightModifiers * metrics.weight
-            sumweights = sumweights + metrics.weight * weightModifiers.sum()
+                thisLoss = metrics.calculate(p_true, p_pred).to(myDev) / metrics.norm
+            losses = losses + thisLoss * metrics.weight
+            sumweights = sumweights + metrics.weight
             individualLosses[key] = thisLoss.detach().sum().item()
             updateExtremes(thisLoss, key, p_true, p_pred)
         else :
@@ -1860,8 +1849,8 @@ def summarizeMe(toSumm, onPrep=True):
             if 'Adv' in metrices and metrices['Adv'].weight > 0 :
                 disLoss, probs = loss_Dis(subImages, subFakeImages)
                 sumAcc.lossD += disLoss.item()
-                sumAcc.predReal += probs[:subBatchSize,0].sum().item()
-                sumAcc.predFake += probs[subBatchSize:,0].sum().item()
+                sumAcc.predReal += probs[:subBatchSize].sum().item()
+                sumAcc.predFake += probs[subBatchSize:].sum().item()
             genLoss, indLosses = loss_Gen(subImages, subFakeImages)
             sumAcc.lossG += genLoss.item()
             for key in indLosses.keys() :
@@ -2142,11 +2131,17 @@ def updateCriteria(saveMe=True, logMe=True) :
 
 
 
+def beforeEachStep(sglocals):
+    return
 
+def afterEachStep(sglocals):
+    return
 
 
 def train_step(allImages):
     global skipGen, skipDis, followers, save_minimal, repeatDis, repeatGen
+
+    beforeEachStep(locals())
 
     trainRes = TrainResClass()
     allImages, _ = unsqeeze4dim(allImages)
@@ -2172,8 +2167,8 @@ def train_step(allImages):
                 #subImages.requires_grad = True
                 #subFakeImages.requires_grad = True
                 disLoss, probs = loss_Dis(subImages, subFakeImages)
-                trainRes.predReal += probs[:subBatchSize,0].sum().item() / repeatDis
-                trainRes.predFake += probs[subBatchSize:,0].sum().item() / repeatDis
+                trainRes.predReal += probs[:subBatchSize].sum().item() / repeatDis
+                trainRes.predFake += probs[subBatchSize:].sum().item() / repeatDis
                 trainRes.lossD += disLoss.item() / repeatDis
                 if doTrainDis(locals()) :
                     disLoss = disLoss / subBatchSize
@@ -2184,6 +2179,8 @@ def train_step(allImages):
 
         def trainGenerator() :
             for optim in optimizers_G :
+                optim.zero_grad(set_to_none=False)
+            for optim in optimizers_D :
                 optim.zero_grad(set_to_none=False)
             for i in range(batchSplit) :
                 subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
@@ -2215,8 +2212,8 @@ def train_step(allImages):
                         subImages = images[subRange,...]#.clone().detach()
                         subFakeImages = generator.generateImages(subImages)
                         disLoss, probs = loss_Dis(subImages, subFakeImages.detach())
-                        trainRes.predReal += probs[:subBatchSize,0].sum().item()
-                        trainRes.predFake += probs[subBatchSize:,0].sum().item()
+                        trainRes.predReal += probs[:subBatchSize].sum().item()
+                        trainRes.predFake += probs[subBatchSize:].sum().item()
                         trainRes.lossD += disLoss.item()
 
         # train generator
@@ -2227,6 +2224,8 @@ def train_step(allImages):
 
     if minimal_criteria is not None :
         updateCriteria(save_minimal)
+
+    afterEachStep(locals())
 
     return trainRes
 
@@ -2471,14 +2470,10 @@ def train(savedCheckPoint, epochSize=None):
             # reference views after epoch
             def overview():
                 with torch.no_grad() :
+                    genImages = generator.generateImages(refImages)
+                    print(loss_Gen(refImages, genImages))
                     if 'Adv' in metrices and  metrices['Adv'].weight > 0 :
-                        probs_ref = []
-                        progs_gen = []
-                        for idx in range(refImages.shape[0]) :
-                            probs_ref.append(discriminator.forward(refImages[[idx],...]).view(-1).item())
-                            progs_gen.append(discriminator.forward(generator.generateImages(refImages[[idx],...])).view(-1).item())
-                        print(probs_ref)
-                        print(progs_gen)
+                        print(loss_Dis(refImages, genImages))
                     displayImages()
             try :
                 generator.train()

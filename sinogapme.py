@@ -12,6 +12,8 @@ parser.add_argument('output', type=str, default="",
                     help='Output HDF5 file.')
 parser.add_argument('-m', '--mask', type=str, default="",
                     help='Mask of the input stack for hdf volume. If not given, then zeros are filled.')
+parser.add_argument('-z', '--zeros',  action='store_true', default=False,
+                    help='Forcebly fill gaps as mask defines, even if the corresponding pixels in the input volume are non-zero.')
 #parser.add_argument('-M', '--model', type=str, default="",
 #                    help='Model to use.')
 parser.add_argument('-v', '--verbose', action='store_true', default=False,
@@ -136,7 +138,7 @@ model = sg.generator
 
 
 
-def fillSinogram(sinogram, mask=None) :
+def fillSinogram(sinogram, mask=None, fill_zerosOnly=True) :
 
     sinogram = torch.tensor(sinogram).to(device=model.device())
     if mask is None :
@@ -167,9 +169,13 @@ def fillSinogram(sinogram, mask=None) :
         resizedSino = model.forward(resizedSino)
         resizedSino = torch.nn.functional.interpolate(resizedSino, size=stripe.shape[-2:], mode='bilinear')
 
-        stripe[ ... , 3*blockW : 4*blockW ] =  torch.where( stripe   [ ... , 3*blockW : 4*blockW ] == 0,
-                                                              resizedSino[ ... , 3*blockW : 4*blockW ],
-                                                              stripe   [ ... , 3*blockW : 4*blockW ] )
+        if fill_zerosOnly :
+            stripe[ ... , 3*blockW : 4*blockW ] =  torch.where( stripe   [ ... , 3*blockW : 4*blockW ] == 0,
+                                                                  resizedSino[ ... , 3*blockW : 4*blockW ],
+                                                                  stripe   [ ... , 3*blockW : 4*blockW ] )
+        else :
+            stripe[ ... , 3*blockW : 4*blockW ] = resizedSino[ ... , 3*blockW : 4*blockW ]
+
         return stripe
 
 
@@ -265,7 +271,7 @@ pbar = tqdm.tqdm(total=fsh[-2]) if args.verbose else None
 for curSl in range(fsh[-2]):
     inSinogram = inData[:,curSl,:]
     inMask = None if mask is None else mask[curSl,:]
-    outSinogram = fillSinogram(inSinogram, inMask)
+    outSinogram = fillSinogram(inSinogram, inMask, args.zeros)
     outData[:,curSl,:] = outSinogram.cpu().numpy()
     if pbar is not None:
         pbar.update(1)
