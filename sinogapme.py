@@ -21,21 +21,17 @@ parser.add_argument('-v', '--verbose', action='store_true', default=False,
 
 args = parser.parse_args()
 
-
-
 import os
 from pathlib import Path
-
-import math
-import numpy as np
-from sympy import false
-import torch
-from torchvision import transforms
-
+import h5py
 import tifffile
 import tqdm
 
-import sinogap_module as sg
+import math
+import numpy as np
+import torch
+from torchvision import transforms
+
 
 myPath = os.path.dirname(os.path.realpath(__file__))
 device = torch.device('cuda:0')
@@ -53,94 +49,176 @@ if os.path.isfile(cfgPath):
         raise
     except:
         pass
-sg.device = device
+
+
+#%% I/O
+
+
+hdfDelimiter = '@' # delimiter between filename and dataset path
+
+
+def residesInMemory(hdfName) :
+    mmapPrefixes = ["/dev/shm",]
+    if "CTAS_MMAP_PATH" in os.environ :
+        mmapPrefixes.extend(os.environ["CTAS_MMAP_PATH"].split(':'))
+    hdfName = os.path.realpath(hdfName)
+    for mmapPrefix in mmapPrefixes :
+        if hdfName.startswith(mmapPrefix) :
+            return True
+    return False
+
+
+def mmapMeIfYouCan(trgH5F, data, mode='r+') :
+    if not residesInMemory(trgH5F.filename) :
+        return None
+    fileSize = trgH5F.id.get_filesize()
+    offset = data.id.get_offset()
+    dtype = data.id.dtype
+    plist = data.id.get_create_plist()
+    if offset is None \
+    or offset < 0 \
+    or not plist.get_layout() in (h5d.CONTIGUOUS, h5d.COMPACT) \
+    or plist.get_external_count() \
+    or plist.get_nfilters() \
+    or fileSize - offset < math.prod(data.shape) * data.dtype.itemsize :
+        return None
+    # now all is ready
+    name = trgH5F.filename
+    trgH5F.close()
+    dataN = np.memmap(name, shape=data.shape, dtype=dtype, mode=mode, offset=offset)
+    data = dataN
+    #plist = trgH5F.id.get_access_plist()
+    #fileno = trgH5F.id.get_vfd_handle(plist)
+    #dataM = mmap.mmap(fileno, fileSize, offset=offset, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
+    return data
+
+
+def getInData(inputString, verbose=False, preread=False):
+    """
+    Function accesses a dataset from read-only HDF5 file and returns it.
+
+    If file resides in memory (or in one of the the paths from the CTAS_MMAP_PATH environment variable)
+    this function tries to mmap dataset into memory, build numpy array on top of it and returns it.
+    If mmaping is not possible then given dataset is accessed and, if preread is False, is returned as is;
+    with preread=True the dataset is read into into numpy array which is then returned.
+
+    :param inputString: Filename of the HDF5 file and dataset path inside it;
+                        Two components are separated by the delimiter (see below).
+                        F.e. "filename.hdf@/data" (with @ as the delimiter).
+    :param verbose: prints some messages.
+    :param preread: only makes sense for files which cannot be mmapped. If True then dataset is read into
+                    numpy array which is returned. If false h5py.Dataset is returned.
+
+    :return: If file can be mmaped into memory or preread=True, returns numpy array with the dataset.
+             Otherwise h5py.Dataset is returned.
+    """
+
+    global hdfDelimiter
+
+    nameSplit = inputString.split(hdfDelimiter)
+    if len(nameSplit) != 2 :
+        raise Exception(f"String \"{inputString}\" does not represent an HDF5 format \"fileName{hdfDelimiter}container\".")
+    hdfName = nameSplit[0]
+    hdfVolume = nameSplit[1]
+    try :
+        trgH5F =  h5py.File(hdfName,'r', swmr=True)
+    except :
+        raise Exception(f"Failed to open HDF file '{hdfName}'.")
+    if  hdfVolume not in trgH5F.keys():
+        raise Exception(f"No dataset '{hdfVolume}' in input file {hdfName}.")
+    data = trgH5F[hdfVolume]
+    if not data.size :
+        raise Exception(f"Container \"{inputString}\" is zero size.")
+    sh = data.shape
+    if len(sh) != 3 :
+        raise Exception(f"Dimensions of the container \"{inputString}\" is not 3: {sh}.")
+    mmaped = mmapMeIfYouCan(trgH5F, data, mode='r')
+    if mmaped is None :
+        if preread :
+          dataN = np.empty(data.shape, dtype=np.float32)
+          if verbose :
+              print(f"Reading input \"{inputString}\" of {data.shape} size ... ", end="", flush=True)
+          data.read_direct(dataN)
+          if verbose :
+              print("Done.")
+          data = dataN
+          trgH5F.close()
+    else :
+        data = mmaped
+    return data
+
+
+def getOutData(outputString, shape=None, dtype=None, overwrite=False) :
+
+    global hdfDelimiter
+
+    if shape is not None :
+        if len(shape) == 2 :
+            shape = (1,*shape)
+        if len(shape) != 3 :
+            raise Exception(f"Not appropriate output array size {shape}.")
+
+    nameSplit = outputString.split(hdfDelimiter)
+    if len(nameSplit) != 2 :
+        raise Exception(f"String \"{outputString}\" does not represent an HDF5 format \"fileName{hdfDelimiter}container\".")
+    hdfName = nameSplit[0]
+    hdfVolume = nameSplit[1]
+    try :
+        trgH5F =  h5py.File(hdfName,'a', libver='latest')
+    except :
+        raise Exception(f"Failed to open HDF file '{hdfName}'.")
+
+    data = None
+    if hdfVolume in trgH5F :
+        data = trgH5F[hdfVolume]
+        if not overwrite :
+            if shape is not None and data.shape != shape :
+                raise Exception(f"Shape of dataset \"{outputString}\" {data.shape} is not equal to requested {shape}.")
+            if dtype is not None and data.dtype != dtype :
+                raise Exception(f"Data type of dataset \"{outputString}\" {data.dtype} is not equal to requested {dtype}.")
+        elif ( shape is not None and data.shape != shape ) or ( dtype is not None and data.dtype != dtype ) :
+            del trgH5F[hdfVolume]
+            data = None
+    if data is None :
+        if shape is None :
+            raise Exception(f"No dataset \"{outputString}\" exists and no shape was provided to create it.")
+        if dtype is None :
+            raise Exception(f"No dataset \"{outputString}\" exists and no data type was provided to create it.")
+        data = trgH5F.create_dataset(hdfVolume, shape=shape, dtype=dtype)
+        # TODO : check other possible preallocations
+        data[-1,-1,-1]=0
+    mmaped = mmapMeIfYouCan(trgH5F, data, mode='r+')
+    if mmaped is not None :
+        data = mmaped
+    return data
+
+
+def closeOutData(data) :
+    if isinstance(data, isinstance(data, np.memmap)) :
+        data.flush()
+        data._mmap.close()
+    elif isinstance(data, h5py.Dataset) :
+        data.file.close()
+
 
 
 
 #%% MODELS
 
-# easier to keep than to clean the code
-sg.TCfg = sg.TCfgClass(
-     exec = 3
-    ,nofEpochs = None
-    ,latentDim = 64
-    ,batchSize = 1
-    ,batchSplit = 1
-    ,labelSmoothFac = 0.1
-    ,learningRateD = 1
-    ,learningRateG = 1
-    ,dataDir=""
-)
+import sinogap_model as sinogap
 
-sg.DCfg = sg.DCfgClass(16,False)
-sg.brickMasks = sg.createBrickMasks()
-
-
-layers2 = [
-    ( 1, 2, 3, 2, 1),
-    ( 2, 2, 3, (2,1), (1,0)),
-    ( 4, 2, 3, (2,1), (1,0)),
-]
-class Generator2(sg.GeneratorTemplate) :
-    def __init__(self):
-        super().__init__(2, 1, 16, 16, layers2)
-        self.lowResGenerator = None # Generator4()
-
-
-layers4 = [
-    ( 1, 2, 3, 2, 1),
-    ( 2, 2, 3, 2, 1),
-    ( 4, 2, 3, (2,1), (1,0)),
-    ( 8, 2, 3, (2,1), (1,0)),
-]
-class Generator4(sg.GeneratorTemplate) :
-    def __init__(self):
-        super().__init__(4, 2, 16, 16, layers4)
-        self.lowResGenerator = Generator2()
-
-
-
-layers8 = [
-    ( 1, 2, 3, 2, 1),
-    ( 2, 2, 3, 2, 1),
-    ( 4, 2, 3, 2, 1),
-    ( 8, 2, 3, (2,1), (1,0)),
-    (16, 2, 3, (2,1), (1,0)),
-]
-class Generator8(sg.GeneratorTemplate) :
-    def __init__(self):
-        super().__init__(8, 2, 16, 16, layers8)
-        self.lowResGenerator = Generator4()
-
-
-layers16 = [
-    ( 1, 2, 3, 2, 1),
-    ( 2, 2, 3, 2, 1),
-    ( 4, 2, 3, 2, 1),
-    ( 8, 2, 3, 2, 1),
-    (16, 2, 3, (2,1), (1,0)),
-    (32, 2, 3, (2,1), (1,0)),
-]
-class Generator16(sg.GeneratorTemplate) :
-    def __init__(self):
-        super().__init__(16, 2, 16, 16, layers16)
-        self.lowResGenerator = Generator8()
-
-
-sg.generator = Generator16().to(device)
-_=sg.load_model(sg.generator, os.path.join(myPath, "sinogap_model.pt") )
-_=sg.generator.requires_grad_(False)
-_=sg.generator.eval()
-
-model = sg.generator
+model = sinogap.model(16, 'gen', False, 16, 16, "sinogap_model.pt")
+_=model.requires_grad_(False)
+_=model.eval()
 
 #%% EXEC
 
 
 
 def fillSinogram(sinogram, mask=None, fill_zerosOnly=True) :
+    global device
 
-    sinogram = torch.tensor(sinogram).to(device=model.device())
+    sinogram = torch.tensor(sinogram).to(device=device)
     if mask is None :
         mask =  torch.where( torch.amin( sinogram, dim=-2) == 0 , 0, 1 )
     sinoLen = sinogram.shape[-1]
@@ -151,7 +229,7 @@ def fillSinogram(sinogram, mask=None, fill_zerosOnly=True) :
         ssh = model.cfg.sinoSh
 
         stripe = stripe.to(device)
-        stripe, _ = sg.unsqeeze4dim(stripe)
+        stripe, _ = sinogap.unsqeeze4dim(stripe)
         sinoW = stripe.shape[-1]
         sinoL = stripe.shape[-2]
         if sinoW % 7 :
@@ -258,11 +336,16 @@ except Exception as e :
 
 if args.verbose :
     print("Reading input ...", end="", flush=True)
-inData = sg.getInData(args.input, preread=False)
+inData = getInData(args.input, preread=False)
 fsh = inData.shape[1:]
-mask = sg.loadImage(args.mask, fsh) if len(args.mask) else None
+if len(args.mask) :
+    mask = tifffile.imread(args.mask).astype(np.float32) if len(args.mask) else None
+    if mask.shape != fsh :
+        raise Exception(f"Different image and mask shapes: {fsh} and {mask.shape}.")
+else :
+    mask = None
 leftMask = np.ones(fsh, dtype=np.uint8)
-outData = sg.getOutData(args.output, inData.shape, inData.dtype)
+outData = getOutData(args.output, inData.shape, inData.dtype)
 if args.verbose :
     print(" Read.")
     print(" Filling.")

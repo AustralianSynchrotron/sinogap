@@ -8,29 +8,31 @@ from dataclasses import dataclass, field
 @dataclass
 class DCfgClass:
     gapW : int
+    inChannels : int
+    baseChannels : int
+    otherChannels : int
     brick : bool = field(repr = False)
     sinoSh : tuple = field(repr = True, init = False)
-    gapSh : tuple = field(repr = True, init = False)
-    gapRngX : type(np.s_[:]) = field(repr = True, init = False)
     gapRng : type(np.s_[:]) = field(repr = True, init = False)
-    readSh : tuple = field(repr = True, init = False)
     def __post_init__(self):
-        self.readSh : tuple = (128 if self.brick else None , 7*16)
         self.sinoSh = ( (8 if self.brick else 256) * self.gapW , 7*self.gapW )
-        self.gapSh = (self.sinoSh[0], self.gapW)
-        self.gapRngX = np.s_[ self.sinoSh[1]//2 - self.gapW//2 : self.sinoSh[1]//2 + self.gapW//2 ]
-        self.gapRng = np.s_[...,self.gapRngX]
+        self.gapRng = np.s_[..., self.sinoSh[1]//2 - self.gapW//2 : self.sinoSh[1]//2 + self.gapW//2 ]
 
 
 
 def normalizeImages(images) :
     images, orgDims = unsqeeze4dim(images)
-    #images = images.clone().detach()
-    #with torch.no_grad() :
     stds, means = torch.std_mean(images, dim=(-1,-2), keepdim=True)
     stds = stds + 1e-7
     images = (images - means) / stds # normalize per image
     return images, (orgDims, stds, means)
+
+
+#def calculateNorm(images) :
+#    noGapImages = torch.cat( (images[...,:DCfg.gapRngX.start], images[...,DCfg.gapRngX.stop:]), dim=-1)
+#    toRet = torch.std_mean( noGapImages, dim=(-1,-2), keepdim=True )
+#    return toRet[0], toRet[1]
+
 
 
 def reNormalizeImages(images, norms, stdOnly=False) :
@@ -109,7 +111,7 @@ def firstDevice(model):
 
 
 
-mainFloors = { 
+mainFloors = {
                2  : [
                        ( 1, 2, 3, 2, 1),
                        ( 2, 2, 3, (2,1), (1,0)),
@@ -152,12 +154,9 @@ class SubTemplate(nn.Module):
 
     def __init__(self, gapW, brick, inChannels, baseChannels, otherChannels, floors, outerKernel=3, norms=True):
         super().__init__()
-        self.cfg = DCfgClass(gapW, brick)
-        self.inChannels = inChannels
-        self.baseChannels = baseChannels
-        self.otherChannels = otherChannels
+        self.cfg = DCfgClass(gapW, inChannels, baseChannels, otherChannels, brick)
         self.entrance = None if inChannels == baseChannels else \
-            self.encblock(self.inChannels, self.baseChannels, stride=1, norm=False,
+            self.encblock(inChannels, baseChannels, stride=1, norm=False,
                           kernel=outerKernel, padding=(outerKernel-1)//2 )
         self.encoders = self.createEncoders(floors, norms=norms)
 
@@ -174,11 +173,11 @@ class SubTemplate(nn.Module):
 
     def encFloor(self, chIn, mult, kernel, stride=1, norm=True, padding=1) :
         firstPadding = (kernel[0]//2, kernel[1]//2) if isinstance(kernel, tuple) else kernel//2
-        block1 = self.encblock( int(chIn*(self.baseChannels+self.otherChannels)),
-                               int(chIn*self.baseChannels),
+        block1 = self.encblock( int(chIn*(self.cfg.baseChannels+self.cfg.otherChannels)),
+                               int(chIn*self.cfg.baseChannels),
                                kernel, stride=1, norm=norm, padding=firstPadding)
-        block2 = self.encblock( int(chIn*(self.baseChannels+self.otherChannels)),
-                               int(chIn*self.baseChannels*mult),
+        block2 = self.encblock( int(chIn*(self.cfg.baseChannels+self.cfg.otherChannels)),
+                               int(chIn*self.cfg.baseChannels*mult),
                                kernel, stride=stride, norm=norm, padding=padding)
         return (block1, block2)
 
@@ -194,7 +193,7 @@ class SubTemplate(nn.Module):
         if encoders is None :
             encoders = self.encoders
         if inShape is None :
-            inShape = (1, self.inChannels, *self.cfg.sinoSh)
+            inShape = (1, 1, *self.cfg.sinoSh)
         smpl = torch.zeros(inShape)
         for encoder in encoders :
             smpl = torch.zeros((1, encoder[0].in_channels, *smpl.shape[2:]))
@@ -211,9 +210,8 @@ class SubGeneratorTemplate(SubTemplate):
 
     def __init__(self, gapW, brick, inChannels, baseChannels, otherChannels, floors, outerKernel=3, noiseChannels=0):
         super().__init__(gapW, brick, inChannels+noiseChannels, baseChannels, otherChannels, floors, outerKernel=outerKernel)
-        self.preGenerator = None
         self.link = None
-        self.amplitude = 4
+        self.amplitude = 4 # used to be a parameter
         self.decoders = self.createDecoders(floors)
         self.lastTouch = None if inChannels == baseChannels else self.createLastTouch()
         self.noiseInjector = self.createLatentGenerator(noiseChannels) if noiseChannels else None
@@ -235,12 +233,12 @@ class SubGeneratorTemplate(SubTemplate):
 
 
     def decFloor(self, chOut, reduce, kernel, stride=1, norm=True, padding=1) :
-        block1 = self.decblock( int(reduce*2*chOut*(self.baseChannels + self.otherChannels)),
-                                int(chOut*self.baseChannels),
+        block1 = self.decblock( int(reduce*2*chOut*(self.cfg.baseChannels + self.cfg.otherChannels)),
+                                int(chOut*self.cfg.baseChannels),
                                 kernel, stride=stride, norm=norm, padding=padding)
         secondPadding = (kernel[0]//2, kernel[1]//2) if isinstance(kernel, tuple) else kernel//2
-        block2 = self.decblock( int(2*chOut*(self.baseChannels + self.otherChannels)),
-                                int(chOut*self.baseChannels),
+        block2 = self.decblock( int(2*chOut*(self.cfg.baseChannels + self.cfg.otherChannels)),
+                                int(chOut*self.cfg.baseChannels),
                                 kernel, stride=1, norm=norm, padding=secondPadding)
         return (block1, block2)
 
@@ -254,7 +252,7 @@ class SubGeneratorTemplate(SubTemplate):
 
     def createLastTouch(self) :
         toRet = nn.Sequential(
-            nn.Conv2d(self.baseChannels+self.otherChannels+self.inChannels, 1, 1),
+            nn.Conv2d(self.cfg.baseChannels+self.cfg.otherChannels+self.cfg.inChannels, 1, 1),
             nn.Tanh(),
         )
         return toRet
@@ -262,7 +260,7 @@ class SubGeneratorTemplate(SubTemplate):
 
     def createLatentGenerator(self, outChannels, decoders=None) :
         latInSh = self.postEncoderShape()[-2:]
-        latInSh = (1,self.baseChannels,*latInSh)
+        latInSh = (1,self.cfg.baseChannels,*latInSh)
         latInChannels = math.prod(latInSh)
         toRet = nn.Sequential(
             nn.Linear(latInChannels, latInChannels),
@@ -273,14 +271,14 @@ class SubGeneratorTemplate(SubTemplate):
             decoders = self.decoders
         for decoder in decoders :
             conv = decoder[0]
-            toRet.append( self.decblock(self.baseChannels, self.baseChannels,
+            toRet.append( self.decblock(self.cfg.baseChannels, self.cfg.baseChannels,
                                         kernel=conv.kernel_size,
                                         stride=conv.stride,
                                         norm=False,
                                         padding=conv.padding,
                                         outputPadding=conv.output_padding
                                         ) )
-        toRet.append(( self.encblock(self.baseChannels, outChannels, kernel=1, padding=0, norm=False) ))
+        toRet.append(( self.encblock(self.cfg.baseChannels, outChannels, kernel=1, padding=0, norm=False) ))
         return toRet
 
 
@@ -300,10 +298,11 @@ class SubGeneratorTemplate(SubTemplate):
 
 class GeneratorTemplate(nn.Module):
 
-    def __init__(self, gapW, inChannels, stripeChannels, bricksChannels, floors, outerKernel=3, noiseChannels=0, links=True):
+    def __init__(self, gapW, stripeChannels, bricksChannels, floors, outerKernel=3, noiseChannels=0, links=True, preGenerator=None):
         super().__init__()
-        self.cfg = DCfgClass(gapW, False)
-        self.preGenerator = None
+        self.preGenerator = preGenerator
+        inChannels = 1 + (0 if preGenerator is None else 1)
+        self.cfg = DCfgClass(gapW, inChannels, stripeChannels, bricksChannels, False)
         self.bricksGenerator = SubGeneratorTemplate(gapW, True,  inChannels, bricksChannels, stripeChannels,
                                                     floors, outerKernel=outerKernel, noiseChannels=noiseChannels)
         self.stripeGenerator = SubGeneratorTemplate(gapW, False, inChannels, stripeChannels, bricksChannels,
@@ -312,10 +311,6 @@ class GeneratorTemplate(nn.Module):
         self.deepGenerator = SubGeneratorTemplate(4, False, deepChans, deepChans, 0, deepFloors)
         if links :
             self.createLink()
-
-
-    def device(self):
-        return next(self.parameters()).device
 
 
     def createLink(self) :
@@ -353,6 +348,34 @@ class GeneratorTemplate(nn.Module):
         )
 
 
+    def fillTheGap(self,images, gap) :
+        if images.shape[-2] != gap.shape[-2] or images.shape[0] != gap.shape[0] :
+            raise Exception(f"Filling gaps requires inputs of the same size except last dimension. Got {images.shape} and {gap.shape}.")
+        if self.cfg.sinoSh[-1] % images.shape[-1] != 0 :
+            raise Exception(f"Width of the images {images.shape[-1]} is an integer of {self.cfg.sinoSh[-1]}.")
+        ratio = self.cfg.sinoSh[-1] // images.shape[-1]
+        gapStart = self.cfg.gapRng[-1].start
+        if self.cfg.gapW % ratio + gapStart % ratio != 0 :
+            raise Exception(f"Gap width {self.cfg.gapW} and gap start {gapStart} must be integer multiples of {ratio}.")
+        gapStart //= ratio
+        gapWidth = self.cfg.gapW // ratio
+        if images.shape[-1] == gap.shape[-1] :
+            gapRng = np.s_[gapStart:gapStart+gapWidth]
+        elif gap.shape[-1] == gapWidth :
+            gapRng = np.s_[:]
+        else :
+            raise Exception(f"Bad gap width {gap.shape[-1]} for filling images of width {images.shape[-1]}.")
+        channels = min(images.shape[1], gap.shape[1])
+        gapped = torch.cat( [ images[:,:channels,:, : gapStart],
+                              gap   [:,:channels,:, gapRng].to(images.device),
+                              images[:,:channels,:, gapStart+gapWidth : ]
+                            ],
+                            dim=-1
+                          )
+        gapped = torch.cat( (gapped, images[:,channels:,...]), dim=1 )
+        return gapped
+
+
     def preProc(self, images) :
         if self.preGenerator is None :
             return images
@@ -368,26 +391,29 @@ class GeneratorTemplate(nn.Module):
                 res = torch.nn.functional.interpolate(res, size=orgSh, mode='bilinear')
         elif self.cfg.gapW == 2:
             images = images.to(firstDevice(self))
+            gapStart = self.cfg.gapRng[-1].start
+            gapStop  = self.cfg.gapRng[-1].stop
             with torch.no_grad() :
-                gap = torch.cat( [ ( 2*images[:,0:1,:,[self.cfg.gapRngX.start-1]] + images[:,0:1,:,[self.cfg.gapRngX.stop]   ] ) / 3,
-                                   ( 2*images[:,0:1,:,[self.cfg.gapRngX.stop]   ] + images[:,0:1,:,[self.cfg.gapRngX.start-1]] ) / 3,
+                gap = torch.cat( [ ( 2*images[:,0:1,:,[gapStart-1]] + images[:,0:1,:,[gapStop]   ] ) / 3,
+                                   ( 2*images[:,0:1,:,[gapStop]   ] + images[:,0:1,:,[gapStart-1]] ) / 3,
                                  ],
                                  dim=-1
                                )
-                res = fillTheGap(images, gap)
+                res = self.fillTheGap(images, gap)
         else :
-            images = images.to(firstDevice(self))
-            with torch.no_grad() :
-                res = images.clone().detach()
-                mask = torch.ones_like(res, dtype=torch.bool)
-                mask[self.cfg.gapRng] = 0
-                res[self.cfg.gapRng] = 0
-                res = pytorch_amfill.ops.amfill(res, mask)
+            raise Exception("Failed to preproccess. Something is wrong with the generator.")
+            #images = images.to(firstDevice(self))
+            #with torch.no_grad() :
+            #    res = images.clone().detach()
+            #    mask = torch.ones_like(res, dtype=torch.bool)
+            #    mask[self.cfg.gapRng] = 0
+            #    res[self.cfg.gapRng] = 0
+            #    res = pytorch_amfill.ops.amfill(res, mask)
         return squeezeOrg(res, orgDims)
 
 
     def generateImages(self, images, noises=None) :
-        return fillTheGap(images, self.forward(images)[:,[0],...])
+        return self.fillTheGap(images, self.forward(images)[:,[0],...])
 
 
     def forwardLink(self, images, bricks):
@@ -431,7 +457,7 @@ class GeneratorTemplate(nn.Module):
 
         # preform inputs
         lrImages = self.preProc(images)
-        filledImages = fillTheGap(images.to(lrImages.device), lrImages[:,[0],...])
+        filledImages = self.fillTheGap(images.to(lrImages.device), lrImages[:,[0],...])
         if self.preGenerator is None :
             stripeIn = filledImages.to(firstDevice(self.stripeGenerator))
         else :
@@ -521,17 +547,18 @@ class GeneratorTemplate(nn.Module):
 
 class Generator(GeneratorTemplate):
 
-    def __init__(self, gapW, inChannels, stripeChannels, bricksChannels, noise=False):
+    def __init__(self, gapW, stripeChannels, bricksChannels, noise=False):
         if gapW not in mainFloors.keys() :
             raise Exception(f"Gap width {gapW} is not from the list of possible: {mainFloors.keys()}.")
-        super().__init__(gapW, inChannels, stripeChannels, bricksChannels, mainFloors[gapW], 
-                         outerKernel = 3, noiseChannels = (1 if noise else 0), links = not noise)
         if noise :
-            self.preGenerator = Generator(gapW, inChannels, stripeChannels, bricksChannels, noise=False)
+            preGenerator = Generator(gapW, stripeChannels, bricksChannels, noise=False)
         elif gapW == 2 :
-            self.preGenerator = None
+            preGenerator = None
         else :
-            self.preGenerator = Generator(gapW//2, inChannels, stripeChannels, bricksChannels, noise=False)
+            preGenerator = Generator(gapW//2, stripeChannels, bricksChannels, noise=False)
+        super().__init__(gapW, stripeChannels, bricksChannels, mainFloors[gapW],
+                         outerKernel = 3, noiseChannels = (1 if noise else 0),
+                         links = not noise, preGenerator = preGenerator)
 
 
 
@@ -561,11 +588,11 @@ class SubDiscriminatorTemplate(SubTemplate):
 
 class DiscriminatorTemplate(nn.Module):
 
-    def __init__(self, gapW, inChannels, stripeChannels, bricksChannels, floors, outerKernel=3):
+    def __init__(self, gapW, stripeChannels, bricksChannels, floors, outerKernel=3, inChannels=1):
         if gapW not in mainFloors.keys() :
             raise Exception(f"Gap width {gapW} is not from the list of possible: {mainFloors.keys()}.")
         super().__init__()
-        self.cfg = DCfgClass(gapW, False)
+        self.cfg = DCfgClass(gapW, inChannels, stripeChannels, bricksChannels, False)
         self.bricksDiscriminator = SubDiscriminatorTemplate(gapW, True,  inChannels, bricksChannels, stripeChannels,
                                                             floors, body=True, outerKernel=outerKernel)
         self.stripeDiscriminator = SubDiscriminatorTemplate(gapW, False, inChannels, stripeChannels, bricksChannels,
@@ -619,19 +646,22 @@ class Discriminator(DiscriminatorTemplate):
     def __init__(self, gapW, stripeChannels, bricksChannels, fromPair=False):
         if gapW not in mainFloors.keys() :
             raise Exception(f"Gap width {gapW} is not from the list of possible: {mainFloors.keys()}.")
-        inChannels = 2 if fromPair else 1
-        super().__init__(gapW, inChannels, stripeChannels, bricksChannels, mainFloors[gapW], outerKernel = 3)
+        super().__init__(gapW, stripeChannels, bricksChannels, mainFloors[gapW],
+                         outerKernel = 3, inChannels = (2 if fromPair else 1) )
 
 
 
 
-def model(gapW, generator, addin, modelfile=None) :
-    modToRet = Generator(gapW, 2, 16, 16, noise=addin) \
-               if generator else \
-               Discriminator(gapW, 16, 16, addin)
+def model(gapW, kind, addin, stripeChannels, bricksChannels, modelfile=None) :
+    if kind.lower() in [ "g", "gen", "generator" ] :
+        modToRet = Generator(gapW, stripeChannels, bricksChannels, noise=addin)
+    elif kind.lower() in [ "d", "dis", "discriminator" ] :
+        modToRet = Discriminator(gapW, stripeChannels, bricksChannels, fromPair=addin)
+    else :
+        raise Exception(f"Unknown kind of model {kind}. Can be 'generator' or 'discriminator' ")
     if modelfile is not None :
         modToRet.load_state_dict(torch.load(modelfile, map_location=torch.device('cpu')))
-    return modToRet
+    return modToRet.eval().requires_grad_(False)
 
 
 
