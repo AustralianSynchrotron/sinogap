@@ -794,7 +794,7 @@ def loss_SMSE(p_true, p_pred):
 
 L1L = nn.L1Loss(reduction='none')
 def loss_L1L(p_true, p_pred):
-    L1L.to(p_true.device)
+    L1L.to(p_pred.device)
     return L1L(p_true[DCfg.gapRng], p_pred[DCfg.gapRng]).sum(dim=(-1,-2,-3))
 
 def loss_L1LL(p_true, p_pred):

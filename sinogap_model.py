@@ -390,7 +390,7 @@ class Generator(nn.Module):
         if self.preGenerator is None :
             return images
         images, orgDims = unsqeeze4dim(images)
-        if isinstance(self.preGenerator, GeneratorTemplate) :
+        if isinstance(self.preGenerator, Generator) :
             orgSh = images.shape[-2:]
             preSh = self.preGenerator.cfg.sinoSh
             if orgSh != preSh :
@@ -457,21 +457,20 @@ class Generator(nn.Module):
         if self.bricksGenerator.link is None :
             postBricks = bricks
         else :
-            postBricks = self.bricksGenerator.link(bricks)
+            postBricks = self.bricksGenerator.link(bricks.to(firstDevice(self.bricksGenerator.link)))
 
         return postImages, postBricks
 
 
     def forward(self, images):
 
-
         # preform inputs
         lrImages = self.preProc(images)
         filledImages = self.fillTheGap(images.to(lrImages.device), lrImages[:,[0],...])
         if self.preGenerator is None :
-            stripeIn = filledImages.to(firstDevice(self.stripeGenerator))
+            stripeIn = filledImages.to(firstDevice(self.stripeGenerator.entrance))
         else :
-            stripeIn = torch.cat( [ img.to(firstDevice(self.stripeGenerator)) for img in (
+            stripeIn = torch.cat( [ img.to(firstDevice(self.stripeGenerator.entrance)) for img in (
                                     filledImages,
                                     lrImages
                                 )  ], dim=1)
@@ -496,13 +495,15 @@ class Generator(nn.Module):
 
         # encoding
         for level, (brick_encoder, stripe_encoder) in enumerate( zip(self.bricksGenerator.encoders, self.stripeGenerator.encoders) ):
-            bricksI = torch.cat( [bricks_dwTrain[-1],
-                                  stripeBricked_dwTrain[-1].to(firstDevice(self.bricksGenerator))
-                                 ], dim=1 )
+            bricksI = torch.cat( [ img.to(firstDevice(brick_encoder)) for img in (
+                                   bricks_dwTrain[-1],
+                                   stripeBricked_dwTrain[-1]
+                                 ) ], dim=1 )
             bricks_dwTrain.append( brick_encoder( bricksI ) )
-            stripeI = torch.cat( [stripe_dwTrain[-1],
-                                  bricksStriped_dwTrain[-1].to(firstDevice(self.stripeGenerator))
-                                 ], dim=1 )
+            stripeI = torch.cat( [ img.to(firstDevice(stripe_encoder)) for img in (
+                                   stripe_dwTrain[-1],
+                                   bricksStriped_dwTrain[-1]
+                                  ) ], dim=1 )
             stripe_dwTrain.append( stripe_encoder(stripeI))
             bricksStriped_dwTrain.append( bricks2stripe(bricks_dwTrain[-1]) )
             stripeBricked_dwTrain.append( stripe2bricks(stripe_dwTrain[-1]) )
@@ -516,13 +517,13 @@ class Generator(nn.Module):
         # decoding
         for level, (brick_decoder, stripe_decoder) in enumerate( zip(self.bricksGenerator.decoders,
                                                                      self.stripeGenerator.decoders) ):
-            bricksI = torch.cat( [ img.to(firstDevice(self.bricksGenerator)) for img in (
+            bricksI = torch.cat( [ img.to(firstDevice(brick_decoder)) for img in (
                                     bricks_upTrain[-1],
                                     bricks_dwTrain[-1-level],
                                     stripe2bricks(stripe_upTrain[-1]),
                                     stripeBricked_dwTrain[-1-level]
                                 ) ], dim=1)
-            stripeI = torch.cat( [ img.to(firstDevice(self.stripeGenerator)) for img in (
+            stripeI = torch.cat( [ img.to(firstDevice(stripe_decoder)) for img in (
                                     stripe_upTrain[-1],
                                     stripe_dwTrain[-1-level],
                                     bricks2stripe(bricks_upTrain[-1]),
@@ -532,7 +533,7 @@ class Generator(nn.Module):
             stripe_upTrain.append( stripe_decoder(stripeI) )
 
         # last touches
-        stripeI = torch.cat( [ img.to(firstDevice(self.stripeGenerator)) for img in (
+        stripeI = torch.cat( [ img.to(firstDevice(self.stripeGenerator.lastTouch)) for img in (
                 stripe_upTrain[-1],
                 bricks2stripe(bricks_upTrain[-1]),
                 stripeIn,
@@ -540,7 +541,7 @@ class Generator(nn.Module):
         stripe_results = self.stripeGenerator.lastTouch(stripeI) * self.stripeGenerator.amplitude
         stripe_results = reNormalizeImages(stripe_results, stripe_norms, stdOnly=True)
 
-        bricksI = torch.cat( [ img.to(firstDevice(self.bricksGenerator)) for img in (
+        bricksI = torch.cat( [ img.to(firstDevice(self.bricksGenerator.lastTouch)) for img in (
                 bricks_upTrain[-1],
                 stripe2bricks(stripe_upTrain[-1]),
                 bricksIn,
