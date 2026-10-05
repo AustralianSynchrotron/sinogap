@@ -296,25 +296,35 @@ class SubGeneratorTemplate(SubTemplate):
 
 
 
-class GeneratorTemplate(nn.Module):
+class Generator(nn.Module):
 
-    def __init__(self, gapW, stripeChannels, bricksChannels, floors, outerKernel=3, noiseChannels=0, links=True, preGenerator=None):
+    def __init__(self, gapW, stripeChannels, bricksChannels, noise=False):
+                 #floors, outerKernel=3, noiseChannels=0, links=True, preGenerator=None):
         super().__init__()
-        self.preGenerator = preGenerator
-        inChannels = 1 + (0 if preGenerator is None else 1)
+        if gapW not in mainFloors.keys() :
+            raise Exception(f"Gap width {gapW} is not from the list of possible: {mainFloors.keys()}.")
+        floors = mainFloors[gapW]
+        if noise :
+            self.preGenerator = Generator(gapW, stripeChannels, bricksChannels, noise=False)
+        elif gapW == 2 :
+            self.preGenerator = None
+        else :
+            self.preGenerator = Generator(gapW//2, stripeChannels, bricksChannels, noise=False)
+        noiseChannels = (1 if noise else 0)
+        inChannels = 1 + (0 if self.preGenerator is None else 1)
         self.cfg = DCfgClass(gapW, inChannels, stripeChannels, bricksChannels, False)
+        outerKernel=3
         self.bricksGenerator = SubGeneratorTemplate(gapW, True,  inChannels, bricksChannels, stripeChannels,
                                                     floors, outerKernel=outerKernel, noiseChannels=noiseChannels)
         self.stripeGenerator = SubGeneratorTemplate(gapW, False, inChannels, stripeChannels, bricksChannels,
                                                     floors, outerKernel=outerKernel, noiseChannels=noiseChannels)
         deepChans = self.stripeGenerator.postEncoderShape()[1]
         self.deepGenerator = SubGeneratorTemplate(4, False, deepChans, deepChans, 0, deepFloors)
-        if links :
+        if not noise :
             self.createLink()
 
 
     def createLink(self) :
-
         bricksSh = self.bricksGenerator.postEncoderShape()
         bricksSz = math.prod(bricksSh[1:])
         self.bricksGenerator.link = nn.Sequential(
@@ -545,23 +555,6 @@ class GeneratorTemplate(nn.Module):
 
 
 
-class Generator(GeneratorTemplate):
-
-    def __init__(self, gapW, stripeChannels, bricksChannels, noise=False):
-        if gapW not in mainFloors.keys() :
-            raise Exception(f"Gap width {gapW} is not from the list of possible: {mainFloors.keys()}.")
-        if noise :
-            preGenerator = Generator(gapW, stripeChannels, bricksChannels, noise=False)
-        elif gapW == 2 :
-            preGenerator = None
-        else :
-            preGenerator = Generator(gapW//2, stripeChannels, bricksChannels, noise=False)
-        super().__init__(gapW, stripeChannels, bricksChannels, mainFloors[gapW],
-                         outerKernel = 3, noiseChannels = (1 if noise else 0),
-                         links = not noise, preGenerator = preGenerator)
-
-
-
 
 class SubDiscriminatorTemplate(SubTemplate):
 
@@ -586,17 +579,19 @@ class SubDiscriminatorTemplate(SubTemplate):
 
 
 
-class DiscriminatorTemplate(nn.Module):
+class Discriminator(nn.Module):
 
-    def __init__(self, gapW, stripeChannels, bricksChannels, floors, outerKernel=3, inChannels=1):
+    def __init__(self, gapW, stripeChannels, bricksChannels, fromPair=False):
+        super().__init__()
         if gapW not in mainFloors.keys() :
             raise Exception(f"Gap width {gapW} is not from the list of possible: {mainFloors.keys()}.")
-        super().__init__()
+        floors = mainFloors[gapW]
+        inChannels = (2 if fromPair else 1)
         self.cfg = DCfgClass(gapW, inChannels, stripeChannels, bricksChannels, False)
         self.bricksDiscriminator = SubDiscriminatorTemplate(gapW, True,  inChannels, bricksChannels, stripeChannels,
-                                                            floors, body=True, outerKernel=outerKernel)
+                                                            floors, body=True, outerKernel=3)
         self.stripeDiscriminator = SubDiscriminatorTemplate(gapW, False, inChannels, stripeChannels, bricksChannels,
-                                                            floors, body=False, outerKernel=outerKernel)
+                                                            floors, body=False, outerKernel=3)
         postStripeShape = self.stripeDiscriminator.postEncoderShape()
         deepChans = postStripeShape[1]
         self.deepDiscriminator = SubDiscriminatorTemplate(4, False, deepChans, deepChans, 0, deepFloors,
@@ -639,15 +634,6 @@ class DiscriminatorTemplate(nn.Module):
         return ( brickResults + stripeResults ) / 2
         #return stripeResults
 
-
-
-class Discriminator(DiscriminatorTemplate):
-
-    def __init__(self, gapW, stripeChannels, bricksChannels, fromPair=False):
-        if gapW not in mainFloors.keys() :
-            raise Exception(f"Gap width {gapW} is not from the list of possible: {mainFloors.keys()}.")
-        super().__init__(gapW, stripeChannels, bricksChannels, mainFloors[gapW],
-                         outerKernel = 3, inChannels = (2 if fromPair else 1) )
 
 
 
