@@ -1090,7 +1090,8 @@ class GeneratorTemplate(nn.Module):
             postChans = images
         else :
             tDev = firstDevice(self.stripeGenerator.link)
-            postChans = self.stripeGenerator.link( images.to(tDev).view(images.shape[0], -1, 1) ).view(images.shape)
+            preChans = images.to(tDev).view(images.shape[0], -1, 1)
+            postChans = self.stripeGenerator.link( preChans ).view(images.shape)
 
         dwTrain = [images.to(firstDevice(self.deepGenerator)),]
         # encoding
@@ -1115,7 +1116,7 @@ class GeneratorTemplate(nn.Module):
         if self.bricksGenerator.link is None :
             postBricks = bricks
         else :
-            postBricks = self.bricksGenerator.link(bricks)
+            postBricks = self.bricksGenerator.link(bricks.to(firstDevice(self.bricksGenerator.link)))
 
         return postImages, postBricks
 

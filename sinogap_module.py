@@ -1063,15 +1063,21 @@ class GeneratorTemplate(nn.Module):
 
     def forwardLink(self, images, bricks):
 
-
-        tDev = firstDevice(self.stripeGenerator.link)
-        postChans = self.stripeGenerator.link( images.to(tDev).view(images.shape[0], -1, 1) ).view(images.shape)
+        if self.stripeGenerator.link is None :
+            postChans = images
+        else :
+            tDev = firstDevice(self.stripeGenerator.link)
+            preChans = images.to(tDev).view(images.shape[0], -1, 1)
+            postChans = self.stripeGenerator.link( preChans ).view(images.shape)
 
         dwTrain = [images.to(firstDevice(self.deepGenerator)),]
         # encoding
         for level, encoder in enumerate(self.deepGenerator.encoders) :
             dwTrain.append( encoder(dwTrain[-1]) )
-        mid = self.deepGenerator.link(dwTrain[-1])
+        if self.deepGenerator.link is None :
+            mid = dwTrain[-1]
+        else :
+            mid = self.deepGenerator.link(dwTrain[-1])
         upTrain = [mid,]
         # decoding
         for level, decoder in enumerate( self.deepGenerator.decoders) :
@@ -1082,11 +1088,15 @@ class GeneratorTemplate(nn.Module):
             upTrain.append( decoder(imgsI) )
         postDeep = upTrain[-1].to(postChans.device)
 
-        postImages = postChans + postDeep.to(postChans.device)
+        postImages = postChans + postDeep
 
-        postBricks = self.bricksGenerator.link(bricks)
+        if self.bricksGenerator.link is None :
+            postBricks = bricks
+        else :
+            postBricks = self.bricksGenerator.link(bricks.to(firstDevice(self.bricksGenerator.link)))
 
         return postImages, postBricks
+
 
 
 
