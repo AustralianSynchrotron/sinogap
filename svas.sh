@@ -16,7 +16,7 @@ fi
 oDir="${2}"
 
 mkdir -p "$oDir"
-ls sinogap_module*.py *${iMask}*  | 
+ls sinogap_model*.py sinogap_train*.py  *${iMask}*  | 
 while read flnm ; do
   onm=$(sed "s:${iMask}::g" <<< "${flnm}" )
   cp -Lvr "$flnm" "$oDir/$onm"
