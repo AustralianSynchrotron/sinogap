@@ -14,8 +14,8 @@ parser.add_argument('-m', '--mask', type=str, default="",
                     help='Mask of the input stack for hdf volume. If not given, then zeros are filled.')
 parser.add_argument('-z', '--zeros',  action='store_true', default=False,
                     help='Forcebly fill gaps as mask defines, even if the corresponding pixels in the input volume are non-zero.')
-#parser.add_argument('-M', '--model', type=str, default="",
-#                    help='Model to use.')
+parser.add_argument('-M', '--model', type=str, default="mse",
+                    help='Model to use. Possible values are "mse"and "gan".')
 parser.add_argument('-v', '--verbose', action='store_true', default=False,
                     help='Be verbose.')
 
@@ -31,6 +31,7 @@ import math
 import numpy as np
 import torch
 from torchvision import transforms
+import sinogap_model as sinogap
 
 
 myPath = os.path.dirname(os.path.realpath(__file__))
@@ -205,9 +206,16 @@ def closeOutData(data) :
 
 #%% MODELS
 
-import sinogap_model as sinogap
-
-model = sinogap.model(16, 'gen', False, 16, 16, "sinogap_model.pt")
+if args.model.lower() in ["", "m", "mse"] :
+    model_path =  os.path.join(myPath, "sinogap_model_mse.pt")
+    model = sinogap.model(16, 'gen', False, 16, 16, model_path )
+elif args.model.lower() in ["g", "gan"] :
+    model_path =  os.path.join(myPath, "sinogap_model_gan.pt")
+    model = sinogap.model(16, 'gen', True, 16, 16, model_path )
+else :
+    raise Exception(f"Unknow model parameter {args.model}. Possible values are :"
+                     " \"mse\" and \"gan\".")
+_=model.to(device)
 _=model.requires_grad_(False)
 _=model.eval()
 
