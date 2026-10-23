@@ -167,7 +167,8 @@ class SubTemplate(nn.Module):
                                 padding=padding, padding_mode='reflect')  )
         if norm :
             layers.append(nn.BatchNorm2d(chOut))
-        layers.append(nn.LeakyReLU(0.2))
+        #layers.append(nn.LeakyReLU(0.2))
+        layers.append(nn.PReLU(num_parameters=chOut, init=0.2))
         return torch.nn.Sequential(*layers)
 
 
@@ -228,7 +229,8 @@ class SubGeneratorTemplate(SubTemplate):
                                           padding=padding, padding_mode='zeros', output_padding=outputPadding) )
         if norm :
             layers.append(nn.BatchNorm2d(chOut))
-        layers.append(nn.LeakyReLU(0.2))
+        #layers.append(nn.LeakyReLU(0.2))
+        layers.append(nn.PReLU(num_parameters=chOut, init=0.2))
         return torch.nn.Sequential(*layers)
 
 
@@ -264,7 +266,8 @@ class SubGeneratorTemplate(SubTemplate):
         latInChannels = math.prod(latInSh)
         toRet = nn.Sequential(
             nn.Linear(latInChannels, latInChannels),
-            nn.LeakyReLU(0.2),
+            #nn.LeakyReLU(0.2),
+            nn.PReLU(num_parameters=latInChannels, init=0.2),
             nn.Unflatten(1, latInSh[1:]),
         )
         if decoders is None :
@@ -330,9 +333,11 @@ class Generator(nn.Module):
         self.bricksGenerator.link = nn.Sequential(
             nn.Flatten(),
             nn.Linear(bricksSz, bricksSz//2),
-            nn.LeakyReLU(0.2),
+            #nn.LeakyReLU(0.2),
+            nn.PReLU(init=0.2),
             nn.Linear(bricksSz//2, bricksSz),
-            nn.LeakyReLU(0.2),
+            #nn.LeakyReLU(0.2),
+            nn.PReLU(init=0.2),
             nn.Unflatten(1, bricksSh[1:]),
         )
 
@@ -341,9 +346,11 @@ class Generator(nn.Module):
         midChans = chansSz * encSh[1] // 2048
         self.stripeGenerator.link = nn.Sequential(
             nn.Conv1d(in_channels=chansSz, out_channels=midChans, kernel_size=1, groups=encSh[1]),
-            nn.LeakyReLU(0.2),
+            #nn.LeakyReLU(0.2),
+            nn.PReLU(init=0.2),
             nn.Conv1d(in_channels=midChans, out_channels=chansSz, kernel_size=1, groups=encSh[1]),
-            nn.LeakyReLU(0.2),
+            #nn.LeakyReLU(0.2),
+            nn.PReLU(init=0.2),
         )
 
         deepSh = self.deepGenerator.postEncoderShape(inShape=encSh)
@@ -351,9 +358,11 @@ class Generator(nn.Module):
         self.deepGenerator.link = nn.Sequential(
             nn.Flatten(),
             nn.Linear(deepSz, deepSz),
-            nn.LeakyReLU(0.2),
+            #nn.LeakyReLU(0.2),
+            nn.PReLU(init=0.2),
             nn.Linear(deepSz, deepSz),
-            nn.LeakyReLU(0.2),
+            #nn.LeakyReLU(0.2),
+            nn.PReLU(init=0.2),
             nn.Unflatten(1, deepSh[1:]),
         )
 
@@ -571,7 +580,8 @@ class SubDiscriminatorTemplate(SubTemplate):
         while leftChannels > 1 :
             outChannels = max(leftChannels//4, 1)
             layers.append(nn.Linear(leftChannels, outChannels))
-            layers.append( nn.Sigmoid() if outChannels == 1 else  nn.LeakyReLU(0.2) )
+            #layers.append( nn.Sigmoid() if outChannels == 1 else  nn.LeakyReLU(0.2) )
+            layers.append( nn.Sigmoid() if outChannels == 1 else  nn.PReLU(init=0.2) )
             leftChannels = outChannels
         return torch.nn.Sequential(*layers)
 
