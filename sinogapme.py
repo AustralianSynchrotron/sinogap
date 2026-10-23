@@ -209,15 +209,16 @@ def closeOutData(data) :
 if args.model.lower() in ["", "m", "mse"] :
     model_path =  os.path.join(myPath, "sinogap_model_mse.pt")
     model = sinogap.model(16, 'gen', False, 16, 16, model_path )
+    _=model.eval()
 elif args.model.lower() in ["g", "gan"] :
     model_path =  os.path.join(myPath, "sinogap_model_gan.pt")
     model = sinogap.model(16, 'gen', True, 16, 16, model_path )
+    _=model.train()
 else :
     raise Exception(f"Unknow model parameter {args.model}. Possible values are :"
                      " \"mse\" and \"gan\".")
 _=model.to(device)
 _=model.requires_grad_(False)
-_=model.eval()
 
 #%% EXEC
 
