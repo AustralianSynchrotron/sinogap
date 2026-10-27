@@ -681,18 +681,32 @@ optimizers_G = []
 optimizers_D = []
 
 
-def adjustScheduler(scheduler, iniLr, target) :
-    if scheduler is None :
-        return ""
-    gamma = scheduler.gamma
-    curLR = scheduler.get_last_lr()[0] / iniLr
-    if gamma < 1 and curLR > target \
-    or gamma > 1 and curLR < target :
-        scheduler.step()
-    return f"LR : {scheduler.get_last_lr()[0]:.3e} ({curLR:.3e}). "
 
+def adjustLR(model, target, gamma=None) :
 
+    if model is generator :
+        schedulers = schedulers_G
+        lr = TCfg.learningRateG
+        modnm = "Gen"
+    elif discriminator is not None and model is discriminator :
+        schedulers =schedulers_D
+        lr = TCfg.learningRateD
+        modnm = "Dis"
+    else :
+        raise Exception("unknown model of type:", type(model))
 
+    currentLR = schedulers[0].get_last_lr()[0] / lr
+    writer.add_scalars("Aux", {f"Lr{modnm}": currentLR}, imer)
+    toRet =  f"{modnm}LR: {currentLR:.4f}"
+    if gamma is not None:
+        toRet += f"{schedulers[0].gamma - 1:+.3f}"
+        for scheduler in schedulers :
+            scheduler.gamma = gamma
+            if gamma < 1 and currentLR > target \
+            or gamma > 1 and currentLR < target :
+                scheduler.step()
+
+    return toRet
 
 
 
