@@ -698,7 +698,9 @@ def adjustLR(model, target, gamma=None) :
     currentLR = schedulers[0].get_last_lr()[0] / lr
     writer.add_scalars("Aux", {f"Lr{modnm}": currentLR}, imer)
     toRet =  f"{modnm}LR: {currentLR:.4f}"
-    if gamma is not None:
+    if gamma is not None \
+    and ( gamma < 1 and currentLR > target \
+    or gamma > 1 and currentLR < target ):
         toRet += f"{schedulers[0].gamma - 1:+.3f}"
         for scheduler in schedulers :
             scheduler.gamma = gamma
