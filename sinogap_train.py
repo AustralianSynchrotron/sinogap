@@ -1220,7 +1220,8 @@ def summarizeMe(toSumm, onPrep=True):
         nofIm = images.shape[0]
         sumAcc.nofIm += nofIm
 
-        subBatchSize = max( TCfg.batchSize, TCfg.batchMax )
+        #subBatchSize = max( TCfg.batchSize, TCfg.batchMax )
+        subBatchSize = TCfg.batchMax
         subBatches = max (nofIm // subBatchSize, 1)
         for i in range(subBatches) :
             subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
