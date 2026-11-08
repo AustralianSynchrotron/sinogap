@@ -65,7 +65,7 @@ class TCfgClass:
     learningRateG: float
     dataDir : str
     device: torch.device = torch.device('cpu')
-    batchSplit : int = 1 # negative to load multiple batches at a time.
+    batchMax : int = 0 # negative to load multiple batches at a time.
     nofEpochs: int = 0
     num_workers : int = os.cpu_count()
     historyHDF : str = field(repr = True, init = False)
@@ -76,8 +76,10 @@ class TCfgClass:
             self.device = torch.device(f"cuda:{self.exec}")
         self.historyHDF = f"train_{self.exec}.hdf"
         self.logDir = f"runs/experiment_{self.exec}"
-        if self.batchSplit > 1 and self.batchSize % self.batchSplit :
-            raise Exception(f"Batch size {self.batchSize} is not divisible by batch split {self.batchSplit}.")
+        if not self.batchMax :
+            self.batchMax = self.batchSize
+        if self.batchSize > self.batchMax and self.batchSize % self.batchMax :
+            raise Exception(f"Batch size {self.batchSize} is not divisible by max batch {self.batchMax}.")
 global TCfg
 TCfg = None
 
@@ -581,7 +583,7 @@ testSet = initIfNew('testSet')
 def createDataLoader(tSet, num_workers=os.cpu_count(), bSizeMult = 1) :
     return torch.utils.data.DataLoader(
         dataset=tSet,
-        batch_size = int( bSizeMult * TCfg.batchSize * max(1, -TCfg.batchSplit) ),
+        batch_size = bSizeMult * TCfg.batchSize ,
         shuffle=False, # randomize dataset instead of the dataloader because it takes enormous amount of time otherwise
         num_workers=num_workers,
         drop_last=True
@@ -1020,10 +1022,9 @@ def loss_Adv(p_true, p_pred, truth):
     if discriminator is None :
         raise Exception("Discriminator is not initialized for adversarial loss.")
     nofIm = p_true.shape[0]
-    batchSplit = TCfg.batchSplit if TCfg.batchSplit > 1 else 1
-    subBatchSize = TCfg.batchSize // batchSplit
-    subBatches = max (nofIm // subBatchSize, 1)
     predictions = torch.empty((nofIm, 1), dtype=torch.float, device=p_pred.device)
+    subBatchSize = min( TCfg.batchSize, TCfg.batchMax )
+    subBatches = max (nofIm // subBatchSize, 1)
     for i in range(subBatches) :
         subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
         dinInput =  p_true[subRange,...] \
@@ -1219,9 +1220,10 @@ def summarizeMe(toSumm, onPrep=True):
         nofIm = images.shape[0]
         sumAcc.nofIm += nofIm
 
-        batchSplit = TCfg.batchSplit if TCfg.batchSplit > 1 else 1
-        subBatchSize = nofIm // batchSplit
-        for i in range(batchSplit) :
+        #subBatchSize = max( TCfg.batchSize, TCfg.batchMax )
+        subBatchSize = TCfg.batchMax
+        subBatches = max (nofIm // subBatchSize, 1)
+        for i in range(subBatches) :
             subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
             subImages = preTransformImage(images[subRange,...])
             subFakeImages = generator.preProc(subImages) \
@@ -1530,13 +1532,12 @@ def train_step(allImages):
         images = allImages[ trainRes.nofIm : trainRes.nofIm + TCfg.batchSize , ... ]
         nofIm = images.shape[0]
         trainRes.nofIm += nofIm
-        batchSplit = TCfg.batchSplit if TCfg.batchSplit > 1 else 1
-        subBatchSize = nofIm // batchSplit
-
+        subBatchSize = min( TCfg.batchSize, TCfg.batchMax )
+        subBatches = max (nofIm // subBatchSize, 1)
         def trainDiscriminator() :
             for optim in optimizers_D :
                 optim.zero_grad(set_to_none=False)
-            for i in range(batchSplit) :
+            for i in range(subBatches) :
                 subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
                 subImages = images[subRange,...]
                 with torch.no_grad() : # create fake images to be descriminated
@@ -1559,7 +1560,7 @@ def train_step(allImages):
                 optim.zero_grad(set_to_none=False)
             for optim in optimizers_D :
                 optim.zero_grad(set_to_none=False)
-            for i in range(batchSplit) :
+            for i in range(subBatches) :
                 subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
                 subImages = images[subRange,...]
                 #with torch.no_grad():
@@ -1584,7 +1585,7 @@ def train_step(allImages):
                     trainDiscriminator()
             else :
                 with torch.no_grad() : # create fake images to be descriminated
-                    for i in range(batchSplit) :
+                    for i in range(subBatches) :
                         subRange = np.s_[i*subBatchSize:(i+1)*subBatchSize]
                         subImages = images[subRange,...]#.clone().detach()
                         subFakeImages = generator.generateImages(subImages)
@@ -1656,12 +1657,8 @@ def train(savedCheckPoint, epochSize=None):
         beforeEachEpoch(epoch)
 
         trainLoader = createDataLoader(trainSet, num_workers=TCfg.num_workers)
-        testLoader = createDataLoader(testSet, num_workers=TCfg.num_workers)
-        #generator.train()
-        #discriminator.train()
         resAcc = TrainResClass()
         updAcc = TrainResClass()
-        #_ = trackExtremes()
 
         total = len(trainLoader)
         if epochSize is not None :
@@ -1731,7 +1728,7 @@ def train(savedCheckPoint, epochSize=None):
 
                 # generate previews
                 #generator.eval()
-                rndIndeces = random.sample(range(images.shape[0]), 2) if images.shape[0] > 1 else 0
+                rndIndeces = random.sample(range(images.shape[0]), 2) if images.shape[0] > 1 else [0]
                 if None in [ minMetrices, maxMetrices ] or \
                    not 'loss' in minMetrices or not 'loss' in maxMetrices or \
                    None in [ minMetrices['loss'], maxMetrices['loss'] ] :
@@ -1742,7 +1739,7 @@ def train(savedCheckPoint, epochSize=None):
                 extViews = extViews.detach().cpu().numpy()
                 refViews, genImages, _ = generateDisplay()
                 refViews = refViews.detach().cpu().numpy()
-                rndIndeces = random.sample(range(images.shape[0]), 2) if images.shape[0] > 1 else 0
+                rndIndeces = random.sample(range(images.shape[0]), 2) if images.shape[0] > 1 else [0]
                 rndViews, rndGen, _ = generateDisplay(images[rndIndeces,...])
                 rndViews = rndViews.detach().cpu().numpy()
                 #generator.train()
