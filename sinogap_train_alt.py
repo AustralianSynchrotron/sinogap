@@ -1519,7 +1519,6 @@ def afterEachStep(sglocals):
 
 def train_step(allImages):
     global skipGen, skipDis, followers, save_minimal, repeatDis, repeatGen
-
     beforeEachStep(locals())
 
     trainRes = TrainResClass()
@@ -1534,6 +1533,7 @@ def train_step(allImages):
         trainRes.nofIm += nofIm
         subBatchSize = min( TCfg.batchSize, TCfg.batchMax )
         subBatches = max (nofIm // subBatchSize, 1)
+
         def trainDiscriminator() :
             for optim in optimizers_D :
                 optim.zero_grad(set_to_none=False)
@@ -1599,18 +1599,19 @@ def train_step(allImages):
             for _ in range(repeatGen) :
                 trainGenerator()
 
-
-    if minimal_criteria is not None :
-        updateCriteria(save_minimal)
-
     afterEachStep(locals())
-
     return trainRes
 
 def beforeTrain(locals) :
+    generator.train()
+    if discriminator is not None :
+        discriminator.train()
     return
 
 def afterTrain(locals) :
+    generator.eval()
+    if discriminator is not None :
+        discriminator.eval()
     return
 
 def beforeEachEpoch(locals) :
@@ -1667,12 +1668,11 @@ def train(savedCheckPoint, epochSize=None):
             if epochSize is not None and resAcc.nofIm >= epochSize * TCfg.batchSize :
                 break
 
-            if prev_data is not None :
-                data = prev_data
-                criteriaBefore = criteriaAfter
-            else :
-                criteriaBefore = criteriaToFollow()
-
+            #if prev_data is not None :
+            #    data = prev_data
+            #    criteriaBefore = criteriaAfter
+            #else :
+            #    criteriaBefore = criteriaToFollow()
             #if followers is not None :
             #    data = mixInFollowers(data)
             #    criteriaBefore = criteriaToFollow()
@@ -1686,41 +1686,42 @@ def train(savedCheckPoint, epochSize=None):
             afterTrain(locals())
             resAcc += trainRes
             updAcc += trainRes
+            if minimal_criteria is not None :
+                updateCriteria(save_minimal)
 
 
-            if followers is not None or localMinimaIter > 200 :
-                prev_data = None
-                repCounter = 0
-                localMinima = 1e100
-            else :
-                criteriaAfter = criteriaToFollow()
-                if criteriaAfter < criteriaBefore  :
-                    if repCounter == 0 :
-                        prev_data = data
-                        #initLRs = { sched : sched.get_last_lr()[0] / TCfg.learningRateG for sched in schedulers_G }
-                        #for sched in schedulers_G :
-                        #    #sched.gamma = 1-0.01
-                        #    torch.optim.lr_scheduler.LambdaLR(sched.optimizer, lambda epoch: initLRs[sched]/2).step()
-                    repCounter += 1
-                    localMinimaIter += 1
-                    if criteriaAfter < localMinima :
-                        localMinima = criteriaAfter
-                        localMinimaIter = 0
-                elif repCounter and ( criteriaAfter < localMinima * 1.005 ) :
-                    repCounter += 1
-                    localMinimaIter += 1
-                else :
-                    prev_data = None
-                    if repCounter > 0 :
-                        localMinima = 1e100
-                        #for sched in schedulers_G :
-                        #    #sched.gamma = 1-0.002
-                        #    torch.optim.lr_scheduler.LambdaLR(sched.optimizer, lambda epoch: initLRs[sched]).step()
-                    repCounter = 0
-                    localMinimaIter = 0
-                if repCounter == 10 :
-                    _= load_model(generator, f"model_{TCfg.exec}_gen_mini.pt")
-
+            #if followers is not None or localMinimaIter > 200 :
+            #    prev_data = None
+            #    repCounter = 0
+            #    localMinima = 1e100
+            #else :
+            #    criteriaAfter = criteriaToFollow()
+            #    if criteriaAfter < criteriaBefore  :
+            #        if repCounter == 0 :
+            #            prev_data = data
+            #            #initLRs = { sched : sched.get_last_lr()[0] / TCfg.learningRateG for sched in schedulers_G }
+            #            #for sched in schedulers_G :
+            #            #    #sched.gamma = 1-0.01
+            #            #    torch.optim.lr_scheduler.LambdaLR(sched.optimizer, lambda epoch: initLRs[sched]/2).step()
+            #        repCounter += 1
+            #        localMinimaIter += 1
+            #        if criteriaAfter < localMinima :
+            #            localMinima = criteriaAfter
+            #            localMinimaIter = 0
+            #    elif repCounter and ( criteriaAfter < localMinima * 1.005 ) :
+            #        repCounter += 1
+            #        localMinimaIter += 1
+            #    else :
+            #        prev_data = None
+            #        if repCounter > 0 :
+            #            localMinima = 1e100
+            #            #for sched in schedulers_G :
+            #            #    #sched.gamma = 1-0.002
+            #            #    torch.optim.lr_scheduler.LambdaLR(sched.optimizer, lambda epoch: initLRs[sched]).step()
+            #        repCounter = 0
+            #        localMinimaIter = 0
+            #    if repCounter == 10 :
+            #        _= load_model(generator, f"model_{TCfg.exec}_gen_mini.pt")
 
 
             # Per minute update:
