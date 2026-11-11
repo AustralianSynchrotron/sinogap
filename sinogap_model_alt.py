@@ -396,10 +396,25 @@ class Generator(nn.Module):
 
 
     def preProc(self, images) :
-        if self.preGenerator is None :
-            return images
+        orgSh = images.shape
         images, orgDims = unsqeeze4dim(images)
-        if isinstance(self.preGenerator, Generator) :
+        if self.preGenerator is None :
+            scale_factor = self.cfg.gapW//2
+            with torch.no_grad() :
+                if scale_factor != 1 :
+                    ssh = tuple( sz // scale_factor for sz in images.shape[-2:] )
+                    images = torch.nn.functional.interpolate(images, size=ssh  , mode='area')
+                gapStart = self.cfg.gapRng[-1].start // scale_factor
+                gapStop  = self.cfg.gapRng[-1].stop  // scale_factor
+                gap = torch.cat( [ ( 2*images[:,0:1,:,[gapStart-1]] + images[:,0:1,:,[gapStop]   ] ) / 3,
+                                   ( 2*images[:,0:1,:,[gapStop]   ] + images[:,0:1,:,[gapStart-1]] ) / 3,
+                                 ],
+                                 dim=-1
+                               )
+                if scale_factor != 1 :
+                    gap = torch.nn.functional.interpolate(images, size=(self.cfg.gapW, orgSh[-1])  , mode='bilinear')
+                res = self.fillTheGap(images, gap)
+        elif isinstance(self.preGenerator, Generator) :
             orgSh = images.shape[-2:]
             preSh = self.preGenerator.cfg.sinoSh
             if orgSh != preSh :
@@ -408,26 +423,8 @@ class Generator(nn.Module):
             res = self.preGenerator.forward(images)
             if orgSh != preSh :
                 res = torch.nn.functional.interpolate(res, size=orgSh, mode='bilinear')
-        elif self.cfg.gapW == 2:
-            images = images.to(firstDevice(self))
-            gapStart = self.cfg.gapRng[-1].start
-            gapStop  = self.cfg.gapRng[-1].stop
-            with torch.no_grad() :
-                gap = torch.cat( [ ( 2*images[:,0:1,:,[gapStart-1]] + images[:,0:1,:,[gapStop]   ] ) / 3,
-                                   ( 2*images[:,0:1,:,[gapStop]   ] + images[:,0:1,:,[gapStart-1]] ) / 3,
-                                 ],
-                                 dim=-1
-                               )
-                res = self.fillTheGap(images, gap)
         else :
             raise Exception("Failed to preproccess. Something is wrong with the generator.")
-            #images = images.to(firstDevice(self))
-            #with torch.no_grad() :
-            #    res = images.clone().detach()
-            #    mask = torch.ones_like(res, dtype=torch.bool)
-            #    mask[self.cfg.gapRng] = 0
-            #    res[self.cfg.gapRng] = 0
-            #    res = pytorch_amfill.ops.amfill(res, mask)
         return squeezeOrg(res, orgDims)
 
 
