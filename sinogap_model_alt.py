@@ -307,9 +307,7 @@ class Generator(nn.Module):
         if gapW not in mainFloors.keys() :
             raise Exception(f"Gap width {gapW} is not from the list of possible: {mainFloors.keys()}.")
         floors = mainFloors[gapW]
-        if noise :
-            self.preGenerator = Generator(gapW, stripeChannels, bricksChannels, noise=False)
-        elif gapW == 2 :
+        if gapW == 2 :
             self.preGenerator = None
         else :
             self.preGenerator = Generator(gapW//2, stripeChannels, bricksChannels, noise=False)
@@ -323,8 +321,7 @@ class Generator(nn.Module):
                                                     floors, outerKernel=outerKernel, noiseChannels=noiseChannels)
         deepChans = self.stripeGenerator.postEncoderShape()[1]
         self.deepGenerator = SubGeneratorTemplate(4, False, deepChans, deepChans, 0, deepFloors)
-        if not noise :
-            self.createLink()
+        self.createLink()
 
 
     def createLink(self) :
@@ -444,10 +441,7 @@ class Generator(nn.Module):
         # encoding
         for level, encoder in enumerate(self.deepGenerator.encoders) :
             dwTrain.append( encoder(dwTrain[-1]) )
-        if self.deepGenerator.link is None :
-            mid = dwTrain[-1]
-        else :
-            mid = self.deepGenerator.link(dwTrain[-1])
+        mid = dwTrain[-1] if self.deepGenerator.link is None else self.deepGenerator.link(dwTrain[-1])
         upTrain = [mid,]
         # decoding
         for level, decoder in enumerate( self.deepGenerator.decoders) :

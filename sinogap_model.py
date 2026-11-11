@@ -166,7 +166,7 @@ class SubTemplate(nn.Module):
         layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias = not norm,
                                 padding=padding, padding_mode='reflect')  )
         if norm :
-            layers.append(nn.BatchNorm2d(chOut))
+            layers.append(nn.InstanceNorm2d(chOut, affine=True, track_running_stats=True))
         #layers.append(nn.LeakyReLU(0.2))
         layers.append(nn.PReLU(num_parameters=chOut, init=0.2))
         return torch.nn.Sequential(*layers)
@@ -228,7 +228,7 @@ class SubGeneratorTemplate(SubTemplate):
         layers.append( nn.ConvTranspose2d(chIn, chOut, kernel, stride=stride, bias = not norm,
                                           padding=padding, padding_mode='zeros', output_padding=outputPadding) )
         if norm :
-            layers.append(nn.BatchNorm2d(chOut))
+            layers.append(nn.InstanceNorm2d(chOut, affine=True, track_running_stats=True))
         #layers.append(nn.LeakyReLU(0.2))
         layers.append(nn.PReLU(num_parameters=chOut, init=0.2))
         return torch.nn.Sequential(*layers)
@@ -444,10 +444,7 @@ class Generator(nn.Module):
         # encoding
         for level, encoder in enumerate(self.deepGenerator.encoders) :
             dwTrain.append( encoder(dwTrain[-1]) )
-        if self.deepGenerator.link is None :
-            mid = dwTrain[-1]
-        else :
-            mid = self.deepGenerator.link(dwTrain[-1])
+        mid = dwTrain[-1] if self.deepGenerator.link is None else self.deepGenerator.link(dwTrain[-1])
         upTrain = [mid,]
         # decoding
         for level, decoder in enumerate( self.deepGenerator.decoders) :

@@ -1851,11 +1851,11 @@ def train(savedCheckPoint, epochSize=None):
                         print(loss_Dis(refImages, genImages))
                     displayImages()
             try :
-                generator.train()
-                print("Reference images in train mode:")
-                overview()
-                generator.eval()
-                print("Reference images in eval mode:")
+                #generator.train()
+                #print("Reference images in train mode:")
+                #overview()
+                #generator.eval()
+                #print("Reference images in eval mode:")
                 overview()
             except Exception as e:
                 print(e)
