@@ -17,7 +17,6 @@ import copy
 
 import math
 import statistics
-from cv2 import norm
 import numpy as np
 import test
 import torch
@@ -38,9 +37,9 @@ import tqdm
 
 import torchmetrics.image
 import ssim
-from eagle_loss import Eagle_Loss
+#from eagle_loss import Eagle_Loss
 from convnext_perceptual_loss import ConvNextPerceptualLoss, ConvNextType
-import pytorch_amfill
+#import pytorch_amfill
 from torchmetrics.regression import PearsonCorrCoef
 from torchmetrics import ConcordanceCorrCoef
 from torchmetrics.functional import concordance_corrcoef
@@ -931,13 +930,13 @@ def loss_HIST(p_true, p_pred):
         toRet.append( img_loss )
     return torch.stack(toRet)
 
-EAGLE = Eagle_Loss(patch_size=3)
-def loss_EAGLE(p_true, p_pred):
-    p_true, _ = md.unsqeeze4dim(p_true)
-    p_pred, _ = md.unsqeeze4dim(p_pred)
-    loss = EAGLE(p_true, p_pred)
-    EAGLE.to(p_true.device)
-    return loss
+#EAGLE = Eagle_Loss(patch_size=3)
+#def loss_EAGLE(p_true, p_pred):
+#    p_true, _ = md.unsqeeze4dim(p_true)
+#    p_pred, _ = md.unsqeeze4dim(p_pred)
+#    loss = EAGLE(p_true, p_pred)
+#    EAGLE.to(p_true.device)
+#    return loss
 
 CNP = None
 def loss_CNP(p_true, p_pred):
@@ -1072,7 +1071,7 @@ metrices = {
     'STD'    : Metrics(loss_STD,     1, 1),
     'COR'    : Metrics(loss_COR,     1, 1),
     'HIST'   : Metrics(loss_HIST,    1, 1),
-    'EAGLE'  : Metrics(loss_EAGLE,   1, 1),
+    #'EAGLE'  : Metrics(loss_EAGLE,   1, 1),
     'ABSGRD' : Metrics(loss_ABSGRD,  1, 1),
 }
 
@@ -1889,6 +1888,7 @@ def train(savedCheckPoint, epochSize=None):
             if minGLoss is None or minGLoss == 0 or lastGLoss < minGLoss :
                 minGLoss = lastGLoss
                 minGEpoch = epoch
+                os.system(f"cp model_{TCfg.exec}_gen.pth model_{TCfg.exec}_gen_best.pt")
                 os.system(f"cp {savedCheckPoint}.pth {savedCheckPoint}_best.pth")
                 os.system(f"cp {savedCheckPoint}_previous.pth {savedCheckPoint}_beforebest.pth")
                 #saveModels(f"model_{TCfg.exec}_B")
