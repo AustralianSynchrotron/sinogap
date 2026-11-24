@@ -166,7 +166,7 @@ class SubTemplate(nn.Module):
         layers.append( nn.Conv2d(chIn, chOut, kernel, stride=stride, bias = not norm,
                                 padding=padding, padding_mode='reflect')  )
         if norm :
-            layers.append(nn.InstanceNorm2d(chOut, affine=True, track_running_stats=True))
+            layers.append(nn.InstanceNorm2d(chOut, affine=True, track_running_stats=False))
         #layers.append(nn.LeakyReLU(0.2))
         layers.append(nn.PReLU(num_parameters=chOut, init=0.2))
         return torch.nn.Sequential(*layers)
@@ -228,7 +228,7 @@ class SubGeneratorTemplate(SubTemplate):
         layers.append( nn.ConvTranspose2d(chIn, chOut, kernel, stride=stride, bias = not norm,
                                           padding=padding, padding_mode='zeros', output_padding=outputPadding) )
         if norm :
-            layers.append(nn.InstanceNorm2d(chOut, affine=True, track_running_stats=True))
+            layers.append(nn.InstanceNorm2d(chOut, affine=True, track_running_stats=False))
         #layers.append(nn.LeakyReLU(0.2))
         layers.append(nn.PReLU(num_parameters=chOut, init=0.2))
         return torch.nn.Sequential(*layers)

@@ -699,16 +699,18 @@ def adjustLR(model, target, gamma=None) :
     currentLR = schedulers[0].get_last_lr()[0] / lr
     writer.add_scalars("Aux", {f"Lr{modnm}": currentLR}, imer)
     toRet =  f"{modnm}LR: {currentLR:.4f}"
-    if gamma is not None \
-    and ( gamma < 1 and currentLR > target \
-    or gamma > 1 and currentLR < target ):
-        toRet += f"{schedulers[0].gamma - 1:+.3f}"
-        for scheduler in schedulers :
-            scheduler.gamma = gamma
-            if gamma < 1 and currentLR > target \
-            or gamma > 1 and currentLR < target :
-                scheduler.step()
-
+    if gamma is None  or gamma == 0 :
+        return  toRet
+    if currentLR >= target:
+        gamma = 1 - abs(gamma)
+    else :
+        gamma = 1 + abs(gamma)
+    toRet += f"{schedulers[0].gamma - 1:+.3f}"
+    for scheduler in schedulers :
+        scheduler.gamma = gamma
+        if gamma < 1 and currentLR > target \
+        or gamma > 1 and currentLR < target :
+            scheduler.step()
     return toRet
 
 
@@ -1640,7 +1642,8 @@ correlatedCriteriaFile = None
 def train(savedCheckPoint, epochSize=None):
     global epoch, minGLoss, minGEpoch, startFrom, imer, resAcc
     global minimal_criteria, lrCoeff, followers
-    global trainLoader, testLoader, testSet, refImages, minMetrices, maxMetrices
+    global trainLoader, testLoader, testSet, trainSet
+    global refImages, minMetrices, maxMetrices
     lastGLoss = minGLoss
 
     lastUpdateTime = time.time()
