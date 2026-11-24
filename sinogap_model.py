@@ -323,8 +323,7 @@ class Generator(nn.Module):
                                                     floors, outerKernel=outerKernel, noiseChannels=noiseChannels)
         deepChans = self.stripeGenerator.postEncoderShape()[1]
         self.deepGenerator = SubGeneratorTemplate(4, False, deepChans, deepChans, 0, deepFloors)
-        if not noise :
-            self.createLink()
+        self.createLink()
 
 
     def createLink(self) :
