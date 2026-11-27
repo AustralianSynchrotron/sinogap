@@ -228,8 +228,9 @@ def fillSinogram(sinogram, mask=None, fill_zerosOnly=True) :
     global device
 
     sinogram = torch.tensor(sinogram).to(device=device)
+    sinogram = torch.nan_to_num(sinogram, nan=0.0)
     if mask is None :
-        mask =  torch.where( torch.amin( sinogram, dim=-2) == 0 , 0, 1 )
+        mask =  torch.where( torch.amin(sinogram, dim=-2) == 0 , 0, 1 )
     sinoLen = sinogram.shape[-1]
 
     def fillStripe(stripe) :
@@ -273,7 +274,7 @@ def fillSinogram(sinogram, mask=None, fill_zerosOnly=True) :
             sideW = 3*gapW
             prevGap = gapsToRet[-1].stop if len(gapsToRet) else 0
             nextGap = gapsIn[gapI+1].start if gapI < len(gapsIn)-1 else sinoLen
-            if  gapW <= 32 \
+            if  gapW <= 64 \
             and ( ignoreMargins or gap.start - prevGap > sideW ) \
             and ( ignoreMargins or nextGap - gap.stop > sideW ) :
                 stripeRange=np.s_[ max(0,gap.start - sideW) : min(sinoLen, gap.stop + sideW) ]
@@ -324,8 +325,12 @@ def fillSinogram(sinogram, mask=None, fill_zerosOnly=True) :
         else :
             gaps = [ *gaps[:curGap], *gaps[curGap+2:] ]
     # rest of the gaps, ignore margins
-    _ = closeGapsFromList(gaps, ignoreMargins=True)
-    _ = closeGapsFromList(gaps, ignoreMargins=True)
+    try :
+        _ = closeGapsFromList(gaps, ignoreMargins=True)
+        _ = closeGapsFromList(gaps, ignoreMargins=True)
+    except Exception as e :
+        print(f"Failed to close some gaps: {gaps}: ", e)
+
 
     return sinogram
 
@@ -335,11 +340,15 @@ def fillSinogram(sinogram, mask=None, fill_zerosOnly=True) :
 
 try :   # single tiff input
     sinogram = tifffile.imread(args.input).astype(np.float32)
-    sinogram = fillSinogram(sinogram).cpu().numpy()
-    tifffile.imwrite(args.output, sinogram)
+    try :
+        sinogram = fillSinogram(sinogram).cpu().numpy()
+        tifffile.imwrite(args.output, sinogram)
+    except Exception as e :
+        print("Failed to clos gaps with exception: ",e)
+        exit(1)
     exit(0)
 except Exception as e :
-    #print("Exception: ",e)
+    print("Exception: ",e)
     pass
 
 

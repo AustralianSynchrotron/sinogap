@@ -1050,8 +1050,8 @@ def loss_Adv_Dis(p_true, p_pred):
 
 
 def loss_Adv_Gen(p_true, p_pred) :
-    loss_pred, _ = loss_Adv(p_pred, p_true, True)
-    return loss_pred
+    loss_pred = loss_Adv(p_pred, p_true, True)[0] + loss_Adv(p_true, p_pred, False)[0]
+    return loss_pred / 2
 
 
 
